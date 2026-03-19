@@ -39,6 +39,12 @@ WINDOW = 20
 
 # devices
 
-GPT_DEVICE = "cuda"
-EM_DEVICE = "cuda"
-SM_DEVICE = "cuda"
+import torch as _torch
+def _default_device():
+    if _torch.cuda.is_available():
+        return "cuda"
+    return "cpu"
+
+GPT_DEVICE = _default_device()
+EM_DEVICE = _default_device()
+SM_DEVICE = _default_device()

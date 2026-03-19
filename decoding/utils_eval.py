@@ -82,7 +82,7 @@ class WER(object):
             if len(ref_seg) == 0 : error = 1.0
             else: error = wer(ref_seg, pred_seg)
             if self.use_score: scores.append(1 - error)
-            else: use_score.append(error)
+            else: scores.append(error)
         return np.array(scores)
     
 """

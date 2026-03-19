@@ -1,0 +1,9 @@
+numpy
+torch
+transformers
+h5py
+scipy
+nltk
+jiwer
+datasets
+bert_score
