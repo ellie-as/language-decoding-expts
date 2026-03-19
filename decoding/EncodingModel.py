@@ -25,3 +25,19 @@ class EncodingModel():
             diff = torch.matmul(stim, self.weights) - self.resp[trs] # encoding model residuals
             multi = torch.matmul(torch.matmul(diff, self.precision), diff.permute(0, 2, 1))
             return -0.5 * multi.diagonal(dim1 = -2, dim2 = -1).sum(dim = 1).detach().cpu().numpy()
+
+    def prs_per_voxel(self, stim, trs):
+        """Decompose log P(R|S) into per-voxel contributions on affected TRs.
+
+        The quadratic form d^T Σ^{-1} d decomposes exactly as
+            Σ_j  d_j * (Σ^{-1} d)_j
+        so the per-voxel terms sum to the total returned by prs().
+
+        Returns (n_variants, n_voxels) array.
+        """
+        with torch.no_grad():
+            stim = stim.float().to(self.device)
+            diff = torch.matmul(stim, self.weights) - self.resp[trs]
+            prec_diff = torch.matmul(diff, self.precision)
+            per_voxel = -0.5 * (diff * prec_diff).sum(dim=1)
+            return per_voxel.detach().cpu().numpy()

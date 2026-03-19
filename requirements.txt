@@ -7,3 +7,4 @@ nltk
 jiwer
 datasets
 bert_score
+nibabel
