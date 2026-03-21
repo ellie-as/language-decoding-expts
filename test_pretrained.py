@@ -44,8 +44,32 @@ DECODING_DIR = REPO_DIR / "decoding"
 sys.path.insert(0, str(DECODING_DIR))
 
 DATA_LM_URL = "https://utexas.box.com/shared/static/7ab8qm5e3i0vfsku0ee4dc6hzgeg7nyh.zip"
-DATA_TEST_URL = "https://utexas.box.com/shared/static/ae5u0t3sh4f46nvmrd3skniq0kk2t5uh.zip"
 MODELS_FOLDER_URL = "https://utexas.box.com/s/ri13t06iwpkyk17h8tfk0dtyva7qtqlz"
+
+S3_BASE = "https://s3.amazonaws.com/openneuro.org"
+OPENNEURO_TEST = "ds004510"
+OPENNEURO_SUBJECTS = ["UTS01", "UTS02", "UTS03"]
+
+TASK_TO_EXPERIMENT = {
+    "wheretheressmoke": "perceived_speech",
+    "laluna": "perceived_movies",
+    "partlycloudy": "perceived_movies",
+    "presto": "perceived_movies",
+    "sintel": "perceived_movies",
+    "attend-F": "perceived_multispeaker",
+    "attend-M": "perceived_multispeaker",
+    "alpha": "imagined_speech",
+    "bravo": "imagined_speech",
+    "charlie": "imagined_speech",
+    "delta": "imagined_speech",
+    "echo": "imagined_speech",
+}
+
+TEXTGRID_TASKS = [
+    "wheretheressmoke", "laluna", "partlycloudy", "presto",
+    "attend-F", "attend-M",
+    "alpha", "bravo", "charlie", "delta", "echo",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -73,7 +97,6 @@ def _extract_zip(zip_path, target_dir):
     with zipfile.ZipFile(str(zip_path), "r") as zf:
         members = zf.namelist()
         prefixes = {m.split("/")[0] for m in members if "/" in m}
-        # If everything lives under a single root folder, strip it
         if len(prefixes) == 1:
             root_prefix = prefixes.pop() + "/"
             for member in members:
@@ -88,46 +111,173 @@ def _extract_zip(zip_path, target_dir):
             zf.extractall(str(target_dir))
 
 
-def download_data():
-    """Download language-model data, test data, and (if possible) pretrained models."""
-    downloads = [
-        ("data_lm", DATA_LM_URL, "Language model data (GPT checkpoints + vocab)"),
-        ("data_test", DATA_TEST_URL, "Test data (brain responses + transcripts)"),
-    ]
+def _s3_list_files(prefix):
+    """List files under an S3 prefix on the OpenNeuro bucket."""
+    import xml.etree.ElementTree as ET
+    url = f"{S3_BASE}/?list-type=2&prefix={prefix}&max-keys=500"
+    with urllib.request.urlopen(url, timeout=30) as resp:
+        tree = ET.parse(resp)
+    ns = {"s3": "http://s3.amazonaws.com/doc/2006-03-01/"}
+    files = []
+    for content in tree.findall(".//s3:Contents", ns):
+        key = content.find("s3:Key", ns).text
+        files.append(key)
+    return files
 
-    for dirname, url, desc in downloads:
-        target = REPO_DIR / dirname
-        if target.exists() and any(target.iterdir()):
-            print(f"  [exists]  {dirname}/  — {desc}")
+
+def _detect_model_subjects():
+    """Return subject IDs found in models/ directory."""
+    models_dir = REPO_DIR / "models"
+    if not models_dir.exists():
+        return []
+    return sorted(d.name for d in models_dir.iterdir()
+                  if d.is_dir() and any(d.glob("*.npz")))
+
+
+def download_test_data():
+    """Download test data from OpenNeuro and organise into data_test/."""
+    target = REPO_DIR / "data_test"
+    if target.exists() and (target / "test_response").exists():
+        existing = list((target / "test_response").rglob("*.hf5"))
+        if existing:
+            print(f"  [exists]  data_test/  ({len(existing)} response files)")
+            return
+
+    model_subjects = _detect_model_subjects()
+    if not model_subjects:
+        print("  [warning]  No subjects in models/ — downloading for UTS01, UTS02, UTS03")
+        model_subjects = OPENNEURO_SUBJECTS
+
+    print(f"\n  Downloading test data from OpenNeuro ({OPENNEURO_TEST})")
+    print(f"  Subjects: {model_subjects}")
+
+    uts_ids = OPENNEURO_SUBJECTS[:len(model_subjects)]
+
+    for uts_id, subj_id in zip(uts_ids, model_subjects):
+        print(f"\n  --- {uts_id} → {subj_id} ---")
+        prefix = f"{OPENNEURO_TEST}/derivative/preprocessed_data/{uts_id}/"
+        s3_files = _s3_list_files(prefix)
+        hf5_files = [f for f in s3_files if f.endswith(".hf5")]
+
+        for s3_key in hf5_files:
+            fname = s3_key.split("/")[-1]
+            task_base = fname.replace(".hf5", "")
+
+            # imagined speech repeats: alpha_repeat-1 → task=alpha
+            task_root = task_base.split("_repeat-")[0] if "_repeat-" in task_base else task_base
+            experiment = TASK_TO_EXPERIMENT.get(task_root)
+            if experiment is None:
+                print(f"    [skip] {fname} (unknown task)")
+                continue
+
+            dest_dir = target / "test_response" / subj_id / experiment
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            dest = dest_dir / fname
+
+            if dest.exists():
+                print(f"    [exists] {subj_id}/{experiment}/{fname}")
+                continue
+
+            url = f"{S3_BASE}/{s3_key}"
+            _download_with_progress(url, dest)
+
+    # TextGrids
+    print(f"\n  --- TextGrids ---")
+    tg_prefix = f"{OPENNEURO_TEST}/derivative/TextGrids/"
+    tg_files = _s3_list_files(tg_prefix)
+
+    for s3_key in tg_files:
+        fname = s3_key.split("/")[-1]
+        if not fname.endswith(".TextGrid"):
+            continue
+        task_root = fname.replace(".TextGrid", "")
+        experiment = TASK_TO_EXPERIMENT.get(task_root)
+        if experiment is None:
             continue
 
-        print(f"\n  Downloading {desc} ...")
-        zip_path = REPO_DIR / f"{dirname}.zip"
+        dest_dir = target / "test_stimulus" / experiment
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest = dest_dir / fname
+
+        if dest.exists():
+            print(f"    [exists] {experiment}/{fname}")
+            continue
+
+        url = f"{S3_BASE}/{s3_key}"
+        _download_with_progress(url, dest)
+
+    # eval_segments.json — derive from response file lengths
+    eval_seg_path = target / "eval_segments.json"
+    if not eval_seg_path.exists():
+        print(f"\n  Generating eval_segments.json ...")
+        _generate_eval_segments(target, eval_seg_path)
+
+
+def _generate_eval_segments(data_test_dir, out_path):
+    """Create eval_segments.json from response file durations (TR=2s)."""
+    import h5py
+    TR = 2.0
+    TRIM_START = 10.0
+
+    segments = {}
+    resp_dir = data_test_dir / "test_response"
+    if not resp_dir.exists():
+        return
+
+    for hf5_path in sorted(resp_dir.rglob("*.hf5")):
+        task = hf5_path.stem
+        if task in segments:
+            continue
         try:
-            _download_with_progress(url, zip_path)
-            target.mkdir(parents=True, exist_ok=True)
-            print(f"  Extracting to {dirname}/ ...")
-            _extract_zip(zip_path, target)
+            with h5py.File(str(hf5_path), "r") as hf:
+                n_trs = hf["data"].shape[0]
+            duration = n_trs * TR
+            segments[task] = [TRIM_START, duration - TRIM_START]
+        except Exception:
+            pass
+
+    with open(str(out_path), "w") as f:
+        json.dump(segments, f, indent=2)
+    print(f"    Saved eval_segments.json ({len(segments)} tasks)")
+
+
+def download_data():
+    """Download language-model data, test data, and pretrained models."""
+    # LM data
+    lm_target = REPO_DIR / "data_lm"
+    if lm_target.exists() and any(lm_target.iterdir()):
+        print(f"  [exists]  data_lm/  — Language model data")
+    else:
+        print(f"\n  Downloading Language model data ...")
+        zip_path = REPO_DIR / "data_lm.zip"
+        try:
+            _download_with_progress(DATA_LM_URL, zip_path)
+            lm_target.mkdir(parents=True, exist_ok=True)
+            print(f"  Extracting to data_lm/ ...")
+            _extract_zip(zip_path, lm_target)
             zip_path.unlink()
-            print(f"  [ok]  {dirname}/")
+            print(f"  [ok]  data_lm/")
         except Exception as exc:
             print(f"  [error]  {exc}")
             if zip_path.exists():
                 zip_path.unlink()
 
+    # Test data from OpenNeuro
+    download_test_data()
+
+    # Models
     models_dir = REPO_DIR / "models"
     if models_dir.exists() and any(models_dir.iterdir()):
-        print(f"  [exists]  models/  — Pretrained encoding + word-rate models")
+        print(f"\n  [exists]  models/  — Pretrained encoding + word-rate models")
     else:
         print(f"\n  Pretrained models must be downloaded manually.")
         print(f"  Open this link in a browser and download the folder contents:")
         print(f"    {MODELS_FOLDER_URL}")
         print(f"  Then extract into:  {models_dir}/")
         print(f"  Expected layout:")
-        print(f"    models/S1/encoding_model_perceived.npz")
-        print(f"    models/S1/word_rate_model_auditory.npz")
-        print(f"    models/S1/word_rate_model_speech.npz")
-        print(f"    models/S2/...   models/S3/...")
+        print(f"    models/<SUBJECT_ID>/encoding_model_perceived.npz")
+        print(f"    models/<SUBJECT_ID>/word_rate_model_auditory.npz")
+        print(f"    models/<SUBJECT_ID>/word_rate_model_speech.npz")
 
 
 # ---------------------------------------------------------------------------
