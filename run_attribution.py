@@ -87,6 +87,48 @@ def compute_attribution(del_stim, resp, weights, voxels, precision):
     return per_voxel_per_tr, per_voxel_total, total_ll
 
 
+def compute_lag_attribution(del_stim, resp, weights, voxels, precision, stim_delays):
+    """Decompose attribution by FIR lag.
+
+    The prediction pred = Σ_k pred_lag_k, so the residual diff = pred - resp
+    can be split as diff = Σ_k pred_lag_k - resp.  The per-voxel attribution
+    then decomposes exactly as:
+
+        attr[j] = Σ_k attr_lag_k[j] + attr_resp[j]
+
+    where attr_lag_k[j] = -0.5 Σ_t pred_lag_k[t,j] * (Σ⁻¹ diff)[t,j]
+    and   attr_resp[j]  = +0.5 Σ_t resp[t,j]        * (Σ⁻¹ diff)[t,j].
+
+    Returns:
+        lag_attr:     (n_delays, n_model_voxels) — attribution from each lag
+        lag_weights:  (n_delays, n_model_voxels) — fraction of weight energy per lag
+    """
+    n_trs, total_feats = del_stim.shape
+    n_delays = len(stim_delays)
+    nf = total_feats // n_delays
+    W = weights[:, voxels]
+    R = resp[:, voxels]
+
+    pred = del_stim @ W
+    diff = pred - R
+    prec_diff = diff @ precision
+
+    lag_attr = np.zeros((n_delays, len(voxels)))
+    lag_weight_energy = np.zeros((n_delays, len(voxels)))
+
+    for ki, d in enumerate(stim_delays):
+        block = slice(ki * nf, (ki + 1) * nf)
+        pred_k = del_stim[:, block] @ W[block, :]
+        lag_attr[ki] = -0.5 * (pred_k * prec_diff).sum(axis=0)
+        lag_weight_energy[ki] = (W[block, :] ** 2).sum(axis=0)
+
+    total_energy = lag_weight_energy.sum(axis=0)
+    total_energy[total_energy == 0] = 1
+    lag_weights = lag_weight_energy / total_energy
+
+    return lag_attr, lag_weights
+
+
 def compute_word_attribution(per_voxel_per_tr, lanczos_mat, stim_delays):
     """Distribute TR-level attribution back to individual words.
 
@@ -401,6 +443,23 @@ def main():
     print(f"    Mean discriminability: {discriminability.mean():.4f}")
 
     # ------------------------------------------------------------------
+    # 3b. Lag decomposition
+    # ------------------------------------------------------------------
+    print(f"\n--- Lag decomposition (delays {config.STIM_DELAYS} TRs = {[d*2 for d in config.STIM_DELAYS]}s) ---\n")
+    lag_attr, lag_weights = compute_lag_attribution(
+        del_stim, data["resp"], data["em_data"]["weights"], voxels, precision,
+        config.STIM_DELAYS,
+    )
+
+    print(f"    {'Lag (TRs)':<12s}  {'Delay (s)':<10s}  {'Mean attr':>10s}  {'% of pred attr':>15s}")
+    print(f"    {'─'*12}  {'─'*10}  {'─'*10}  {'─'*15}")
+    pred_attr_total = lag_attr.sum()
+    for ki, d in enumerate(config.STIM_DELAYS):
+        la_mean = lag_attr[ki].mean()
+        la_pct = lag_attr[ki].sum() / pred_attr_total * 100 if pred_attr_total != 0 else 0
+        print(f"    {d:<12d}  {d*2:<10d}  {la_mean:10.4f}  {la_pct:14.1f}%")
+
+    # ------------------------------------------------------------------
     # 4. Word-level attribution
     # ------------------------------------------------------------------
     print(f"\n--- Word-level attribution ---\n")
@@ -438,6 +497,33 @@ def main():
             print_roi_table(local_rois, per_voxel_total, discriminability, total_ll)
 
     if local_rois is not None and len(local_rois) >= 2:
+        # lag × region table
+        print(f"\n--- Lag × Region attribution ---\n")
+        region_names = sorted(local_rois)
+        hdr = f"    {'Lag':>4s}  {'Delay':>6s}"
+        for name in region_names:
+            hdr += f"  {name:>20s}"
+        print(hdr)
+        print(f"    {'─'*4}  {'─'*6}" + "".join(f"  {'─'*20}" for _ in region_names))
+        for ki, d in enumerate(config.STIM_DELAYS):
+            row = f"    {d:4d}  {d*2:5d}s"
+            for name in region_names:
+                idx = local_rois[name]
+                val = lag_attr[ki, idx].mean() if len(idx) > 0 else 0
+                row += f"  {val:20.6f}"
+            print(row)
+        # weight profile
+        print(f"\n    Weight energy fraction per lag:")
+        print(f"    {'Lag':>4s}  {'Delay':>6s}" + "".join(f"  {name:>20s}" for name in region_names))
+        print(f"    {'─'*4}  {'─'*6}" + "".join(f"  {'─'*20}" for _ in region_names))
+        for ki, d in enumerate(config.STIM_DELAYS):
+            row = f"    {d:4d}  {d*2:5d}s"
+            for name in region_names:
+                idx = local_rois[name]
+                val = lag_weights[ki, idx].mean() if len(idx) > 0 else 0
+                row += f"  {val:20.4f}"
+            print(row)
+
         # per-word breakdown by region
         print(f"\n--- Per-word attribution by region (top 15 words) ---\n")
         hdr_parts = [f"    {'word':>15s}"]
@@ -485,6 +571,9 @@ def main():
         tr_times=data["tr_times"],
         voxels=voxels,
         total_likelihood=total_ll,
+        lag_attr=lag_attr,
+        lag_weights=lag_weights,
+        stim_delays=np.array(config.STIM_DELAYS),
     )
     np.savez(str(save_path), **save_dict)
 
@@ -498,6 +587,9 @@ def main():
     print(f"    decoded_words        ({len(decoded_words)},)           decoded word strings")
     print(f"    word_embs            {word_embs.shape}     GPT embeddings per word")
     print(f"    voxels               ({len(voxels)},)           global voxel indices")
+    print(f"    lag_attr             {lag_attr.shape}      per-lag, per-voxel attribution")
+    print(f"    lag_weights          {lag_weights.shape}      weight energy fraction per lag")
+    print(f"    stim_delays          ({len(config.STIM_DELAYS)},)              FIR delays in TRs")
 
     print("\n" + "=" * 65)
     print("  Done.")
