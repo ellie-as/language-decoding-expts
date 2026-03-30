@@ -279,7 +279,7 @@ def download_train_data():
     else:
         print(f"\n  Downloading training TextGrids from OpenNeuro ({OPENNEURO_TRAIN}) ...")
         stim_dir.mkdir(parents=True, exist_ok=True)
-        prefix = f"{OPENNEURO_TRAIN}/derivative/TextGrids/"
+        prefix = f"{OPENNEURO_TRAIN}/derivatives/TextGrids/"
         try:
             tg_files = _s3_list_files(prefix)
             tg_files = [f for f in tg_files if f.endswith(".TextGrid")]
@@ -313,7 +313,7 @@ def download_train_data():
             print(f"\n  --- {uts_id} -> {subj_id} ---")
             subj_dir = resp_dir / subj_id
             subj_dir.mkdir(parents=True, exist_ok=True)
-            prefix = f"{OPENNEURO_TRAIN}/derivative/preprocessed_data/{uts_id}/"
+            prefix = f"{OPENNEURO_TRAIN}/derivatives/preprocessed_data/{uts_id}/"
             try:
                 s3_files = _s3_list_files(prefix)
                 hf5_files = [f for f in s3_files if f.endswith(".hf5")]
