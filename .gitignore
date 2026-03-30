@@ -1,0 +1,68 @@
+# Ignore everything by default
+/*
+
+# Keep this file
+!/.gitignore
+
+# Keep top-level files you want tracked
+!/NOTES.md
+!/README.md
+!/requirements.txt
+!/create_frontal_rois.py
+!/plot_frontal_rois.py
+!/run_analysis.py
+!/run_attribution.py
+!/show_predictions.py
+!/test_pretrained.py
+!/frontal_rois_UTS01.json
+!/frontal_rois_UTS02.json
+!/frontal_rois_UTS03.json
+!/frontal_rois_figure.png
+!/nihms-2005151.pdf
+
+# Keep the decoding folder and its contents
+!/decoding/
+!/decoding/**
+
+# Explicitly ignore large/local folders
+/data_test/
+/data_lm/
+/models/
+
+# Python cache / temp files anywhere
+__pycache__/
+*.py[codz]
+*$py.class
+.ipynb_checkpoints/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Virtual environments / env files
+.env
+.envrc
+.venv/
+venv/
+env/
+ENV/
+
+# Build / packaging artifacts
+build/
+dist/
+.eggs/
+*.egg-info/
+*.egg
+pip-log.txt
+pip-delete-this-directory.txt
+
+# OS / editor clutter
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Logs
+*.log
