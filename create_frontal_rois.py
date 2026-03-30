@@ -134,13 +134,23 @@ FRONTAL_LABELS = {
 # ─────────────────────────────────────────────────────────────────────────────
 
 BRODMANN_LABELS = {
-    # --- BA 10: frontopolar cortex ---
+    # --- BA 10: frontopolar cortex + medial BA 10/32 + ventromedial BA 10/11 ---
+    # DK 'superiorfrontal' covers the medial wall of SFG (BA 9 medial); added
+    # to ba9_46 rather than here.  rostralanteriorcingulate (rostral ACC /
+    # vmPFC) and medialorbitofrontal (gyrus rectus) fill the medial/orbital
+    # BA 10 territory that frontalpole alone misses.
     "ba10": {
         "frontalpole":              (1032, 2032),
+        "rostralanteriorcingulate": (1026, 2026),  # medial BA 10/32 (vmPFC)
+        "medialorbitofrontal":      (1014, 2014),  # ventromedial BA 10/11
     },
-    # --- BA 9/46: dorsolateral prefrontal cortex (DLPFC) ---
+    # --- BA 9/46: dorsolateral prefrontal cortex (DLPFC) + medial BA 9 ---
+    # DK 'superiorfrontal' includes the medial wall of the superior frontal
+    # gyrus, which corresponds to medial BA 9 / pre-SMA territory (pre-SMA
+    # proper sits at the BA 6/8/9 border on the medial wall).
     "ba9_46": {
         "rostralmiddlefrontal":     (1027, 2027),
+        "superiorfrontal":          (1028, 2028),  # medial BA 9 / SFG medial wall
     },
     # --- BA 8: frontal eye field / dorsal premotor ---
     "ba8": {
