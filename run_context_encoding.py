@@ -205,16 +205,29 @@ def features_to_tr(word_vecs, word_seqs, stories):
 # ROI summary
 # ---------------------------------------------------------------------------
 
-def print_roi_summary(all_corrs, rois_path, context_lengths, model_types):
-    """Print per-ROI mean encoding correlation for every condition."""
+def print_roi_summary(all_corrs, rois_path, vox, context_lengths, model_types):
+    """Print per-ROI mean encoding correlation for every condition.
+
+    *vox* maps local indices (into corrs) to global voxel indices.
+    ROI files use global indices, so we build a reverse mapping.
+    """
     with open(rois_path) as f:
         rois = json.load(f)
     region_names = sorted(rois.keys())
 
+    global_to_local = {int(g): i for i, g in enumerate(vox)}
+
+    local_rois = {}
+    for rn in region_names:
+        local_rois[rn] = np.array(
+            [global_to_local[v] for v in rois[rn] if v in global_to_local],
+            dtype=int,
+        )
+
     hdr = f"  {'condition':<25s}"
     for rn in region_names:
-        hdr += f"  {rn:>22s}"
-    hdr += f"  {'all_voxels':>12s}"
+        hdr += f"  {rn + f' ({len(local_rois[rn])})':>25s}"
+    hdr += f"  {'all':>10s}"
 
     print("\n" + "=" * len(hdr))
     print("  Per-ROI mean encoding correlation")
@@ -230,11 +243,10 @@ def print_roi_summary(all_corrs, rois_path, context_lengths, model_types):
             corrs = all_corrs[label]
             row = f"  {label:<25s}"
             for rn in region_names:
-                idx = np.array(rois[rn], dtype=int)
-                valid = idx[idx < len(corrs)]
-                mean_r = corrs[valid].mean() if len(valid) > 0 else float("nan")
-                row += f"  {mean_r:22.4f}"
-            row += f"  {corrs.mean():12.4f}"
+                idx = local_rois[rn]
+                mean_r = corrs[idx].mean() if len(idx) > 0 else float("nan")
+                row += f"  {mean_r:25.4f}"
+            row += f"  {corrs.mean():10.4f}"
             print(row)
         print()
 
@@ -242,6 +254,46 @@ def print_roi_summary(all_corrs, rois_path, context_lengths, model_types):
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
+def load_voxel_set(subject, all_voxels):
+    """Load the language-responsive voxel indices from the pretrained model.
+
+    Falls back to all voxels if no pretrained model is found.
+    Returns (voxel_indices, is_subset) where voxel_indices index into the
+    full response matrix.
+    """
+    em_path = os.path.join(config.MODEL_DIR, subject, "encoding_model_perceived.npz")
+    if os.path.exists(em_path):
+        em = np.load(em_path)
+        vox = em["voxels"]
+        log.info("Loaded %d language-responsive voxels from pretrained model",
+                 len(vox))
+        return vox, True
+    log.warning("No pretrained model found at %s — using all %d voxels "
+                "(may require a lot of RAM)", em_path, all_voxels)
+    return np.arange(all_voxels), False
+
+
+def chunked_bootstrap_ridge(rstim, rresp, chunk_size=10000, **kwargs):
+    """Run bootstrap_ridge in voxel chunks to stay within memory limits."""
+    n_voxels = rresp.shape[1]
+    if n_voxels <= chunk_size:
+        wt, valphas, bscorrs = bootstrap_ridge(rstim, rresp, **kwargs)
+        corrs = bscorrs.mean(2).max(0)
+        del bscorrs
+        return corrs, wt
+
+    all_corrs = np.zeros(n_voxels)
+    all_wt = None
+    for start in range(0, n_voxels, chunk_size):
+        end = min(start + chunk_size, n_voxels)
+        log.info("  Voxel chunk [%d:%d] / %d", start, end, n_voxels)
+        wt, valphas, bscorrs = bootstrap_ridge(
+            rstim, rresp[:, start:end], **kwargs)
+        all_corrs[start:end] = bscorrs.mean(2).max(0)
+        del wt, bscorrs
+    return all_corrs, None
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -260,6 +312,14 @@ def main():
                              "(e.g. frontal_rois_UTS01.json)")
     parser.add_argument("--nboots", type=int, default=config.NBOOTS)
     parser.add_argument("--output-dir", default="context_results")
+    parser.add_argument("--voxels-from-rois", action="store_true",
+                        help="Use only voxels inside the ROIs (requires --rois)")
+    parser.add_argument("--all-voxels", action="store_true",
+                        help="Use all voxels instead of pretrained language-"
+                             "responsive set (needs more RAM, uses chunking)")
+    parser.add_argument("--voxel-chunk-size", type=int, default=10000,
+                        help="Voxel chunk size when using --all-voxels "
+                             "(default 10000)")
     parser.add_argument("--save-weights", action="store_true",
                         help="Also save full regression weights (large files)")
     args = parser.parse_args()
@@ -281,8 +341,33 @@ def main():
     # Word sequences & fMRI responses
     # ------------------------------------------------------------------
     word_seqs = get_story_wordseqs(stories)
-    rresp = get_resp(args.subject, stories, stack=True)
-    log.info("Response matrix: %s (TRs x voxels)", rresp.shape)
+    rresp_full = get_resp(args.subject, stories, stack=True)
+    log.info("Full response matrix: %s (TRs x voxels)", rresp_full.shape)
+
+    # ------------------------------------------------------------------
+    # Voxel selection
+    # ------------------------------------------------------------------
+    if args.voxels_from_rois:
+        if not args.rois or not os.path.exists(args.rois):
+            log.error("--voxels-from-rois requires --rois <file>")
+            sys.exit(1)
+        with open(args.rois) as f:
+            rois = json.load(f)
+        roi_voxels = set()
+        for idx_list in rois.values():
+            roi_voxels.update(idx_list)
+        vox = np.sort(np.array(list(roi_voxels), dtype=int))
+        vox = vox[vox < rresp_full.shape[1]]
+        log.info("Using %d voxels from ROIs (%s)", len(vox), args.rois)
+    elif args.all_voxels:
+        vox = np.arange(rresp_full.shape[1])
+        log.info("Using ALL %d voxels (chunked processing)", len(vox))
+    else:
+        vox, _ = load_voxel_set(args.subject, rresp_full.shape[1])
+
+    rresp = rresp_full[:, vox]
+    del rresp_full
+    log.info("Working response matrix: %s (TRs x voxels)", rresp.shape)
 
     # ------------------------------------------------------------------
     # Output directory
@@ -334,16 +419,15 @@ def main():
             log.info("Bootstrap ridge regression (%d boots, chunklen=%d, "
                      "nchunks=%d)...", args.nboots, config.CHUNKLEN, nchunks)
 
-            wt, valphas, bscorrs = bootstrap_ridge(
+            corrs, wt = chunked_bootstrap_ridge(
                 rstim, rresp,
+                chunk_size=args.voxel_chunk_size,
                 alphas=config.ALPHAS,
                 nboots=args.nboots,
                 chunklen=config.CHUNKLEN,
                 nchunks=nchunks,
                 use_corr=True,
             )
-            # Per-voxel correlation: mean across bootstraps, best alpha
-            corrs = bscorrs.mean(2).max(0)
             del rstim
 
             all_corrs[label] = corrs
@@ -353,16 +437,16 @@ def main():
             # 4. Save per-condition results
             save_dict = dict(
                 corrs=corrs,
-                alphas=valphas,
+                voxels=vox,
                 model_type=np.array(model_type),
                 context_length=np.array(ctx_len),
                 stories=np.array(stories),
             )
-            if args.save_weights:
+            if args.save_weights and wt is not None:
                 save_dict["weights"] = wt
 
             np.savez(os.path.join(out_dir, f"{label}.npz"), **save_dict)
-            del wt, bscorrs
+            del wt
             log.info("  -> saved %s/%s.npz", out_dir, label)
 
     # ------------------------------------------------------------------
@@ -371,6 +455,7 @@ def main():
     summary = {label: c for label, c in all_corrs.items()}
     summary["context_lengths"] = np.array(args.context_lengths)
     summary["model_types"] = np.array(args.models)
+    summary["voxels"] = vox
     np.savez(os.path.join(out_dir, "summary.npz"), **summary)
 
     # ------------------------------------------------------------------
@@ -378,7 +463,7 @@ def main():
     # ------------------------------------------------------------------
     log.info("")
     log.info("=" * 60)
-    log.info("SUMMARY — per-voxel encoding correlation")
+    log.info("SUMMARY — per-voxel encoding correlation (%d voxels)", len(vox))
     log.info("=" * 60)
     for label, corrs in all_corrs.items():
         log.info("  %-25s  mean=%.4f  max=%.4f  n(r>0.1)=%d",
@@ -388,7 +473,7 @@ def main():
     # Optional ROI breakdown
     # ------------------------------------------------------------------
     if args.rois and os.path.exists(args.rois):
-        print_roi_summary(all_corrs, args.rois, args.context_lengths,
+        print_roi_summary(all_corrs, args.rois, vox, args.context_lengths,
                           args.models)
 
     log.info("All results saved to %s", out_dir)
