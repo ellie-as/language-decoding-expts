@@ -3,14 +3,18 @@
 Test pretrained semantic decoding models from Tang et al. (2023).
 
 This script runs the full pipeline using pre-fit encoding and word rate models:
-  1. Downloads required data (language model, test data, pretrained models)
+  1. Downloads required data (language model, train/test data, pretrained models)
   2. Runs the decoder on held-out test brain responses
   3. Evaluates predictions against reference transcripts
   4. Prints decoded text and similarity scores
 
 Usage:
-  # First time: download all required data
+  # Download everything (LM, training data, test data, model instructions)
   python test_pretrained.py download
+
+  # Or download training / test data separately
+  python test_pretrained.py download-train
+  python test_pretrained.py download-test
 
   # See what subjects, experiments, and tasks are available
   python test_pretrained.py list
@@ -44,10 +48,12 @@ DECODING_DIR = REPO_DIR / "decoding"
 sys.path.insert(0, str(DECODING_DIR))
 
 DATA_LM_URL = "https://utexas.box.com/shared/static/7ab8qm5e3i0vfsku0ee4dc6hzgeg7nyh.zip"
+DATA_TRAIN_URL = "https://utexas.box.com/shared/static/3go1g4gcdar2cntjit2knz5jwr3mvxwe.zip"
 MODELS_FOLDER_URL = "https://utexas.box.com/s/ri13t06iwpkyk17h8tfk0dtyva7qtqlz"
 
 S3_BASE = "https://s3.amazonaws.com/openneuro.org"
 OPENNEURO_TEST = "ds004510"
+OPENNEURO_TRAIN = "ds003020"
 OPENNEURO_SUBJECTS = ["UTS01", "UTS02", "UTS03"]
 
 TASK_TO_EXPERIMENT = {
@@ -241,9 +247,92 @@ def _generate_eval_segments(data_test_dir, out_path):
     print(f"    Saved eval_segments.json ({len(segments)} tasks)")
 
 
-def download_data():
-    """Download language-model data, test data, and pretrained models."""
-    # LM data
+def download_train_data():
+    """Download training data: metadata from Box, stimuli+responses from OpenNeuro ds003020."""
+    target = REPO_DIR / "data_train"
+
+    # Step 1: metadata zip from Box (sess_to_story, respdict, ROIs)
+    meta_marker = target / "sess_to_story.json"
+    if meta_marker.exists():
+        print(f"  [exists]  data_train/ metadata (sess_to_story.json etc.)")
+    else:
+        print(f"\n  Downloading training metadata from Box ...")
+        zip_path = REPO_DIR / "data_train.zip"
+        try:
+            _download_with_progress(DATA_TRAIN_URL, zip_path)
+            target.mkdir(parents=True, exist_ok=True)
+            print(f"  Extracting to data_train/ ...")
+            _extract_zip(zip_path, target)
+            zip_path.unlink()
+            print(f"  [ok]  data_train/ metadata")
+        except Exception as exc:
+            print(f"  [error]  {exc}")
+            if zip_path.exists():
+                zip_path.unlink()
+            return
+
+    # Step 2: stimulus TextGrids from OpenNeuro ds003020
+    stim_dir = target / "train_stimulus"
+    if stim_dir.exists() and list(stim_dir.glob("*.TextGrid")):
+        n_existing = len(list(stim_dir.glob("*.TextGrid")))
+        print(f"  [exists]  train_stimulus/ ({n_existing} TextGrids)")
+    else:
+        print(f"\n  Downloading training TextGrids from OpenNeuro ({OPENNEURO_TRAIN}) ...")
+        stim_dir.mkdir(parents=True, exist_ok=True)
+        prefix = f"{OPENNEURO_TRAIN}/derivative/TextGrids/"
+        try:
+            tg_files = _s3_list_files(prefix)
+            tg_files = [f for f in tg_files if f.endswith(".TextGrid")]
+            for s3_key in tg_files:
+                fname = s3_key.split("/")[-1]
+                dest = stim_dir / fname
+                if dest.exists():
+                    print(f"    [exists] {fname}")
+                    continue
+                url = f"{S3_BASE}/{s3_key}"
+                _download_with_progress(url, dest)
+            print(f"  [ok]  train_stimulus/")
+        except Exception as exc:
+            print(f"  [error]  Could not list/download TextGrids: {exc}")
+            print(f"  You can download them manually from:")
+            print(f"    https://openneuro.org/datasets/{OPENNEURO_TRAIN}")
+
+    # Step 3: fMRI responses from OpenNeuro ds003020
+    # Map UTS IDs to model subject IDs (S1, S2, S3)
+    model_subjects = _detect_model_subjects() or ["S1", "S2", "S3"]
+    uts_to_subj = dict(zip(OPENNEURO_SUBJECTS[:len(model_subjects)], model_subjects))
+
+    resp_dir = target / "train_response"
+    if resp_dir.exists() and list(resp_dir.rglob("*.hf5")):
+        n_existing = len(list(resp_dir.rglob("*.hf5")))
+        print(f"  [exists]  train_response/ ({n_existing} response files)")
+    else:
+        print(f"\n  Downloading training responses from OpenNeuro ({OPENNEURO_TRAIN}) ...")
+        resp_dir.mkdir(parents=True, exist_ok=True)
+        for uts_id, subj_id in uts_to_subj.items():
+            print(f"\n  --- {uts_id} -> {subj_id} ---")
+            subj_dir = resp_dir / subj_id
+            subj_dir.mkdir(parents=True, exist_ok=True)
+            prefix = f"{OPENNEURO_TRAIN}/derivative/preprocessed_data/{uts_id}/"
+            try:
+                s3_files = _s3_list_files(prefix)
+                hf5_files = [f for f in s3_files if f.endswith(".hf5")]
+                for s3_key in hf5_files:
+                    fname = s3_key.split("/")[-1]
+                    dest = subj_dir / fname
+                    if dest.exists():
+                        print(f"    [exists] {fname}")
+                        continue
+                    url = f"{S3_BASE}/{s3_key}"
+                    _download_with_progress(url, dest)
+            except Exception as exc:
+                print(f"    [error] {uts_id}: {exc}")
+
+        print(f"\n  [ok]  train_response/")
+
+
+def download_lm():
+    """Download language model data from Box."""
     lm_target = REPO_DIR / "data_lm"
     if lm_target.exists() and any(lm_target.iterdir()):
         print(f"  [exists]  data_lm/  — Language model data")
@@ -262,10 +351,13 @@ def download_data():
             if zip_path.exists():
                 zip_path.unlink()
 
-    # Test data from OpenNeuro
+
+def download_all():
+    """Download everything: LM, training data, test data, and pretrained models."""
+    download_lm()
+    download_train_data()
     download_test_data()
 
-    # Models
     models_dir = REPO_DIR / "models"
     if models_dir.exists() and any(models_dir.iterdir()):
         print(f"\n  [exists]  models/  — Pretrained encoding + word-rate models")
@@ -615,7 +707,9 @@ def main():
     )
     sub = top.add_subparsers(dest="command")
 
-    sub.add_parser("download", help="Download required data (LM, test, models)")
+    sub.add_parser("download", help="Download everything (LM, train, test, models)")
+    sub.add_parser("download-train", help="Download training data (metadata + stimuli + fMRI responses)")
+    sub.add_parser("download-test", help="Download test data (stimuli + fMRI responses from OpenNeuro)")
     sub.add_parser("list", help="List available subjects / experiments / tasks")
 
     run_p = sub.add_parser("run", help="Run decoding and/or evaluation")
@@ -640,8 +734,20 @@ def main():
     print("=" * 62)
 
     if args.command == "download":
-        print("\n--- Downloading data ---\n")
-        download_data()
+        print("\n--- Downloading all data ---\n")
+        download_all()
+        return
+
+    if args.command == "download-train":
+        print("\n--- Downloading training data ---\n")
+        download_lm()
+        download_train_data()
+        return
+
+    if args.command == "download-test":
+        print("\n--- Downloading test data ---\n")
+        download_lm()
+        download_test_data()
         return
 
     if args.command == "list":

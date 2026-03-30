@@ -10,15 +10,23 @@ We are using the pretrained models from [Tang et al. (2023)](https://www.nature.
 pip install -r requirements.txt
 ```
 
-2. **Download language model + test data**:
+2. **Download training data** (LM checkpoint, training stimuli + fMRI responses):
 
 ```bash
-python test_pretrained.py download
+python test_pretrained.py download-train
 ```
 
-This downloads the GPT checkpoint into `data_lm/` and pulls test brain responses + transcripts from [OpenNeuro ds004510](https://openneuro.org/datasets/ds004510/) into `data_test/`.
+This downloads the GPT checkpoint into `data_lm/`, training metadata from [Box](https://utexas.box.com/shared/static/3go1g4gcdar2cntjit2knz5jwr3mvxwe.zip) into `data_train/`, and training stimuli + fMRI responses from [OpenNeuro ds003020](https://openneuro.org/datasets/ds003020/).
 
-3. **Download pretrained models** manually from [Box](https://utexas.app.box.com/s/ri13t06iwpkyk17h8tfk0dtyva7qtqlz). Unzip into `models/` so the layout is:
+3. **Download test data** (test stimuli + fMRI responses):
+
+```bash
+python test_pretrained.py download-test
+```
+
+This downloads test brain responses + transcripts from [OpenNeuro ds004510](https://openneuro.org/datasets/ds004510/) into `data_test/`.
+
+4. **Download pretrained models** manually from [Box](https://utexas.app.box.com/s/ri13t06iwpkyk17h8tfk0dtyva7qtqlz). Unzip into `models/` so the layout is:
 
 ```
 models/
@@ -30,7 +38,7 @@ models/
   S3/...
 ```
 
-4. **Verify** everything is in place:
+5. **Verify** everything is in place:
 
 ```bash
 python test_pretrained.py list
