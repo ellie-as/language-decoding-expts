@@ -19,9 +19,16 @@ Models
 
 Usage
 -----
-  python run_context_encoding.py --subject S1
+  # Run on all frontal voxels for S1 (reads ba_indices/UTS01/)
+  python run_context_encoding.py --subject S1 --voxels-from-rois
+
+  # Subset of models and context lengths
   python run_context_encoding.py --subject S1 --models gpt1 gpt2 \\
-      --context-lengths 20 60 200 --rois frontal_rois_UTS01.json
+      --context-lengths 20 60 200 --voxels-from-rois
+
+  # Custom BA directory
+  python run_context_encoding.py --subject S1 --voxels-from-rois \\
+      --ba-dir /path/to/ba_indices
 
 GPT-2 is downloaded from Hugging Face on first use. On slow clusters, set
 HF_HUB_DOWNLOAD_TIMEOUT=600 or pass --gpt2-model /path/to/local/gpt2.
@@ -46,6 +53,7 @@ from utils_ridge.util import make_delayed
 
 CONTEXT_LENGTHS = [20, 40, 60, 100, 200]
 MODEL_CHOICES = ["gpt1", "gpt2", "gpt2-pool", "embedding"]
+SUBJECT_TO_UTS = {"S1": "UTS01", "S2": "UTS02", "S3": "UTS03"}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -262,14 +270,33 @@ def features_to_tr(word_vecs, word_seqs, stories):
 # ROI summary
 # ---------------------------------------------------------------------------
 
-def print_roi_summary(all_corrs, rois_path, vox, context_lengths, model_types):
+def load_ba_rois(ba_subject_dir):
+    """Load all individual BA ROI files from a subject's ba_indices directory.
+
+    Returns a dict mapping region name (e.g. "BA_10") to a list of voxel
+    indices.  Skips BA_full_frontal since that's the union used for voxel
+    selection, not a sub-region.
+    """
+    import glob as globmod
+    rois = {}
+    for path in sorted(globmod.glob(os.path.join(ba_subject_dir, "*.json"))):
+        fname = os.path.basename(path)
+        if fname == "BA_full_frontal.json":
+            continue
+        with open(path) as f:
+            d = json.load(f)
+        for key, indices in d.items():
+            rois[key] = indices
+    return rois
+
+
+def print_roi_summary(all_corrs, ba_subject_dir, vox, context_lengths, model_types):
     """Print per-ROI mean encoding correlation for every condition.
 
+    Loads individual BA files from *ba_subject_dir* (e.g. ba_indices/UTS01/).
     *vox* maps local indices (into corrs) to global voxel indices.
-    ROI files use global indices, so we build a reverse mapping.
     """
-    with open(rois_path) as f:
-        rois = json.load(f)
+    rois = load_ba_rois(ba_subject_dir)
     region_names = sorted(rois.keys())
 
     global_to_local = {int(g): i for i, g in enumerate(vox)}
@@ -371,13 +398,17 @@ def main():
              "https://huggingface.co/openai-community/gpt2). Use a path if the cluster "
              "cannot reach huggingface.co.",
     )
-    parser.add_argument("--rois", default=None,
-                        help="Frontal ROI JSON for per-region summary "
-                             "(e.g. frontal_rois_UTS01.json)")
+    parser.add_argument(
+        "--ba-dir",
+        default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "ba_indices"),
+        help="Directory containing per-subject Brodmann area indices "
+             "(default: ba_indices/ in repo root)",
+    )
     parser.add_argument("--nboots", type=int, default=config.NBOOTS)
     parser.add_argument("--output-dir", default="context_results")
     parser.add_argument("--voxels-from-rois", action="store_true",
-                        help="Use only voxels inside the ROIs (requires --rois)")
+                        help="Restrict to frontal voxels from ba_indices/ "
+                             "(uses BA_full_frontal.json for the subject)")
     parser.add_argument("--all-voxels", action="store_true",
                         help="Use all voxels instead of pretrained language-"
                              "responsive set (needs more RAM, uses chunking)")
@@ -411,18 +442,21 @@ def main():
     # ------------------------------------------------------------------
     # Voxel selection
     # ------------------------------------------------------------------
+    uts_id = SUBJECT_TO_UTS.get(args.subject)
+    ba_subject_dir = os.path.join(args.ba_dir, uts_id) if uts_id else None
+
     if args.voxels_from_rois:
-        if not args.rois or not os.path.exists(args.rois):
-            log.error("--voxels-from-rois requires --rois <file>")
+        if not ba_subject_dir or not os.path.isdir(ba_subject_dir):
+            log.error("--voxels-from-rois: no BA directory found at %s "
+                      "(subject %s -> %s)", ba_subject_dir, args.subject, uts_id)
             sys.exit(1)
-        with open(args.rois) as f:
-            rois = json.load(f)
-        roi_voxels = set()
-        for idx_list in rois.values():
-            roi_voxels.update(idx_list)
-        vox = np.sort(np.array(list(roi_voxels), dtype=int))
+        frontal_path = os.path.join(ba_subject_dir, "BA_full_frontal.json")
+        with open(frontal_path) as f:
+            frontal = json.load(f)
+        frontal_voxels = list(frontal.values())[0]
+        vox = np.sort(np.array(frontal_voxels, dtype=int))
         vox = vox[vox < rresp_full.shape[1]]
-        log.info("Using %d voxels from ROIs (%s)", len(vox), args.rois)
+        log.info("Using %d frontal voxels from %s", len(vox), frontal_path)
     elif args.all_voxels:
         vox = np.arange(rresp_full.shape[1])
         log.info("Using ALL %d voxels (chunked processing)", len(vox))
@@ -538,9 +572,9 @@ def main():
     # ------------------------------------------------------------------
     # Optional ROI breakdown
     # ------------------------------------------------------------------
-    if args.rois and os.path.exists(args.rois):
-        print_roi_summary(all_corrs, args.rois, vox, args.context_lengths,
-                          args.models)
+    if ba_subject_dir and os.path.isdir(ba_subject_dir):
+        print_roi_summary(all_corrs, ba_subject_dir, vox,
+                          args.context_lengths, args.models)
 
     log.info("All results saved to %s", out_dir)
 
