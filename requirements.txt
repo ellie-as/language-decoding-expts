@@ -8,3 +8,4 @@ jiwer
 datasets
 bert_score
 nibabel
+openai

@@ -13,12 +13,11 @@ Usage:
 import argparse
 import json
 import os
-import re
 import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 REPO_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_DIR / "decoding"))
@@ -103,24 +102,6 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def parse_json_object(text: str) -> Dict[str, str]:
-    text = text.strip()
-    try:
-        obj = json.loads(text)
-        if isinstance(obj, dict):
-            return obj
-    except json.JSONDecodeError:
-        pass
-
-    match = re.search(r"\{.*\}", text, flags=re.DOTALL)
-    if match:
-        obj = json.loads(match.group(0))
-        if isinstance(obj, dict):
-            return obj
-
-    raise ValueError("Could not parse model output as JSON object.")
-
-
 def build_user_prompt(
     words: List[str],
     end_exclusive: int,
@@ -134,26 +115,16 @@ def build_user_prompt(
     return (
         f"Summarize the context below in exactly {summary_words} words.\n"
         "Preserve story content faithfully. Do not add unsupported details.\n"
-        "Return ONLY valid JSON with exactly one key: \"summary\".\n\n"
-        f"CONTEXT_WINDOW_WORDS: {context_window}\n"
-        f"CONTEXT:\n{snippet}"
+        "Return only the summary text, with no preamble, labels, quotes, or JSON.\n\n"
+        f"TEXT:\n{snippet}"
     )
 
 
-def enforce_exact_word_count(
-    text: str,
-    target_words: int,
-    pad_token: str = "[PAD]",
-) -> Tuple[str, int, int]:
+def enforce_max_word_count(text: str, target_words: int) -> str:
     tokens = text.strip().split()
-    original_count = len(tokens)
-    if original_count >= target_words:
-        trimmed = " ".join(tokens[:target_words])
-        return trimmed, original_count, 0
-
-    pad_count = target_words - original_count
-    padded = " ".join(tokens + [pad_token] * pad_count)
-    return padded, original_count, pad_count
+    if len(tokens) <= target_words:
+        return " ".join(tokens)
+    return " ".join(tokens[:target_words])
 
 
 def request_summary(
@@ -167,11 +138,7 @@ def request_summary(
     n_retries: int = 5,
 ) -> Dict[str, object]:
     if end_exclusive <= 0:
-        return {
-            "summary": " ".join(["[PAD]"] * summary_words),
-            "original_word_count": 0,
-            "pad_word_count": summary_words,
-        }
+        return {"summary": "", "summary_word_count": 0}
 
     prompt = build_user_prompt(
         words=words,
@@ -182,7 +149,7 @@ def request_summary(
     system_prompt = (
         "You summarize stories faithfully. "
         "Do not add speculation. "
-        "Output must be JSON only."
+        "Output only summary text."
     )
 
     for attempt in range(n_retries):
@@ -191,23 +158,16 @@ def request_summary(
                 model=model,
                 temperature=0.2,
                 max_tokens=max_summary_tokens,
-                response_format={"type": "json_object"},
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": prompt},
                 ],
             )
-            content = response.choices[0].message.content or "{}"
-            parsed = parse_json_object(content)
-            raw_summary = str(parsed.get("summary", "")).strip()
-            fixed_summary, original_count, pad_count = enforce_exact_word_count(
-                raw_summary,
-                target_words=summary_words,
-            )
+            raw_summary = (response.choices[0].message.content or "").strip()
+            fixed_summary = enforce_max_word_count(raw_summary, target_words=summary_words)
             return {
                 "summary": fixed_summary,
-                "original_word_count": original_count,
-                "pad_word_count": pad_count,
+                "summary_word_count": len(fixed_summary.split()) if fixed_summary else 0,
             }
         except (RateLimitError, APITimeoutError, APIError, ValueError) as err:
             if attempt == n_retries - 1:
@@ -315,8 +275,7 @@ def main() -> None:
                     "n_words_seen": end_exclusive,
                     "context_words_used": int(min(w, end_exclusive)),
                     "summary": summary_data["summary"],
-                    "summary_original_word_count": summary_data["original_word_count"],
-                    "summary_pad_word_count": summary_data["pad_word_count"],
+                    "summary_word_count": summary_data["summary_word_count"],
                 }
                 file_handles[w].write(json.dumps(row, ensure_ascii=True) + "\n")
 

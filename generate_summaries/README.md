@@ -74,5 +74,5 @@ Each JSONL line has:
 - `tr_index`, `tr_time_s`
 - `n_words_seen`
 - `context_words_used` (actual available words in that context)
-- `summary` (forced to exactly `summary_words` tokens)
-- `summary_original_word_count`, `summary_pad_word_count`
+- `summary` (plain text from model, truncated to at most `summary_words`)
+- `summary_word_count`

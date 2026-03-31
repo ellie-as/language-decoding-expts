@@ -19,6 +19,8 @@
 !/frontal_rois_UTS03.json
 !/frontal_rois_figure.png
 !/nihms-2005151.pdf
+!/generate_summaries/
+!/generate_summaries/**
 
 # Keep the decoding folder and its contents
 !/decoding/
@@ -28,6 +30,7 @@
 /data_test/
 /data_lm/
 /models/
+/generate_summaries/outputs/
 
 # Python cache / temp files anywhere
 __pycache__/
