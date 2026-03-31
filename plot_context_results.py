@@ -3,15 +3,14 @@
 Plot results from run_context_encoding.py.
 
 Loads all completed condition .npz files and produces:
-  1. ROI bar/line plots comparing context lengths per frontal subregion
+  1. ROI bar/line plots comparing context lengths per Brodmann area
   2. (Optional) pycortex flatmaps if the pycortex database is available
 
 Usage:
-  python plot_context_results.py --subject S1 --rois frontal_rois_UTS01.json
+  python plot_context_results.py --subject S1
 
   # With pycortex brain maps (requires pycortex + pycortex-db for the subject)
-  python plot_context_results.py --subject S1 --rois frontal_rois_UTS01.json \
-      --pycortex-subject UTS01
+  python plot_context_results.py --subject S1 --pycortex-subject UTS01
 """
 
 import os
@@ -30,8 +29,13 @@ REPO_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(REPO_DIR / "decoding"))
 import config
 
-REGION_ORDER = ["posterior_frontal", "middle_frontal", "anterior_frontal"]
-REGION_LABELS = ["Posterior\nfrontal", "Middle\nfrontal", "Anterior\nfrontal"]
+SUBJECT_TO_UTS = {"S1": "UTS01", "S2": "UTS02", "S3": "UTS03"}
+
+REGION_ORDER = ["BA_6", "BA_8", "BA_9_46", "BA_10", "BROCA"]
+REGION_LABELS = ["BA 6\n(premotor)", "BA 8\n(FEF)", "BA 9/46\n(DLPFC)",
+                 "BA 10\n(frontopolar)", "Broca's\narea"]
+REGION_COLORS = ["#4c72b0", "#dd8452", "#55a868", "#c44e52", "#8172b3"]
+
 MODEL_CMAP = {
     "gpt1": "Blues", "gpt2": "Oranges", "gpt2-pool": "Reds",
     "embedding": "Greens",
@@ -56,6 +60,20 @@ def load_all_conditions(results_dir):
         d = np.load(path, allow_pickle=True)
         results[name] = {k: d[k] for k in d.files}
     return results
+
+
+def load_ba_rois(ba_subject_dir):
+    """Load individual BA ROI files, skipping BA_full_frontal."""
+    rois = {}
+    for path in sorted(glob(os.path.join(ba_subject_dir, "*.json"))):
+        fname = os.path.basename(path)
+        if fname == "BA_full_frontal.json":
+            continue
+        with open(path) as f:
+            d = json.load(f)
+        for key, indices in d.items():
+            rois[key] = indices
+    return rois
 
 
 def build_roi_table(results, rois, vox):
@@ -131,15 +149,14 @@ def plot_roi_lines(table, results, save_path):
 
 
 def plot_roi_bars(table, results, save_path):
-    """Grouped bar chart: groups = context lengths, bars = frontal subregions,
+    """Grouped bar chart: groups = context lengths, bars = Brodmann areas,
     separate panel per model."""
     models = sorted({parse_label(l)[0] for l in table})
     ctx_lengths = sorted({parse_label(l)[1] for l in table})
 
-    fig, axes = plt.subplots(1, len(models), figsize=(5 * len(models), 4.5),
+    fig, axes = plt.subplots(1, len(models), figsize=(5.5 * len(models), 5),
                              sharey=True, squeeze=False)
     axes = axes[0]
-    region_colors = ["#4c72b0", "#dd8452", "#55a868"]
 
     for ai, model in enumerate(models):
         ax = axes[ai]
@@ -154,7 +171,7 @@ def plot_roi_bars(table, results, save_path):
                 label = f"{model}_ctx{ctx}"
                 vals.append(table[label][rn] if label in table else np.nan)
             offset = (ri - (n_reg - 1) / 2) * bar_w
-            ax.bar(x + offset, vals, bar_w * 0.9, color=region_colors[ri],
+            ax.bar(x + offset, vals, bar_w * 0.9, color=REGION_COLORS[ri],
                    label=REGION_LABELS[ri].replace("\n", " "))
 
         ax.set_xticks(x)
@@ -163,10 +180,10 @@ def plot_roi_bars(table, results, save_path):
         ax.set_title(model.upper(), fontsize=12, fontweight="bold")
         if ai == 0:
             ax.set_ylabel("Mean encoding correlation (r)")
-            ax.legend(fontsize=8)
+            ax.legend(fontsize=7)
         ax.grid(axis="y", alpha=0.3)
 
-    fig.suptitle("Encoding correlation by context length and frontal subregion",
+    fig.suptitle("Encoding correlation by context length and Brodmann area",
                  fontsize=13, y=1.02)
     fig.tight_layout()
     fig.savefig(save_path, dpi=150, bbox_inches="tight")
@@ -175,7 +192,7 @@ def plot_roi_bars(table, results, save_path):
 
 
 def plot_per_voxel_hist(results, local_rois, save_path):
-    """Per-voxel correlation histograms, one panel per condition, colored by ROI."""
+    """Per-voxel correlation histograms, one panel per condition, colored by BA."""
     labels = sorted(results.keys(), key=lambda l: (parse_label(l)[0], parse_label(l)[1]))
     n = len(labels)
     ncols = min(3, n)
@@ -183,7 +200,6 @@ def plot_per_voxel_hist(results, local_rois, save_path):
 
     fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 3.5 * nrows),
                              squeeze=False)
-    region_colors = ["#4c72b0", "#dd8452", "#55a868"]
 
     for i, label in enumerate(labels):
         ax = axes[i // ncols, i % ncols]
@@ -192,19 +208,19 @@ def plot_per_voxel_hist(results, local_rois, save_path):
             idx = local_rois.get(rn, np.array([], dtype=int))
             if len(idx) == 0:
                 continue
-            ax.hist(corrs[idx], bins=30, alpha=0.5, color=region_colors[ri],
-                    label=rn.replace("_", " "), density=True)
+            ax.hist(corrs[idx], bins=30, alpha=0.45, color=REGION_COLORS[ri],
+                    label=REGION_LABELS[ri].replace("\n", " "), density=True)
         model, ctx = parse_label(label)
         ax.set_title(f"{model.upper()} ctx={ctx}", fontsize=10)
         ax.set_xlabel("r")
         if i == 0:
-            ax.legend(fontsize=7)
+            ax.legend(fontsize=6)
         ax.axvline(0, color="gray", linewidth=0.5)
 
     for i in range(n, nrows * ncols):
         axes[i // ncols, i % ncols].set_visible(False)
 
-    fig.suptitle("Per-voxel encoding correlation distributions by ROI",
+    fig.suptitle("Per-voxel encoding correlation distributions by Brodmann area",
                  fontsize=13, y=1.01)
     fig.tight_layout()
     fig.savefig(save_path, dpi=150, bbox_inches="tight")
@@ -252,8 +268,12 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--subject", required=True)
-    parser.add_argument("--rois", required=True,
-                        help="Frontal ROI JSON (e.g. frontal_rois_UTS01.json)")
+    parser.add_argument(
+        "--ba-dir",
+        default=str(REPO_DIR / "ba_indices"),
+        help="Directory containing per-subject Brodmann area indices "
+             "(default: ba_indices/ in repo root)",
+    )
     parser.add_argument("--results-dir", default=None,
                         help="Override results directory "
                              "(default: context_results/<subject>)")
@@ -273,6 +293,14 @@ def main():
         print("Run run_context_encoding.py first.")
         sys.exit(1)
 
+    # Resolve BA directory for this subject
+    uts_id = SUBJECT_TO_UTS.get(args.subject)
+    ba_subject_dir = os.path.join(args.ba_dir, uts_id) if uts_id else None
+    if not ba_subject_dir or not os.path.isdir(ba_subject_dir):
+        print(f"No BA directory found at {ba_subject_dir} "
+              f"(subject {args.subject} -> {uts_id})")
+        sys.exit(1)
+
     # Load all completed conditions
     results = load_all_conditions(results_dir)
     if not results:
@@ -287,9 +315,8 @@ def main():
     first = next(iter(results.values()))
     vox = first["voxels"]
 
-    # Load ROIs
-    with open(args.rois) as f:
-        rois = json.load(f)
+    # Load ROIs from BA files
+    rois = load_ba_rois(ba_subject_dir)
 
     # Build ROI table
     table, local_rois = build_roi_table(results, rois, vox)
