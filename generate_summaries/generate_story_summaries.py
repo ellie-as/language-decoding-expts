@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
-Generate rolling context summaries at each TR for one story.
+Generate rolling context summaries at each TR for one or more stories.
 
-For each TR, this script summarizes the last N words (default: 50, 200, 500)
+For each TR, this script summarizes the last N words
+(default: 20, 50, 200, 500)
 using the OpenAI API and enforces a fixed summary length (default: 50 words).
 It saves separate JSONL + metadata files per context length.
 
 Usage:
   python generate_summaries/generate_story_summaries.py --story alternateithicatom
+  python generate_summaries/generate_story_summaries.py
 """
 
 import argparse
@@ -44,19 +46,19 @@ def list_available_stories() -> List[str]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Generate rolling summaries at each TR for one story."
+        description="Generate rolling summaries at each TR for one or all stories."
     )
     parser.add_argument(
         "--story",
         type=str,
         default=None,
-        help="Story name from data_train textgrids. Required unless --list-stories is set.",
+        help="Story name from data_train textgrids. If omitted, runs all stories.",
     )
     parser.add_argument(
         "--windows",
         type=int,
         nargs="+",
-        default=[50, 200, 500],
+        default=[20, 50, 200, 500],
         help="Word-window sizes to summarize at each TR.",
     )
     parser.add_argument(
@@ -190,14 +192,20 @@ def main() -> None:
         print("\n".join(available_stories))
         return
 
-    if not args.story:
-        raise ValueError("Pass --story <story_name> or use --list-stories.")
-
-    if args.story not in available_stories and available_stories:
-        raise ValueError(
-            f"Story '{args.story}' not found in sess_to_story.json. "
-            f"Example stories: {available_stories[:10]}"
-        )
+    if args.story:
+        if args.story not in available_stories and available_stories:
+            raise ValueError(
+                f"Story '{args.story}' not found in sess_to_story.json. "
+                f"Example stories: {available_stories[:10]}"
+            )
+        stories_to_run = [args.story]
+    else:
+        if not available_stories:
+            raise ValueError(
+                "No stories found in data_train/sess_to_story.json. "
+                "Use --story if you want to run a specific story path."
+            )
+        stories_to_run = available_stories
 
     windows = sorted(set(args.windows))
     if windows[0] <= 0:
@@ -205,108 +213,114 @@ def main() -> None:
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    safe_model = args.model.replace("/", "_")
-    output_paths = {
-        w: {
-            "jsonl": out_dir / f"{args.story}.{safe_model}.ctx{w}.jsonl",
-            "meta": out_dir / f"{args.story}.{safe_model}.ctx{w}.meta.json",
-        }
-        for w in windows
-    }
-    if not args.overwrite:
-        existing = []
-        for w in windows:
-            if output_paths[w]["jsonl"].exists() or output_paths[w]["meta"].exists():
-                existing.append(w)
-        if existing:
-            raise FileExistsError(
-                "Output exists for these context windows. Use --overwrite to replace: "
-                + ", ".join(str(w) for w in existing)
-            )
-
-    print(f"Loading story word sequence: {args.story}")
-    word_seq = get_story_wordseqs([args.story])[args.story]
-    words = list(word_seq.data)
-
-    tr_count = len(word_seq.split_inds) + 1
-    tr_times = list(word_seq.tr_times)
-    split_inds = list(word_seq.split_inds)
-    end_exclusive_by_tr = split_inds + [len(words)]
-
-    if args.max_trs is not None:
-        tr_count = min(tr_count, args.max_trs)
-        tr_times = tr_times[:tr_count]
-        end_exclusive_by_tr = end_exclusive_by_tr[:tr_count]
-
-    print(f"Story has {len(words)} words, {tr_count} TRs to summarize.")
-
     if "OPENAI_API_KEY" not in os.environ:
         raise EnvironmentError(
             "OPENAI_API_KEY is not set. Export it before running this script."
         )
 
     client = OpenAI()
-    file_handles = {
-        w: open(output_paths[w]["jsonl"], "w", encoding="utf-8")
-        for w in windows
-    }
-    try:
-        for tr_idx in range(tr_count):
-            end_exclusive = int(end_exclusive_by_tr[tr_idx])
-            for w in windows:
-                summary_data = request_summary(
-                    client=client,
-                    model=args.model,
-                    words=words,
-                    end_exclusive=end_exclusive,
-                    context_window=w,
-                    summary_words=args.summary_words,
-                    max_summary_tokens=args.max_summary_tokens,
-                )
-                row = {
-                    "story": args.story,
-                    "model": args.model,
-                    "context_window_words": w,
-                    "summary_words": args.summary_words,
-                    "tr_index": tr_idx,
-                    "tr_time_s": (
-                        float(tr_times[tr_idx]) if tr_idx < len(tr_times) else None
-                    ),
-                    "n_words_seen": end_exclusive,
-                    "context_words_used": int(min(w, end_exclusive)),
-                    "summary": summary_data["summary"],
-                    "summary_word_count": summary_data["summary_word_count"],
-                }
-                file_handles[w].write(json.dumps(row, ensure_ascii=True) + "\n")
 
-            if (tr_idx + 1) % 10 == 0 or tr_idx == tr_count - 1:
-                print(f"  summarized TR {tr_idx + 1}/{tr_count}")
-    finally:
-        for handle in file_handles.values():
-            handle.close()
+    safe_model = args.model.replace("/", "_")
+    print(f"Running {len(stories_to_run)} story(s): {', '.join(stories_to_run)}")
 
-    for w in windows:
-        metadata = {
-            "created_at_utc": datetime.now(timezone.utc).isoformat(),
-            "story": args.story,
-            "model": args.model,
-            "context_window_words": w,
-            "summary_words": args.summary_words,
-            "tr_count": tr_count,
-            "total_words": len(words),
-            "max_summary_tokens": args.max_summary_tokens,
-            "jsonl_path": str(output_paths[w]["jsonl"]),
-            "notes": (
-                "One JSON object per TR. Summary text is forced to exactly summary_words."
-            ),
+    for story_name in stories_to_run:
+        output_paths = {
+            w: {
+                "jsonl": out_dir / f"{story_name}.{safe_model}.ctx{w}.jsonl",
+                "meta": out_dir / f"{story_name}.{safe_model}.ctx{w}.meta.json",
+            }
+            for w in windows
         }
-        with open(output_paths[w]["meta"], "w", encoding="utf-8") as f:
-            json.dump(metadata, f, indent=2)
 
-    print("\nSaved files:")
-    for w in windows:
-        print(f"  ctx={w}: {output_paths[w]['jsonl']}")
-        print(f"           {output_paths[w]['meta']}")
+        if not args.overwrite:
+            existing = []
+            for w in windows:
+                if output_paths[w]["jsonl"].exists() or output_paths[w]["meta"].exists():
+                    existing.append(w)
+            if existing:
+                raise FileExistsError(
+                    f"Output exists for story '{story_name}' context windows: "
+                    + ", ".join(str(w) for w in existing)
+                    + ". Use --overwrite to replace."
+                )
+
+        print(f"\nLoading story word sequence: {story_name}")
+        word_seq = get_story_wordseqs([story_name])[story_name]
+        words = list(word_seq.data)
+
+        tr_count = len(word_seq.split_inds) + 1
+        tr_times = list(word_seq.tr_times)
+        split_inds = list(word_seq.split_inds)
+        end_exclusive_by_tr = split_inds + [len(words)]
+
+        if args.max_trs is not None:
+            tr_count = min(tr_count, args.max_trs)
+            tr_times = tr_times[:tr_count]
+            end_exclusive_by_tr = end_exclusive_by_tr[:tr_count]
+
+        print(f"Story has {len(words)} words, {tr_count} TRs to summarize.")
+
+        file_handles = {
+            w: open(output_paths[w]["jsonl"], "w", encoding="utf-8")
+            for w in windows
+        }
+        try:
+            for tr_idx in range(tr_count):
+                end_exclusive = int(end_exclusive_by_tr[tr_idx])
+                for w in windows:
+                    summary_data = request_summary(
+                        client=client,
+                        model=args.model,
+                        words=words,
+                        end_exclusive=end_exclusive,
+                        context_window=w,
+                        summary_words=args.summary_words,
+                        max_summary_tokens=args.max_summary_tokens,
+                    )
+                    row = {
+                        "story": story_name,
+                        "model": args.model,
+                        "context_window_words": w,
+                        "summary_words": args.summary_words,
+                        "tr_index": tr_idx,
+                        "tr_time_s": (
+                            float(tr_times[tr_idx]) if tr_idx < len(tr_times) else None
+                        ),
+                        "n_words_seen": end_exclusive,
+                        "context_words_used": int(min(w, end_exclusive)),
+                        "summary": summary_data["summary"],
+                        "summary_word_count": summary_data["summary_word_count"],
+                    }
+                    file_handles[w].write(json.dumps(row, ensure_ascii=True) + "\n")
+
+                if (tr_idx + 1) % 10 == 0 or tr_idx == tr_count - 1:
+                    print(f"  summarized TR {tr_idx + 1}/{tr_count}")
+        finally:
+            for handle in file_handles.values():
+                handle.close()
+
+        for w in windows:
+            metadata = {
+                "created_at_utc": datetime.now(timezone.utc).isoformat(),
+                "story": story_name,
+                "model": args.model,
+                "context_window_words": w,
+                "summary_words": args.summary_words,
+                "tr_count": tr_count,
+                "total_words": len(words),
+                "max_summary_tokens": args.max_summary_tokens,
+                "jsonl_path": str(output_paths[w]["jsonl"]),
+                "notes": (
+                    "One JSON object per TR. Summary text is truncated to at most summary_words."
+                ),
+            }
+            with open(output_paths[w]["meta"], "w", encoding="utf-8") as f:
+                json.dump(metadata, f, indent=2)
+
+        print("Saved files:")
+        for w in windows:
+            print(f"  ctx={w}: {output_paths[w]['jsonl']}")
+            print(f"           {output_paths[w]['meta']}")
 
 
 if __name__ == "__main__":
