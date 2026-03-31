@@ -4,16 +4,25 @@
 # Keep this file
 !/.gitignore
 
-# Keep top-level files you want tracked
+# -----------------
+# Keep top-level files
+# -----------------
 !/NOTES.md
 !/README.md
 !/requirements.txt
+
 !/create_frontal_rois.py
+!/create_subj_BA_jsons.py
+!/download_pycortex_files.py
+!/helper.py
 !/plot_frontal_rois.py
+!/plot_context_results.py
 !/run_analysis.py
 !/run_attribution.py
+!/run_context_encoding.py
 !/show_predictions.py
 !/test_pretrained.py
+
 !/frontal_rois_UTS01.json
 !/frontal_rois_UTS02.json
 !/frontal_rois_UTS03.json
@@ -22,17 +31,35 @@
 !/generate_summaries/
 !/generate_summaries/**
 
-# Keep the decoding folder and its contents
+# -----------------
+# Keep folders
+# -----------------
 !/decoding/
 !/decoding/**
 
-# Explicitly ignore large/local folders
+!/atlas_fsaverage/
+!/atlas_fsaverage/**
+
+!/ba_indices/
+!/ba_indices/**
+
+!/ba_plots/
+!/ba_plots/**
+
+!/pycortex-db/
+!/pycortex-db/**
+
+# -----------------
+# Ignore large/local data folders
+# -----------------
 /data_test/
 /data_lm/
 /models/
 /generate_summaries/outputs/
 
-# Python cache / temp files anywhere
+# -----------------
+# Python cache / temp files
+# -----------------
 __pycache__/
 *.py[codz]
 *$py.class
@@ -44,7 +71,9 @@ __pycache__/
 .coverage.*
 htmlcov/
 
-# Virtual environments / env files
+# -----------------
+# Environments
+# -----------------
 .env
 .envrc
 .venv/
@@ -52,20 +81,24 @@ venv/
 env/
 ENV/
 
-# Build / packaging artifacts
+# -----------------
+# Build artifacts
+# -----------------
 build/
 dist/
 .eggs/
 *.egg-info/
 *.egg
-pip-log.txt
-pip-delete-this-directory.txt
 
-# OS / editor clutter
+# -----------------
+# Editor / OS clutter
+# -----------------
 .DS_Store
 Thumbs.db
 .vscode/
 .idea/
 
+# -----------------
 # Logs
+# -----------------
 *.log
