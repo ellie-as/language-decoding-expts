@@ -13,7 +13,7 @@ are saved and optionally summarised by ROI.
 Models
 ------
   gpt1       : OpenAI GPT (openai-gpt), layer 9 hidden states
-  gpt2       : GPT-2 small, last hidden layer
+  gpt2       : GPT-2 small (openai-community/gpt2 on Hugging Face), last layer
   embedding  : Sentence-transformer (all-MiniLM-L6-v2)
 
 Usage
@@ -21,6 +21,9 @@ Usage
   python run_context_encoding.py --subject S1
   python run_context_encoding.py --subject S1 --models gpt1 gpt2 \\
       --context-lengths 20 60 200 --rois frontal_rois_UTS01.json
+
+GPT-2 is downloaded from Hugging Face on first use. On slow clusters, set
+HF_HUB_DOWNLOAD_TIMEOUT=600 or pass --gpt2-model /path/to/local/gpt2.
 """
 
 import os
@@ -50,6 +53,41 @@ logging.basicConfig(
 )
 log = logging.getLogger("context_encoding")
 np.random.seed(42)
+
+
+def _configure_huggingface_downloads():
+    """Raise HF Hub timeouts (default read timeout is ~10s; HPC egress is often slow)."""
+    os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "600")
+    os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "120")
+
+
+def _load_gpt2_with_retry(model_name_or_path, device, n_retries=4):
+    """Load tokenizer + model; retry on timeout / transient network errors."""
+    import time
+    from transformers import GPT2Tokenizer, GPT2Model
+
+    last_err = None
+    for attempt in range(n_retries):
+        try:
+            tokenizer = GPT2Tokenizer.from_pretrained(model_name_or_path)
+            model = GPT2Model.from_pretrained(model_name_or_path).eval().to(device)
+            return tokenizer, model
+        except Exception as e:
+            last_err = e
+            wait = 30 * (attempt + 1)
+            log.warning(
+                "GPT-2 load failed (attempt %d/%d): %s — retrying in %ds",
+                attempt + 1, n_retries, e, wait,
+            )
+            time.sleep(wait)
+    raise RuntimeError(
+        "Could not download/load GPT-2 from Hugging Face. "
+        "On a cluster, either: (1) run once on a machine with fast internet so "
+        "~/.cache/huggingface fills, then copy that cache to the GPU node, or "
+        "(2) pass --gpt2-model /path/to/local/openai-community-gpt2 folder, or "
+        "(3) set TRANSFORMERS_OFFLINE=1 if the model is already cached.\n"
+        f"Original error: {last_err}",
+    ) from last_err
 
 
 # ---------------------------------------------------------------------------
@@ -100,17 +138,19 @@ def extract_gpt1_features(stories, word_seqs, context_words, device,
     return word_vecs
 
 
-def extract_gpt2_features(stories, word_seqs, context_length, device):
+def extract_gpt2_features(stories, word_seqs, context_length, device,
+                          model_name_or_path="openai-community/gpt2"):
     """GPT-2 (small) last-layer hidden states with a sliding word window.
 
     For each word position, the preceding *context_length - 1* words plus the
     current word are concatenated, BPE-tokenised, and fed through GPT-2.
     The hidden state of the last BPE token at the final layer is returned.
-    """
-    from transformers import GPT2Tokenizer, GPT2Model
 
-    tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
-    model = GPT2Model.from_pretrained("gpt2").eval().to(device)
+    *model_name_or_path* is passed to ``from_pretrained`` (Hub id or local dir).
+    """
+    _configure_huggingface_downloads()
+    log.info("Loading GPT-2 from %r (HF timeouts extended via env)", model_name_or_path)
+    tokenizer, model = _load_gpt2_with_retry(model_name_or_path, device)
     hidden_dim = model.config.n_embd
 
     word_vecs = {}
@@ -121,8 +161,11 @@ def extract_gpt2_features(stories, word_seqs, context_length, device):
 
         for i in range(n):
             start = max(0, i - context_length + 1)
-            text = " ".join(words[start:i + 1])
-            ids = tokenizer.encode(text)
+            text = " ".join(w for w in words[start:i + 1] if w.strip())
+            ids = tokenizer.encode(text) if text.strip() else []
+            if len(ids) == 0:
+                vecs[i] = vecs[i - 1] if i > 0 else 0.0
+                continue
             if len(ids) > 1024:
                 ids = ids[-1024:]
             ids_t = torch.tensor([ids], device=device)
@@ -147,6 +190,7 @@ def extract_embedding_features(stories, word_seqs, context_length, device):
     For each word position, the last *context_length* words (including the
     current one) are joined into a string and encoded.
     """
+    _configure_huggingface_downloads()
     from sentence_transformers import SentenceTransformer
 
     st_model = SentenceTransformer("all-MiniLM-L6-v2", device=device)
@@ -307,6 +351,13 @@ def main():
                         default=CONTEXT_LENGTHS)
     parser.add_argument("--models", nargs="+", default=MODEL_CHOICES,
                         choices=MODEL_CHOICES)
+    parser.add_argument(
+        "--gpt2-model",
+        default="openai-community/gpt2",
+        help="Hugging Face model id or local directory (default: openai-community/gpt2, "
+             "https://huggingface.co/openai-community/gpt2). Use a path if the cluster "
+             "cannot reach huggingface.co.",
+    )
     parser.add_argument("--rois", default=None,
                         help="Frontal ROI JSON for per-region summary "
                              "(e.g. frontal_rois_UTS01.json)")
@@ -400,6 +451,7 @@ def main():
                     stories, word_seqs,
                     context_length=ctx_len,
                     device=device,
+                    model_name_or_path=args.gpt2_model,
                 )
             elif model_type == "embedding":
                 word_vecs = extract_embedding_features(
