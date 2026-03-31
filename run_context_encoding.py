@@ -405,6 +405,9 @@ def main():
              "(default: ba_indices/ in repo root)",
     )
     parser.add_argument("--nboots", type=int, default=config.NBOOTS)
+    parser.add_argument("--single-alpha", type=float, default=None,
+                        help="Use a single fixed ridge alpha instead of "
+                             "cross-validated search (e.g. --single-alpha 100)")
     parser.add_argument("--output-dir", default="context_results")
     parser.add_argument("--voxels-from-rois", action="store_true",
                         help="Restrict to frontal voxels from ba_indices/ "
@@ -516,13 +519,15 @@ def main():
 
             # 3. Ridge encoding model (features -> voxels)
             nchunks = int(np.ceil(rresp.shape[0] / 5 / config.CHUNKLEN))
+            alphas = np.array([args.single_alpha]) if args.single_alpha else config.ALPHAS
             log.info("Bootstrap ridge regression (%d boots, chunklen=%d, "
-                     "nchunks=%d)...", args.nboots, config.CHUNKLEN, nchunks)
+                     "nchunks=%d, alphas=%s)...",
+                     args.nboots, config.CHUNKLEN, nchunks, alphas)
 
             corrs, wt = chunked_bootstrap_ridge(
                 rstim, rresp,
                 chunk_size=args.voxel_chunk_size,
-                alphas=config.ALPHAS,
+                alphas=alphas,
                 nboots=args.nboots,
                 chunklen=config.CHUNKLEN,
                 nchunks=nchunks,
