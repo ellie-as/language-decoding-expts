@@ -32,8 +32,14 @@ import config
 
 REGION_ORDER = ["posterior_frontal", "middle_frontal", "anterior_frontal"]
 REGION_LABELS = ["Posterior\nfrontal", "Middle\nfrontal", "Anterior\nfrontal"]
-MODEL_CMAP = {"gpt1": "Blues", "gpt2": "Oranges", "embedding": "Greens"}
-MODEL_COLOR = {"gpt1": "#1f77b4", "gpt2": "#ff7f0e", "embedding": "#2ca02c"}
+MODEL_CMAP = {
+    "gpt1": "Blues", "gpt2": "Oranges", "gpt2-pool": "Reds",
+    "embedding": "Greens",
+}
+MODEL_COLOR = {
+    "gpt1": "#1f77b4", "gpt2": "#ff7f0e", "gpt2-pool": "#d62728",
+    "embedding": "#2ca02c",
+}
 
 
 # ---------------------------------------------------------------------------

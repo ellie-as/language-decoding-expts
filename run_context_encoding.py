@@ -13,8 +13,9 @@ are saved and optionally summarised by ROI.
 Models
 ------
   gpt1       : OpenAI GPT (openai-gpt), layer 9 hidden states
-  gpt2       : GPT-2 small (openai-community/gpt2 on Hugging Face), last layer
-  embedding  : Sentence-transformer (all-MiniLM-L6-v2)
+  gpt2       : GPT-2 small (openai-community/gpt2), last token, last layer
+  gpt2-pool  : GPT-2 small, mean-pooled over all tokens, last layer
+  embedding  : Sentence-transformer (all-MiniLM-L6-v2), mean-pooled
 
 Usage
 -----
@@ -44,7 +45,7 @@ from utils_ridge.interpdata import lanczosinterp2D
 from utils_ridge.util import make_delayed
 
 CONTEXT_LENGTHS = [20, 40, 60, 100, 200]
-MODEL_CHOICES = ["gpt1", "gpt2", "embedding"]
+MODEL_CHOICES = ["gpt1", "gpt2", "gpt2-pool", "embedding"]
 
 logging.basicConfig(
     level=logging.INFO,
@@ -139,17 +140,25 @@ def extract_gpt1_features(stories, word_seqs, context_words, device,
 
 
 def extract_gpt2_features(stories, word_seqs, context_length, device,
-                          model_name_or_path="openai-community/gpt2"):
+                          model_name_or_path="openai-community/gpt2",
+                          pool=False):
     """GPT-2 (small) last-layer hidden states with a sliding word window.
 
     For each word position, the preceding *context_length - 1* words plus the
     current word are concatenated, BPE-tokenised, and fed through GPT-2.
-    The hidden state of the last BPE token at the final layer is returned.
+
+    If *pool* is False (default), the hidden state of the **last BPE token**
+    at the final layer is returned — the standard choice for causal LMs.
+
+    If *pool* is True, the hidden states are **mean-pooled** over all tokens
+    in the sequence.  This gives a representation that weights all context
+    positions equally rather than privileging the most recent token.
 
     *model_name_or_path* is passed to ``from_pretrained`` (Hub id or local dir).
     """
     _configure_huggingface_downloads()
-    log.info("Loading GPT-2 from %r (HF timeouts extended via env)", model_name_or_path)
+    pool_tag = " (mean-pool)" if pool else " (last-token)"
+    log.info("Loading GPT-2 from %r%s", model_name_or_path, pool_tag)
     tokenizer, model = _load_gpt2_with_retry(model_name_or_path, device)
     hidden_dim = model.config.n_embd
 
@@ -171,7 +180,11 @@ def extract_gpt2_features(stories, word_seqs, context_length, device,
             ids_t = torch.tensor([ids], device=device)
             with torch.no_grad():
                 out = model(ids_t, output_hidden_states=True)
-            vecs[i] = out.hidden_states[-1][0, -1].cpu().numpy()
+            hidden = out.hidden_states[-1][0]  # (seq_len, hidden_dim)
+            if pool:
+                vecs[i] = hidden.mean(dim=0).cpu().numpy()
+            else:
+                vecs[i] = hidden[-1].cpu().numpy()
 
             if (i + 1) % 500 == 0:
                 log.info("  %s: %d / %d words", story, i + 1, n)
@@ -446,12 +459,13 @@ def main():
                     context_words=ctx_len - 1,
                     device=device,
                 )
-            elif model_type == "gpt2":
+            elif model_type in ("gpt2", "gpt2-pool"):
                 word_vecs = extract_gpt2_features(
                     stories, word_seqs,
                     context_length=ctx_len,
                     device=device,
                     model_name_or_path=args.gpt2_model,
+                    pool=(model_type == "gpt2-pool"),
                 )
             elif model_type == "embedding":
                 word_vecs = extract_embedding_features(
