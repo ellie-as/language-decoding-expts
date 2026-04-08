@@ -13,8 +13,8 @@ are saved and optionally summarised by ROI.
 Models
 ------
   gpt1       : OpenAI GPT (openai-gpt), layer 9 hidden states
-  gpt2       : GPT-2 small (openai-community/gpt2), last token, last layer
-  gpt2-pool  : GPT-2 small, mean-pooled over all tokens, last layer
+  gpt2       : GPT-2 small (openai-community/gpt2), last token, layer 9
+  gpt2-pool  : GPT-2 small, mean-pooled over all tokens, layer 9
   embedding  : Sentence-transformer (all-MiniLM-L6-v2), mean-pooled
 
 Usage
@@ -150,17 +150,17 @@ def extract_gpt1_features(stories, word_seqs, context_words, device,
 def extract_gpt2_features(stories, word_seqs, context_length, device,
                           model_name_or_path="openai-community/gpt2",
                           pool=False):
-    """GPT-2 (small) last-layer hidden states with a sliding word window.
+    """GPT-2 (small) layer-9 hidden states with a sliding word window.
+
+    Uses layer 9 (of 12) to match GPT-1 extraction, since intermediate layers
+    encode richer semantic features than the final prediction layer.
 
     For each word position, the preceding *context_length - 1* words plus the
     current word are concatenated, BPE-tokenised, and fed through GPT-2.
 
     If *pool* is False (default), the hidden state of the **last BPE token**
-    at the final layer is returned — the standard choice for causal LMs.
-
-    If *pool* is True, the hidden states are **mean-pooled** over all tokens
-    in the sequence.  This gives a representation that weights all context
-    positions equally rather than privileging the most recent token.
+    is returned.  If *pool* is True, the hidden states are **mean-pooled**
+    over all tokens in the sequence.
 
     *model_name_or_path* is passed to ``from_pretrained`` (Hub id or local dir).
     """
@@ -188,7 +188,7 @@ def extract_gpt2_features(stories, word_seqs, context_length, device,
             ids_t = torch.tensor([ids], device=device)
             with torch.no_grad():
                 out = model(ids_t, output_hidden_states=True)
-            hidden = out.hidden_states[-1][0]  # (seq_len, hidden_dim)
+            hidden = out.hidden_states[config.GPT_LAYER][0]  # layer 9, (seq_len, hidden_dim)
             if pool:
                 vecs[i] = hidden.mean(dim=0).cpu().numpy()
             else:
