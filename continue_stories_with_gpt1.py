@@ -315,8 +315,16 @@ def generate_continuations(gpt, prompt_words, args):
 
     prompt_ids_full = gpt.encode(prompt_words)
     model_limit = get_model_context_limit(gpt.model)
-    truncated = len(prompt_ids_full) > model_limit
-    prompt_ids = prompt_ids_full[-model_limit:]
+    if args.max_new_words >= model_limit:
+        raise ValueError(
+            f"--max-new-words ({args.max_new_words}) must be smaller than the model "
+            f"context limit ({model_limit})."
+        )
+
+    prompt_token_budget = model_limit - args.max_new_words
+    truncated = len(prompt_ids_full) > prompt_token_budget
+    prompt_ids = prompt_ids_full[-prompt_token_budget:]
+    prompt_words_used = prompt_words[-len(prompt_ids):] if prompt_ids else []
 
     prompt_unk_count = sum(token_id == gpt.UNK_ID for token_id in prompt_ids_full)
     input_ids = torch.tensor([prompt_ids], dtype=torch.long, device=config.GPT_DEVICE)
@@ -324,6 +332,7 @@ def generate_continuations(gpt, prompt_words, args):
     generate_kwargs = dict(
         input_ids=input_ids,
         max_new_tokens=args.max_new_words,
+        max_length=model_limit,
         num_return_sequences=args.num_return_sequences,
         pad_token_id=getattr(gpt.model.config, "pad_token_id", None) or gpt.UNK_ID,
     )
@@ -361,6 +370,9 @@ def generate_continuations(gpt, prompt_words, args):
         "prompt_unk_fraction": prompt_unk_count / max(1, len(prompt_ids_full)),
         "prompt_truncated_to_model_limit": truncated,
         "model_context_limit": model_limit,
+        "prompt_token_budget": prompt_token_budget,
+        "prompt_word_count_used": len(prompt_words_used),
+        "prompt_text_used": " ".join(prompt_words_used),
     }
 
 
@@ -406,19 +418,29 @@ def main():
             generated = generate_continuations(gpt, extracted["prompt_words"], args)
 
             prompt_text = " ".join(extracted["prompt_words"])
+            prompt_text_used = generated["prompt_text_used"]
             reference_text = " ".join(extracted["reference_words"])
 
             txt_f.write("=" * 100 + "\n")
             txt_f.write(f"STORY: {story}\n")
             txt_f.write(
                 f"PROMPT WORDS: {extracted['prompt_word_count']} / {extracted['story_word_count']}  "
+                f"USED: {generated['prompt_word_count_used']}  "
                 f"METHOD: {extracted['prompt_method']}  "
                 f"UNK: {generated['prompt_unk_count']} ({generated['prompt_unk_fraction']:.3f})\n"
             )
             if generated["prompt_truncated_to_model_limit"]:
-                txt_f.write(f"PROMPT TRUNCATED TO LAST {generated['model_context_limit']} WORD IDS FOR GENERATION\n")
-            txt_f.write("\nPROMPT:\n")
+                txt_f.write(
+                    "PROMPT TRUNCATED FOR GENERATION: "
+                    f"used last {generated['prompt_word_count_used']} words "
+                    f"to leave room for {args.max_new_words} new tokens within "
+                    f"the model limit {generated['model_context_limit']}\n"
+                )
+            txt_f.write("\nFULL EXTRACTED PROMPT:\n")
             txt_f.write(prompt_text + "\n")
+            if generated["prompt_truncated_to_model_limit"]:
+                txt_f.write("\nPROMPT ACTUALLY FED TO MODEL:\n")
+                txt_f.write(prompt_text_used + "\n")
             txt_f.write("\nREFERENCE CONTINUATION:\n")
             txt_f.write((reference_text or "[no held-out reference words]") + "\n")
 
@@ -438,7 +460,10 @@ def main():
                     "prompt_unk_fraction": generated["prompt_unk_fraction"],
                     "prompt_truncated_to_model_limit": generated["prompt_truncated_to_model_limit"],
                     "model_context_limit": generated["model_context_limit"],
-                    "prompt_text": prompt_text,
+                    "prompt_token_budget": generated["prompt_token_budget"],
+                    "prompt_word_count_used": generated["prompt_word_count_used"],
+                    "prompt_text_full": prompt_text,
+                    "prompt_text_used": prompt_text_used,
                     "reference_text": reference_text,
                     "generated_text": sample["continuation_text"],
                 }
