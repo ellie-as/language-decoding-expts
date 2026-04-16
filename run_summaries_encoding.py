@@ -62,7 +62,7 @@ from utils_ridge.util import make_delayed  # noqa: E402
 
 SUBJECT_TO_UTS = {"S1": "UTS01", "S2": "UTS02", "S3": "UTS03"}
 MODEL_CHOICES = ["gpt1", "gpt2", "gpt2-pool", "embedding"]
-ENCODING_MODEL_CHOICES = ["ridge", "pls-ridge", "lgbm"]
+ENCODING_MODEL_CHOICES = ["ridge", "pls-ridge", "mlp", "lgbm"]
 DEFAULT_HOLDOUT_COUNT = 5
 SUMMARY_FILE_RE = re.compile(
     r"^(?P<story>[^.]+)\.(?P<model>.+)\.ctx(?P<horizon>\d+)\.jsonl$"
@@ -151,6 +151,9 @@ def load_voxel_set(subject, all_voxels):
 
 def zscore_columns(mat):
     """Z-score each column, guarding against constant vectors."""
+    mat = np.asarray(mat)
+    if mat.ndim == 1:
+        mat = mat[:, None]
     mean = mat.mean(0)
     std = mat.std(0)
     std[std == 0] = 1
@@ -287,6 +290,145 @@ def fit_chunked_lgbm(
     return all_corrs, None, np.full(n_voxels, np.nan), all_train_fit_corrs
 
 
+def fit_chunked_mlp(
+    rstim,
+    rresp,
+    eval_stim,
+    eval_resp,
+    output_chunk_size=512,
+    hidden_dim=128,
+    activation="relu",
+    alpha=1e-4,
+    learning_rate_init=1e-3,
+    batch_size=64,
+    max_iter=200,
+    early_stopping=True,
+    validation_fraction=0.1,
+    n_iter_no_change=10,
+):
+    """Fit one-hidden-layer PyTorch MLP regressors over chunks of output voxels."""
+    if eval_stim is None or eval_resp is None:
+        raise ValueError(
+            "MLP encoding requires held-out test stories. "
+            "Do not use --no-story-holdout with --encoding-model mlp."
+        )
+
+    device = torch.device(config.EM_DEVICE)
+    log.info("  Torch MLP device: %s", device)
+
+    def make_activation(name):
+        mapping = {
+            "identity": torch.nn.Identity,
+            "logistic": torch.nn.Sigmoid,
+            "tanh": torch.nn.Tanh,
+            "relu": torch.nn.ReLU,
+        }
+        return mapping[name]()
+
+    class ChunkMLP(torch.nn.Module):
+        def __init__(self, input_dim, output_dim):
+            super().__init__()
+            self.net = torch.nn.Sequential(
+                torch.nn.Linear(input_dim, hidden_dim),
+                make_activation(activation),
+                torch.nn.Linear(hidden_dim, output_dim),
+            )
+
+        def forward(self, x):
+            return self.net(x)
+
+    n_voxels = rresp.shape[1]
+    all_corrs = np.zeros(n_voxels)
+    all_train_fit_corrs = np.zeros(n_voxels)
+    rstim_t = torch.tensor(rstim, dtype=torch.float32, device=device)
+    eval_stim_t = torch.tensor(eval_stim, dtype=torch.float32, device=device)
+
+    for start in range(0, n_voxels, output_chunk_size):
+        end = min(start + output_chunk_size, n_voxels)
+        log.info("  Output chunk [%d:%d] / %d", start, end, n_voxels)
+
+        train_chunk = rresp[:, start:end]
+        y_mean = train_chunk.mean(0)
+        y_std = train_chunk.std(0)
+        y_std[y_std == 0] = 1
+        train_chunk_z = np.nan_to_num((train_chunk - y_mean) / y_std)
+        train_chunk_t = torch.tensor(train_chunk_z, dtype=torch.float32, device=device)
+        model = ChunkMLP(rstim.shape[1], end - start).to(device)
+        optimizer = torch.optim.Adam(
+            model.parameters(),
+            lr=learning_rate_init,
+            weight_decay=alpha,
+        )
+        loss_fn = torch.nn.MSELoss()
+
+        n_train = rstim.shape[0]
+        use_early_stopping = early_stopping and n_train >= 10
+        if use_early_stopping:
+            n_val = max(1, int(round(n_train * validation_fraction)))
+            n_val = min(n_val, n_train - 1)
+            rng = np.random.default_rng(42)
+            perm = rng.permutation(n_train)
+            val_idx_np = perm[:n_val]
+            fit_idx_np = perm[n_val:]
+            fit_idx = torch.tensor(fit_idx_np, dtype=torch.long, device=device)
+            val_idx = torch.tensor(val_idx_np, dtype=torch.long, device=device)
+            best_val = float("inf")
+            best_state = None
+            patience = 0
+        else:
+            fit_idx = torch.arange(n_train, device=device)
+            val_idx = None
+            best_val = None
+            best_state = None
+            patience = 0
+
+        for epoch in range(max_iter):
+            model.train()
+            shuffled = fit_idx[torch.randperm(len(fit_idx), device=device)]
+            for batch_start in range(0, len(shuffled), batch_size):
+                batch_idx = shuffled[batch_start:batch_start + batch_size]
+                optimizer.zero_grad(set_to_none=True)
+                pred = model(rstim_t[batch_idx])
+                loss = loss_fn(pred, train_chunk_t[batch_idx])
+                loss.backward()
+                optimizer.step()
+
+            if use_early_stopping:
+                model.eval()
+                with torch.no_grad():
+                    val_loss = loss_fn(model(rstim_t[val_idx]), train_chunk_t[val_idx]).item()
+                if val_loss < best_val - 1e-6:
+                    best_val = val_loss
+                    best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                    patience = 0
+                else:
+                    patience += 1
+                    if patience >= n_iter_no_change:
+                        log.info(
+                            "    early stop at epoch %d with val_loss=%.6f",
+                            epoch + 1,
+                            best_val,
+                        )
+                        break
+
+        if best_state is not None:
+            model.load_state_dict(best_state)
+            model.to(device)
+
+        model.eval()
+        with torch.no_grad():
+            eval_pred = model(eval_stim_t).detach().cpu().numpy().astype(np.float32, copy=False)
+            train_pred = model(rstim_t).detach().cpu().numpy().astype(np.float32, copy=False)
+
+        all_corrs[start:end] = score_prediction_matrix(eval_resp[:, start:end], eval_pred)
+        all_train_fit_corrs[start:end] = score_prediction_matrix(
+            train_chunk,
+            train_pred,
+        )
+
+    return all_corrs, None, np.full(n_voxels, np.nan), all_train_fit_corrs
+
+
 def fit_encoding_model(
     args,
     train_rstim,
@@ -389,6 +531,33 @@ def fit_encoding_model(
         )
         del train_scores, test_scores, pls, wt
         return corrs, None, cv_corrs, None
+
+    if args.encoding_model == "mlp":
+        if args.save_weights:
+            raise ValueError("--save-weights is not supported for --encoding-model mlp.")
+        if args.single_alpha is not None:
+            raise ValueError("--single-alpha only applies to --encoding-model ridge or pls-ridge.")
+
+        mlp_params = {
+            "output_chunk_size": args.mlp_output_chunk_size,
+            "hidden_dim": args.mlp_hidden_dim,
+            "activation": args.mlp_activation,
+            "alpha": args.mlp_alpha,
+            "learning_rate_init": args.mlp_learning_rate_init,
+            "batch_size": args.mlp_batch_size,
+            "max_iter": args.mlp_max_iter,
+            "early_stopping": args.mlp_early_stopping,
+            "validation_fraction": args.mlp_validation_fraction,
+            "n_iter_no_change": args.mlp_n_iter_no_change,
+        }
+        log.info("MLP regression with params: %s", mlp_params)
+        return fit_chunked_mlp(
+            train_rstim,
+            train_rresp,
+            test_rstim,
+            test_rresp,
+            **mlp_params,
+        )
 
     if args.save_weights:
         raise ValueError("--save-weights is only supported for --encoding-model ridge.")
@@ -1055,6 +1224,65 @@ def parse_args():
         help="Convergence tolerance for the PLS solver in --encoding-model pls-ridge.",
     )
     parser.add_argument(
+        "--mlp-output-chunk-size",
+        type=int,
+        default=512,
+        help="Number of voxel outputs per one-hidden-layer PyTorch MLP when --encoding-model mlp.",
+    )
+    parser.add_argument(
+        "--mlp-hidden-dim",
+        type=int,
+        default=128,
+        help="Hidden width for the one-hidden-layer PyTorch MLP when --encoding-model mlp.",
+    )
+    parser.add_argument(
+        "--mlp-activation",
+        default="relu",
+        choices=["identity", "logistic", "tanh", "relu"],
+        help="Hidden activation for the PyTorch MLP when --encoding-model mlp.",
+    )
+    parser.add_argument(
+        "--mlp-alpha",
+        type=float,
+        default=1e-4,
+        help="Adam weight decay for the PyTorch MLP when --encoding-model mlp.",
+    )
+    parser.add_argument(
+        "--mlp-learning-rate-init",
+        type=float,
+        default=1e-3,
+        help="Initial learning rate for the PyTorch MLP when --encoding-model mlp.",
+    )
+    parser.add_argument(
+        "--mlp-batch-size",
+        type=int,
+        default=64,
+        help="Mini-batch size for --encoding-model mlp.",
+    )
+    parser.add_argument(
+        "--mlp-max-iter",
+        type=int,
+        default=200,
+        help="Maximum iterations for --encoding-model mlp.",
+    )
+    parser.add_argument(
+        "--mlp-early-stopping",
+        action="store_true",
+        help="Enable internal validation-based early stopping for --encoding-model mlp.",
+    )
+    parser.add_argument(
+        "--mlp-validation-fraction",
+        type=float,
+        default=0.1,
+        help="Validation fraction used when --mlp-early-stopping is enabled.",
+    )
+    parser.add_argument(
+        "--mlp-n-iter-no-change",
+        type=int,
+        default=10,
+        help="Patience for --encoding-model mlp.",
+    )
+    parser.add_argument(
         "--lgbm-n-estimators",
         type=int,
         default=300,
@@ -1352,7 +1580,7 @@ def main():
                         cv_corrs.max(),
                         (cv_corrs > 0.1).sum(),
                     )
-                elif args.encoding_model == "lgbm":
+                elif args.encoding_model in {"lgbm", "mlp"}:
                     log.info(
                         "  Training fit mean r=%.4f | max r=%.4f | n(r>0.1)=%d",
                         train_fit_corrs.mean(),
@@ -1370,6 +1598,14 @@ def main():
                     encoding_model=np.array(args.encoding_model),
                     pls_n_components=np.array(args.pls_n_components),
                     pls_scale=np.array(args.pls_scale),
+                    mlp_output_chunk_size=np.array(args.mlp_output_chunk_size),
+                    mlp_hidden_dim=np.array(args.mlp_hidden_dim),
+                    mlp_activation=np.array(args.mlp_activation),
+                    mlp_alpha=np.array(args.mlp_alpha),
+                    mlp_learning_rate_init=np.array(args.mlp_learning_rate_init),
+                    mlp_batch_size=np.array(args.mlp_batch_size),
+                    mlp_max_iter=np.array(args.mlp_max_iter),
+                    mlp_early_stopping=np.array(args.mlp_early_stopping),
                     feature_model=np.array(model_type),
                     feature_backend=np.array(encoder.backend),
                     summary_horizon=np.array(horizon),
@@ -1403,6 +1639,14 @@ def main():
     summary["encoding_model"] = np.array(args.encoding_model)
     summary["pls_n_components"] = np.array(args.pls_n_components)
     summary["pls_scale"] = np.array(args.pls_scale)
+    summary["mlp_output_chunk_size"] = np.array(args.mlp_output_chunk_size)
+    summary["mlp_hidden_dim"] = np.array(args.mlp_hidden_dim)
+    summary["mlp_activation"] = np.array(args.mlp_activation)
+    summary["mlp_alpha"] = np.array(args.mlp_alpha)
+    summary["mlp_learning_rate_init"] = np.array(args.mlp_learning_rate_init)
+    summary["mlp_batch_size"] = np.array(args.mlp_batch_size)
+    summary["mlp_max_iter"] = np.array(args.mlp_max_iter)
+    summary["mlp_early_stopping"] = np.array(args.mlp_early_stopping)
     summary["embedding_model"] = np.array(args.embedding_model)
     summary["gpt2_model"] = np.array(args.gpt2_model)
     summary["voxels"] = vox
