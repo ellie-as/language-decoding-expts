@@ -172,6 +172,31 @@ def score_encoding_predictions(stim, resp, wt):
     return score_prediction_matrix(resp, np.dot(stim, wt))
 
 
+def standardize_train_test(train_mat, test_mat=None, eps=1e-6):
+    """Standardize columns using training statistics and drop near-constant columns."""
+    train_mat = np.asarray(train_mat, dtype=np.float32)
+    test_mat = None if test_mat is None else np.asarray(test_mat, dtype=np.float32)
+
+    mean = train_mat.mean(0)
+    std = train_mat.std(0)
+    keep = std > eps
+    if not np.any(keep):
+        raise ValueError(
+            f"All columns have near-zero std after transformation (eps={eps})."
+        )
+
+    mean = mean[keep]
+    std = std[keep]
+    train_z = np.nan_to_num((train_mat[:, keep] - mean) / std)
+    if test_mat is None:
+        test_z = None
+    else:
+        test_z = np.nan_to_num((test_mat[:, keep] - mean) / std)
+    return train_z.astype(np.float32, copy=False), (
+        None if test_z is None else test_z.astype(np.float32, copy=False)
+    ), keep
+
+
 def chunked_bootstrap_ridge(
     rstim,
     rresp,
@@ -471,6 +496,12 @@ def fit_encoding_model(
                 "pls-ridge without story holdout fits the PLS transform before bootstrap CV, "
                 "so the reported CV score may be optimistic. Prefer the default held-out-story evaluation."
             )
+        if args.single_alpha is not None:
+            log.warning(
+                "Using --single-alpha=%s for pls-ridge. If this value came from plain ridge, "
+                "it may not transfer well to the PLS latent space; consider omitting it first.",
+                args.single_alpha,
+            )
 
         from sklearn.cross_decomposition import PLSRegression
 
@@ -508,6 +539,24 @@ def fit_encoding_model(
             test_scores = pls.transform(test_rstim).astype(np.float32, copy=False)
         else:
             test_scores = None
+
+        raw_score_std = train_scores.std(0)
+        log.info(
+            "PLS raw score std: min=%.3e median=%.3e max=%.3e",
+            float(raw_score_std.min()),
+            float(np.median(raw_score_std)),
+            float(raw_score_std.max()),
+        )
+        train_scores, test_scores, keep = standardize_train_test(
+            train_scores,
+            test_scores,
+            eps=1e-6,
+        )
+        log.info(
+            "Retained %d / %d PLS components after dropping near-zero latent dims",
+            int(keep.sum()),
+            len(keep),
+        )
 
         log.info(
             "Bootstrap ridge regression on PLS scores (%d boots, chunklen=%d, nchunks=%d, alphas=%s)...",
