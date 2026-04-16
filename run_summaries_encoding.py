@@ -62,7 +62,7 @@ from utils_ridge.util import make_delayed  # noqa: E402
 
 SUBJECT_TO_UTS = {"S1": "UTS01", "S2": "UTS02", "S3": "UTS03"}
 MODEL_CHOICES = ["gpt1", "gpt2", "gpt2-pool", "embedding"]
-ENCODING_MODEL_CHOICES = ["ridge", "lgbm"]
+ENCODING_MODEL_CHOICES = ["ridge", "pls-ridge", "lgbm"]
 DEFAULT_HOLDOUT_COUNT = 5
 SUMMARY_FILE_RE = re.compile(
     r"^(?P<story>[^.]+)\.(?P<model>.+)\.ctx(?P<horizon>\d+)\.jsonl$"
@@ -295,9 +295,10 @@ def fit_encoding_model(
     test_rresp,
 ):
     """Dispatch to the requested encoding model backend."""
+    alphas = np.array([args.single_alpha]) if args.single_alpha else config.ALPHAS
+    nchunks = int(np.ceil(train_rresp.shape[0] / 5 / config.CHUNKLEN))
+
     if args.encoding_model == "ridge":
-        alphas = np.array([args.single_alpha]) if args.single_alpha else config.ALPHAS
-        nchunks = int(np.ceil(train_rresp.shape[0] / 5 / config.CHUNKLEN))
         log.info(
             "Bootstrap ridge regression (%d boots, chunklen=%d, nchunks=%d, alphas=%s)...",
             args.nboots,
@@ -320,10 +321,79 @@ def fit_encoding_model(
         )
         return corrs, wt, cv_corrs, None
 
+    if args.encoding_model == "pls-ridge":
+        if args.save_weights:
+            raise ValueError("--save-weights is not yet supported for --encoding-model pls-ridge.")
+        if test_rstim is None:
+            log.warning(
+                "pls-ridge without story holdout fits the PLS transform before bootstrap CV, "
+                "so the reported CV score may be optimistic. Prefer the default held-out-story evaluation."
+            )
+
+        from sklearn.cross_decomposition import PLSRegression
+
+        max_components = min(
+            args.pls_n_components,
+            train_rstim.shape[0] - 1,
+            train_rstim.shape[1],
+        )
+        if max_components < 1:
+            raise ValueError(
+                "PLS needs at least one component. Check the number of training TRs "
+                "and delayed features."
+            )
+        if max_components < args.pls_n_components:
+            log.info(
+                "Reducing PLS components from requested %d to %d based on data shape",
+                args.pls_n_components,
+                max_components,
+            )
+
+        pls = PLSRegression(
+            n_components=max_components,
+            scale=args.pls_scale,
+            max_iter=args.pls_max_iter,
+            tol=args.pls_tol,
+            copy=False,
+        )
+        log.info(
+            "Fitting PLS transform (n_components=%d, scale=%s) on training stories...",
+            max_components,
+            args.pls_scale,
+        )
+        train_scores = pls.fit_transform(train_rstim, train_rresp)[0].astype(np.float32, copy=False)
+        if test_rstim is not None:
+            test_scores = pls.transform(test_rstim).astype(np.float32, copy=False)
+        else:
+            test_scores = None
+
+        log.info(
+            "Bootstrap ridge regression on PLS scores (%d boots, chunklen=%d, nchunks=%d, alphas=%s)...",
+            args.nboots,
+            config.CHUNKLEN,
+            nchunks,
+            alphas,
+        )
+        corrs, wt, cv_corrs = chunked_bootstrap_ridge(
+            train_scores,
+            train_rresp,
+            chunk_size=args.voxel_chunk_size,
+            eval_stim=test_scores,
+            eval_resp=test_rresp,
+            return_weights=False,
+            alphas=alphas,
+            nboots=args.nboots,
+            chunklen=config.CHUNKLEN,
+            nchunks=nchunks,
+            use_corr=True,
+        )
+        del train_scores, test_scores, pls, wt
+        return corrs, None, cv_corrs, None
+
     if args.save_weights:
         raise ValueError("--save-weights is only supported for --encoding-model ridge.")
     if args.single_alpha is not None:
-        raise ValueError("--single-alpha only applies to --encoding-model ridge.")
+        raise ValueError("--single-alpha only applies to --encoding-model ridge or pls-ridge.")
 
     lgbm_params = {
         "n_estimators": args.lgbm_n_estimators,
@@ -959,7 +1029,30 @@ def parse_args():
         "--single-alpha",
         type=float,
         default=None,
-        help="Use a single fixed ridge alpha instead of cross-validated search (ridge only).",
+        help="Use a single fixed ridge alpha instead of cross-validated search (ridge / pls-ridge).",
+    )
+    parser.add_argument(
+        "--pls-n-components",
+        type=int,
+        default=64,
+        help="Number of latent components for --encoding-model pls-ridge.",
+    )
+    parser.add_argument(
+        "--pls-scale",
+        action="store_true",
+        help="Scale X and Y inside PLSRegression for --encoding-model pls-ridge.",
+    )
+    parser.add_argument(
+        "--pls-max-iter",
+        type=int,
+        default=500,
+        help="Maximum iterations for the PLS solver in --encoding-model pls-ridge.",
+    )
+    parser.add_argument(
+        "--pls-tol",
+        type=float,
+        default=1e-6,
+        help="Convergence tolerance for the PLS solver in --encoding-model pls-ridge.",
     )
     parser.add_argument(
         "--lgbm-n-estimators",
@@ -1275,6 +1368,8 @@ def main():
                     ),
                     voxels=vox,
                     encoding_model=np.array(args.encoding_model),
+                    pls_n_components=np.array(args.pls_n_components),
+                    pls_scale=np.array(args.pls_scale),
                     feature_model=np.array(model_type),
                     feature_backend=np.array(encoder.backend),
                     summary_horizon=np.array(horizon),
@@ -1306,6 +1401,8 @@ def main():
     summary["summary_model"] = np.array(summary_model)
     summary["feature_models"] = np.array(args.models)
     summary["encoding_model"] = np.array(args.encoding_model)
+    summary["pls_n_components"] = np.array(args.pls_n_components)
+    summary["pls_scale"] = np.array(args.pls_scale)
     summary["embedding_model"] = np.array(args.embedding_model)
     summary["gpt2_model"] = np.array(args.gpt2_model)
     summary["voxels"] = vox
