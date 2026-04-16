@@ -8,7 +8,7 @@ For each summary horizon, this script:
 1. Loads one summary per TR for every training story
 2. Extracts one feature vector per summary using a chosen text model
 3. Applies the same TR trimming and FIR delays as the context-length pipeline
-4. Trains a ridge encoding model (summary features -> voxels)
+4. Trains an encoding model (summary features -> voxels)
 5. Saves per-voxel prediction correlations for each feature-model / horizon pair
 
 This is analogous to ``run_context_encoding.py``, except the experimental
@@ -22,6 +22,7 @@ Usage
       --summaries-dir /path/to/summaries \
       --summary-model gpt-4o-mini \
       --models gpt1 gpt2 gpt2-pool embedding \
+      --encoding-model ridge \
       --voxels-from-rois
 
   python run_summaries_encoding.py \
@@ -29,15 +30,21 @@ Usage
       --stories wildwomenanddancingqueens \
       --summary-horizons 20 50 200 500 \
       --summaries-dir /path/to/summaries \
+      --encoding-model lgbm \
       --voxels-from-rois
+
+By default, the last few selected stories are held out as a story-level test
+set. Use ``--no-story-holdout`` to revert to within-training bootstrap CV only.
 """
 
 import argparse
+import hashlib
 import json
 import logging
 import os
 import re
 import sys
+import warnings
 from pathlib import Path
 
 import h5py
@@ -55,6 +62,8 @@ from utils_ridge.util import make_delayed  # noqa: E402
 
 SUBJECT_TO_UTS = {"S1": "UTS01", "S2": "UTS02", "S3": "UTS03"}
 MODEL_CHOICES = ["gpt1", "gpt2", "gpt2-pool", "embedding"]
+ENCODING_MODEL_CHOICES = ["ridge", "lgbm"]
+DEFAULT_HOLDOUT_COUNT = 5
 SUMMARY_FILE_RE = re.compile(
     r"^(?P<story>[^.]+)\.(?P<model>.+)\.ctx(?P<horizon>\d+)\.jsonl$"
 )
@@ -140,29 +149,219 @@ def load_voxel_set(subject, all_voxels):
     return np.arange(all_voxels), False
 
 
-def chunked_bootstrap_ridge(rstim, rresp, chunk_size=10000, **kwargs):
+def zscore_columns(mat):
+    """Z-score each column, guarding against constant vectors."""
+    mean = mat.mean(0)
+    std = mat.std(0)
+    std[std == 0] = 1
+    return np.nan_to_num((mat - mean) / std)
+
+
+def score_prediction_matrix(resp, pred):
+    """Column-wise correlation between predicted and observed responses."""
+    corrs = (zscore_columns(resp) * zscore_columns(pred)).mean(0)
+    corrs[np.isnan(corrs)] = 0
+    return corrs
+
+
+def score_encoding_predictions(stim, resp, wt):
+    """Column-wise correlation for a linear model weight matrix."""
+    return score_prediction_matrix(resp, np.dot(stim, wt))
+
+
+def chunked_bootstrap_ridge(
+    rstim,
+    rresp,
+    chunk_size=10000,
+    eval_stim=None,
+    eval_resp=None,
+    return_weights=False,
+    **kwargs,
+):
     """Run bootstrap_ridge in voxel chunks to reduce memory pressure."""
     n_voxels = rresp.shape[1]
     if n_voxels <= chunk_size:
         wt, valphas, bscorrs = bootstrap_ridge(rstim, rresp, **kwargs)
-        corrs = bscorrs.mean(2).max(0)
+        cv_corrs = bscorrs.mean(2).max(0)
+        corrs = (
+            score_encoding_predictions(eval_stim, eval_resp, wt)
+            if eval_stim is not None and eval_resp is not None
+            else cv_corrs
+        )
         del valphas, bscorrs
-        return corrs, wt
+        return corrs, (wt if return_weights else None), cv_corrs
 
     all_corrs = np.zeros(n_voxels)
-    all_wt = None
+    all_cv_corrs = np.zeros(n_voxels)
+    all_wt = (
+        np.zeros((rstim.shape[1], n_voxels), dtype=np.float32)
+        if return_weights
+        else None
+    )
     for start in range(0, n_voxels, chunk_size):
         end = min(start + chunk_size, n_voxels)
         log.info("  Voxel chunk [%d:%d] / %d", start, end, n_voxels)
         wt, valphas, bscorrs = bootstrap_ridge(rstim, rresp[:, start:end], **kwargs)
-        all_corrs[start:end] = bscorrs.mean(2).max(0)
+        chunk_cv_corrs = bscorrs.mean(2).max(0)
+        all_cv_corrs[start:end] = chunk_cv_corrs
+        if eval_stim is not None and eval_resp is not None:
+            all_corrs[start:end] = score_encoding_predictions(
+                eval_stim,
+                eval_resp[:, start:end],
+                wt,
+            )
+        else:
+            all_corrs[start:end] = chunk_cv_corrs
+        if return_weights:
+            all_wt[:, start:end] = wt.astype(np.float32, copy=False)
         del wt, valphas, bscorrs
-    return all_corrs, all_wt
+    return all_corrs, all_wt, all_cv_corrs
+
+
+def fit_chunked_lgbm(
+    rstim,
+    rresp,
+    eval_stim,
+    eval_resp,
+    chunk_size=10000,
+    params=None,
+):
+    """Fit one LightGBM regressor per voxel and score on held-out stories."""
+    if eval_stim is None or eval_resp is None:
+        raise ValueError(
+            "LightGBM encoding requires held-out test stories. "
+            "Do not use --no-story-holdout with --encoding-model lgbm."
+        )
+
+    try:
+        from lightgbm import LGBMRegressor
+    except ImportError as err:
+        raise ImportError(
+            "lightgbm is not installed. Install dependencies from requirements.txt "
+            "or run `pip install lightgbm`."
+        ) from err
+
+    params = dict(params or {})
+    n_voxels = rresp.shape[1]
+    all_corrs = np.zeros(n_voxels)
+    all_train_fit_corrs = np.zeros(n_voxels)
+
+    for start in range(0, n_voxels, chunk_size):
+        end = min(start + chunk_size, n_voxels)
+        log.info("  Voxel chunk [%d:%d] / %d", start, end, n_voxels)
+
+        chunk_eval_pred = np.zeros((eval_stim.shape[0], end - start), dtype=np.float32)
+        chunk_train_pred = np.zeros((rstim.shape[0], end - start), dtype=np.float32)
+
+        for local_idx, voxel_idx in enumerate(range(start, end)):
+            model = LGBMRegressor(**params)
+            model.fit(rstim, rresp[:, voxel_idx])
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore",
+                    message="X does not have valid feature names, but LGBMRegressor was fitted with feature names",
+                    category=UserWarning,
+                )
+                chunk_eval_pred[:, local_idx] = model.predict(
+                    eval_stim,
+                    validate_features=False,
+                ).astype(np.float32, copy=False)
+                chunk_train_pred[:, local_idx] = model.predict(
+                    rstim,
+                    validate_features=False,
+                ).astype(np.float32, copy=False)
+
+            if (local_idx + 1) % 250 == 0 or voxel_idx == end - 1:
+                log.info(
+                    "    fitted %d / %d voxels in current chunk",
+                    local_idx + 1,
+                    end - start,
+                )
+
+        all_corrs[start:end] = score_prediction_matrix(eval_resp[:, start:end], chunk_eval_pred)
+        all_train_fit_corrs[start:end] = score_prediction_matrix(
+            rresp[:, start:end],
+            chunk_train_pred,
+        )
+
+    return all_corrs, None, np.full(n_voxels, np.nan), all_train_fit_corrs
+
+
+def fit_encoding_model(
+    args,
+    train_rstim,
+    train_rresp,
+    test_rstim,
+    test_rresp,
+):
+    """Dispatch to the requested encoding model backend."""
+    if args.encoding_model == "ridge":
+        alphas = np.array([args.single_alpha]) if args.single_alpha else config.ALPHAS
+        nchunks = int(np.ceil(train_rresp.shape[0] / 5 / config.CHUNKLEN))
+        log.info(
+            "Bootstrap ridge regression (%d boots, chunklen=%d, nchunks=%d, alphas=%s)...",
+            args.nboots,
+            config.CHUNKLEN,
+            nchunks,
+            alphas,
+        )
+        corrs, wt, cv_corrs = chunked_bootstrap_ridge(
+            train_rstim,
+            train_rresp,
+            chunk_size=args.voxel_chunk_size,
+            eval_stim=test_rstim,
+            eval_resp=test_rresp,
+            return_weights=args.save_weights,
+            alphas=alphas,
+            nboots=args.nboots,
+            chunklen=config.CHUNKLEN,
+            nchunks=nchunks,
+            use_corr=True,
+        )
+        return corrs, wt, cv_corrs, None
+
+    if args.save_weights:
+        raise ValueError("--save-weights is only supported for --encoding-model ridge.")
+    if args.single_alpha is not None:
+        raise ValueError("--single-alpha only applies to --encoding-model ridge.")
+
+    lgbm_params = {
+        "n_estimators": args.lgbm_n_estimators,
+        "learning_rate": args.lgbm_learning_rate,
+        "num_leaves": args.lgbm_num_leaves,
+        "max_depth": args.lgbm_max_depth,
+        "min_child_samples": args.lgbm_min_child_samples,
+        "subsample": args.lgbm_subsample,
+        "colsample_bytree": args.lgbm_colsample_bytree,
+        "reg_alpha": args.lgbm_reg_alpha,
+        "reg_lambda": args.lgbm_reg_lambda,
+        "n_jobs": args.lgbm_n_jobs,
+        "random_state": 42,
+        "verbosity": -1,
+        "force_col_wise": True,
+    }
+    log.info("LightGBM regression with params: %s", lgbm_params)
+    return fit_chunked_lgbm(
+        train_rstim,
+        train_rresp,
+        test_rstim,
+        test_rresp,
+        chunk_size=args.voxel_chunk_size,
+        params=lgbm_params,
+    )
 
 
 def sanitize_name(value):
     """Make strings safe for filenames while keeping them readable."""
     return re.sub(r"[^A-Za-z0-9._-]+", "-", value)
+
+
+def make_story_split_tag(train_stories, test_stories):
+    """Compact filename-safe tag describing the train/test story split."""
+    if not test_stories:
+        return "bootstrap-cv"
+    digest = hashlib.md5("\n".join(test_stories).encode("utf-8")).hexdigest()[:8]
+    return f"holdout-{len(test_stories)}-{digest}"
 
 
 def load_story_list(args):
@@ -178,6 +377,36 @@ def load_story_list(args):
     for sess in args.sessions:
         stories.extend(sess_to_story[str(sess)])
     return stories
+
+
+def split_story_list(stories, args):
+    """Split selected stories into training and held-out test stories."""
+    if args.no_story_holdout:
+        return list(stories), []
+
+    if args.holdout_stories:
+        requested = list(dict.fromkeys(args.holdout_stories))
+        missing = [story for story in requested if story not in stories]
+        if missing:
+            raise ValueError(
+                f"--holdout-stories contains stories not in the selected set: {missing}"
+            )
+        holdout_set = set(requested)
+        test_stories = [story for story in stories if story in holdout_set]
+    else:
+        if args.holdout_count <= 0:
+            return list(stories), []
+        if args.holdout_count >= len(stories):
+            raise ValueError(
+                f"--holdout-count ({args.holdout_count}) must be smaller than the "
+                f"number of selected stories ({len(stories)})."
+            )
+        test_stories = list(stories[-args.holdout_count :])
+
+    train_stories = [story for story in stories if story not in set(test_stories)]
+    if not train_stories:
+        raise ValueError("Story holdout left zero training stories.")
+    return train_stories, test_stories
 
 
 def build_summary_index(summaries_dir):
@@ -278,17 +507,26 @@ def resolve_summary_horizons(index, stories, summary_model, requested_horizons=N
     return common_horizons
 
 
-def load_resp_lengths(subject, stories):
-    """Read per-story response lengths without loading the full response matrices."""
+def load_resp_info(subject, stories):
+    """Read response shapes without loading the full response matrices."""
     resp_dir = Path(config.DATA_TRAIN_DIR) / "train_response" / subject
     lengths = {}
+    n_voxels = None
     for story in stories:
         resp_path = resp_dir / f"{story}.hf5"
         if not resp_path.exists():
             raise FileNotFoundError(f"Missing response file: {resp_path}")
         with h5py.File(resp_path, "r") as hf:
-            lengths[story] = int(hf["data"].shape[0])
-    return lengths
+            shape = hf["data"].shape
+            lengths[story] = int(shape[0])
+            if n_voxels is None:
+                n_voxels = int(shape[1])
+            elif int(shape[1]) != n_voxels:
+                raise ValueError(
+                    f"Inconsistent voxel count across response files: "
+                    f"{resp_path} has {int(shape[1])}, expected {n_voxels}"
+                )
+    return lengths, n_voxels
 
 
 def load_summary_texts(path, expected_story, expected_model, expected_horizon):
@@ -580,7 +818,7 @@ def build_design_matrix(stories, texts_by_story, resp_lengths, encoder):
 
 def format_condition_row(meta):
     """Compact human-readable label for summaries ROI tables."""
-    return f"{meta['feature_model']}_h{meta['summary_horizon']}"
+    return f"{meta['encoding_model']}_{meta['feature_model']}_h{meta['summary_horizon']}"
 
 
 def print_roi_summary(all_corrs, ba_subject_dir, vox, label_to_meta):
@@ -610,6 +848,7 @@ def print_roi_summary(all_corrs, ba_subject_dir, vox, label_to_meta):
     for label in sorted(
         all_corrs,
         key=lambda item: (
+            label_to_meta[item]["encoding_model"],
             label_to_meta[item]["feature_model"],
             label_to_meta[item]["summary_horizon"],
         ),
@@ -635,7 +874,7 @@ def parse_args():
         "--stories",
         nargs="+",
         default=None,
-        help="Explicit story list. If omitted, stories are derived from --sessions.",
+        help="Story pool to analyze. If omitted, stories are derived from --sessions.",
     )
     parser.add_argument(
         "--sessions",
@@ -643,6 +882,26 @@ def parse_args():
         type=int,
         default=[2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 18, 20],
         help="Training sessions to include when --stories is not provided.",
+    )
+    parser.add_argument(
+        "--holdout-stories",
+        nargs="+",
+        default=None,
+        help="Explicit held-out test stories. Must be a subset of the selected story pool.",
+    )
+    parser.add_argument(
+        "--holdout-count",
+        type=int,
+        default=DEFAULT_HOLDOUT_COUNT,
+        help=(
+            "If --holdout-stories is omitted, hold out the last N selected stories as "
+            "the story-level test set."
+        ),
+    )
+    parser.add_argument(
+        "--no-story-holdout",
+        action="store_true",
+        help="Disable story-level holdout and report only within-training bootstrap CV.",
     )
     parser.add_argument(
         "--summaries-dir",
@@ -667,6 +926,12 @@ def parse_args():
         default=MODEL_CHOICES,
         choices=MODEL_CHOICES,
         help="Feature models to use for encoding the summary text.",
+    )
+    parser.add_argument(
+        "--encoding-model",
+        default="ridge",
+        choices=ENCODING_MODEL_CHOICES,
+        help="Encoding model backend used to predict voxel responses from summary features.",
     )
     parser.add_argument(
         "--embedding-model",
@@ -694,7 +959,67 @@ def parse_args():
         "--single-alpha",
         type=float,
         default=None,
-        help="Use a single fixed ridge alpha instead of cross-validated search.",
+        help="Use a single fixed ridge alpha instead of cross-validated search (ridge only).",
+    )
+    parser.add_argument(
+        "--lgbm-n-estimators",
+        type=int,
+        default=300,
+        help="Number of boosting rounds for --encoding-model lgbm.",
+    )
+    parser.add_argument(
+        "--lgbm-learning-rate",
+        type=float,
+        default=0.05,
+        help="Learning rate for --encoding-model lgbm.",
+    )
+    parser.add_argument(
+        "--lgbm-num-leaves",
+        type=int,
+        default=31,
+        help="Number of leaves per tree for --encoding-model lgbm.",
+    )
+    parser.add_argument(
+        "--lgbm-max-depth",
+        type=int,
+        default=-1,
+        help="Maximum tree depth for --encoding-model lgbm (-1 = unlimited).",
+    )
+    parser.add_argument(
+        "--lgbm-min-child-samples",
+        type=int,
+        default=20,
+        help="Minimum child samples for --encoding-model lgbm.",
+    )
+    parser.add_argument(
+        "--lgbm-subsample",
+        type=float,
+        default=0.8,
+        help="Row subsampling fraction for --encoding-model lgbm.",
+    )
+    parser.add_argument(
+        "--lgbm-colsample-bytree",
+        type=float,
+        default=0.8,
+        help="Feature subsampling fraction per tree for --encoding-model lgbm.",
+    )
+    parser.add_argument(
+        "--lgbm-reg-alpha",
+        type=float,
+        default=0.0,
+        help="L1 regularization for --encoding-model lgbm.",
+    )
+    parser.add_argument(
+        "--lgbm-reg-lambda",
+        type=float,
+        default=0.0,
+        help="L2 regularization for --encoding-model lgbm.",
+    )
+    parser.add_argument(
+        "--lgbm-n-jobs",
+        type=int,
+        default=1,
+        help="Threads per voxel model for --encoding-model lgbm.",
     )
     parser.add_argument(
         "--output-dir",
@@ -736,7 +1061,13 @@ def main():
     log.info("Device: %s", device)
 
     stories = load_story_list(args)
-    log.info("Stories (%d): %s", len(stories), stories)
+    train_stories, test_stories = split_story_list(stories, args)
+    log.info("Selected stories (%d): %s", len(stories), stories)
+    log.info("Training stories (%d): %s", len(train_stories), train_stories)
+    if test_stories:
+        log.info("Held-out test stories (%d): %s", len(test_stories), test_stories)
+    else:
+        log.info("Story-level holdout disabled; scoring will use bootstrap CV within training stories")
 
     summaries_dir = Path(args.summaries_dir).expanduser().resolve()
     if not summaries_dir.is_dir():
@@ -750,10 +1081,19 @@ def main():
     log.info("Summary model: %s", summary_model)
     log.info("Summary horizons: %s", summary_horizons)
     log.info("Feature models: %s", args.models)
+    log.info("Encoding model: %s", args.encoding_model)
 
-    resp_lengths = load_resp_lengths(args.subject, stories)
-    rresp_full = get_resp(args.subject, stories, stack=True)
-    log.info("Full response matrix: %s (TRs x voxels)", rresp_full.shape)
+    train_resp_lengths, total_voxels = load_resp_info(args.subject, train_stories)
+    if test_stories:
+        test_resp_lengths, test_total_voxels = load_resp_info(args.subject, test_stories)
+        if test_total_voxels != total_voxels:
+            raise ValueError(
+                f"Train/test response voxel counts do not match: "
+                f"{total_voxels} vs {test_total_voxels}"
+            )
+    else:
+        test_resp_lengths = {}
+    log.info("Response matrix width: %d voxels", total_voxels)
 
     uts_id = SUBJECT_TO_UTS.get(args.subject)
     ba_subject_dir = os.path.join(args.ba_dir, uts_id) if uts_id else None
@@ -772,17 +1112,21 @@ def main():
             frontal = json.load(f)
         frontal_voxels = list(frontal.values())[0]
         vox = np.sort(np.array(frontal_voxels, dtype=int))
-        vox = vox[vox < rresp_full.shape[1]]
+        vox = vox[vox < total_voxels]
         log.info("Using %d frontal voxels from %s", len(vox), frontal_path)
     elif args.all_voxels:
-        vox = np.arange(rresp_full.shape[1])
+        vox = np.arange(total_voxels)
         log.info("Using ALL %d voxels (chunked processing)", len(vox))
     else:
-        vox, _ = load_voxel_set(args.subject, rresp_full.shape[1])
+        vox, _ = load_voxel_set(args.subject, total_voxels)
 
-    rresp = rresp_full[:, vox]
-    del rresp_full
-    log.info("Working response matrix: %s (TRs x voxels)", rresp.shape)
+    train_rresp = get_resp(args.subject, train_stories, stack=True, vox=vox)
+    log.info("Training response matrix: %s (TRs x voxels)", train_rresp.shape)
+    if test_stories:
+        test_rresp = get_resp(args.subject, test_stories, stack=True, vox=vox)
+        log.info("Held-out test response matrix: %s (TRs x voxels)", test_rresp.shape)
+    else:
+        test_rresp = None
 
     out_dir = Path(config.REPO_DIR) / args.output_dir / args.subject
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -790,9 +1134,9 @@ def main():
     all_corrs = {}
     label_to_meta = {}
     safe_summary_model = sanitize_name(summary_model)
+    safe_encoding_model = sanitize_name(args.encoding_model)
+    split_tag = make_story_split_tag(train_stories, test_stories)
     summary_cache = {}
-    nchunks = int(np.ceil(rresp.shape[0] / 5 / config.CHUNKLEN))
-    alphas = np.array([args.single_alpha]) if args.single_alpha else config.ALPHAS
 
     def get_cached_summaries(horizon):
         if horizon in summary_cache:
@@ -832,15 +1176,20 @@ def main():
         try:
             for horizon in summary_horizons:
                 label = (
-                    f"{safe_feature_model}__{safe_feature_backend}__"
-                    f"{safe_summary_model}__h{horizon}"
+                    f"{safe_encoding_model}__{safe_feature_model}__{safe_feature_backend}__"
+                    f"{safe_summary_model}__h{horizon}__{split_tag}"
                 )
                 out_path = out_dir / f"{label}.npz"
                 meta = {
+                    "encoding_model": args.encoding_model,
                     "feature_model": model_type,
                     "feature_backend": encoder.backend,
                     "summary_horizon": horizon,
                     "summary_model": summary_model,
+                    "split_tag": split_tag,
+                    "evaluation_split": (
+                        "story_holdout" if test_stories else "bootstrap_cv"
+                    ),
                 }
                 label_to_meta[label] = meta
 
@@ -856,46 +1205,76 @@ def main():
 
                 texts_by_story, summary_words = get_cached_summaries(horizon)
 
-                log.info("Extracting %s summary features and building design matrix...", model_type)
-                rstim = build_design_matrix(stories, texts_by_story, resp_lengths, encoder)
-                if rstim.shape[0] != rresp.shape[0]:
+                log.info("Extracting %s summary features and building training design matrix...", model_type)
+                train_rstim = build_design_matrix(
+                    train_stories,
+                    texts_by_story,
+                    train_resp_lengths,
+                    encoder,
+                )
+                if train_rstim.shape[0] != train_rresp.shape[0]:
                     raise ValueError(
-                        f"Design matrix rows ({rstim.shape[0]}) do not match response rows "
-                        f"({rresp.shape[0]})."
+                        f"Training design matrix rows ({train_rstim.shape[0]}) do not match "
+                        f"training response rows ({train_rresp.shape[0]})."
                     )
-                log.info("Design matrix: %s (TRs x delayed features)", rstim.shape)
+                log.info("Training design matrix: %s (TRs x delayed features)", train_rstim.shape)
 
-                log.info(
-                    "Bootstrap ridge regression (%d boots, chunklen=%d, nchunks=%d, alphas=%s)...",
-                    args.nboots,
-                    config.CHUNKLEN,
-                    nchunks,
-                    alphas,
-                )
+                if test_stories:
+                    test_rstim = build_design_matrix(
+                        test_stories,
+                        texts_by_story,
+                        test_resp_lengths,
+                        encoder,
+                    )
+                    if test_rstim.shape[0] != test_rresp.shape[0]:
+                        raise ValueError(
+                            f"Test design matrix rows ({test_rstim.shape[0]}) do not match "
+                            f"test response rows ({test_rresp.shape[0]})."
+                        )
+                    log.info("Held-out test design matrix: %s (TRs x delayed features)", test_rstim.shape)
+                else:
+                    test_rstim = None
 
-                corrs, wt = chunked_bootstrap_ridge(
-                    rstim,
-                    rresp,
-                    chunk_size=args.voxel_chunk_size,
-                    alphas=alphas,
-                    nboots=args.nboots,
-                    chunklen=config.CHUNKLEN,
-                    nchunks=nchunks,
-                    use_corr=True,
+                corrs, wt, cv_corrs, train_fit_corrs = fit_encoding_model(
+                    args,
+                    train_rstim,
+                    train_rresp,
+                    test_rstim,
+                    test_rresp,
                 )
-                del rstim
+                del train_rstim, test_rstim
 
                 all_corrs[label] = corrs
                 log.info(
-                    "  mean r=%.4f | max r=%.4f | n(r>0.1)=%d",
+                    "  %s mean r=%.4f | max r=%.4f | n(r>0.1)=%d",
+                    "Held-out test" if test_stories else "Bootstrap-CV",
                     corrs.mean(),
                     corrs.max(),
                     (corrs > 0.1).sum(),
                 )
+                if args.encoding_model == "ridge" and test_stories:
+                    log.info(
+                        "  Training bootstrap-CV mean r=%.4f | max r=%.4f | n(r>0.1)=%d",
+                        cv_corrs.mean(),
+                        cv_corrs.max(),
+                        (cv_corrs > 0.1).sum(),
+                    )
+                elif args.encoding_model == "lgbm":
+                    log.info(
+                        "  Training fit mean r=%.4f | max r=%.4f | n(r>0.1)=%d",
+                        train_fit_corrs.mean(),
+                        train_fit_corrs.max(),
+                        (train_fit_corrs > 0.1).sum(),
+                    )
 
                 save_dict = dict(
                     corrs=corrs,
+                    cv_corrs=cv_corrs,
+                    train_fit_corrs=(
+                        train_fit_corrs if train_fit_corrs is not None else np.array([])
+                    ),
                     voxels=vox,
+                    encoding_model=np.array(args.encoding_model),
                     feature_model=np.array(model_type),
                     feature_backend=np.array(encoder.backend),
                     summary_horizon=np.array(horizon),
@@ -903,6 +1282,14 @@ def main():
                     embedding_model=np.array(args.embedding_model),
                     summary_words=np.array(summary_words),
                     stories=np.array(stories),
+                    train_stories=np.array(train_stories),
+                    test_stories=np.array(test_stories),
+                    n_train_stories=np.array(len(train_stories)),
+                    n_test_stories=np.array(len(test_stories)),
+                    split_tag=np.array(split_tag),
+                    evaluation_split=np.array(
+                        "story_holdout" if test_stories else "bootstrap_cv"
+                    ),
                     condition_label=np.array(label),
                 )
                 if args.save_weights and wt is not None:
@@ -918,25 +1305,37 @@ def main():
     summary["summary_horizons"] = np.array(summary_horizons)
     summary["summary_model"] = np.array(summary_model)
     summary["feature_models"] = np.array(args.models)
+    summary["encoding_model"] = np.array(args.encoding_model)
     summary["embedding_model"] = np.array(args.embedding_model)
     summary["gpt2_model"] = np.array(args.gpt2_model)
     summary["voxels"] = vox
+    summary["stories"] = np.array(stories)
+    summary["train_stories"] = np.array(train_stories)
+    summary["test_stories"] = np.array(test_stories)
+    summary["split_tag"] = np.array(split_tag)
+    summary["evaluation_split"] = np.array("story_holdout" if test_stories else "bootstrap_cv")
     np.savez(out_dir / "summary.npz", **summary)
 
     log.info("")
     log.info("=" * 60)
-    log.info("SUMMARY — per-voxel encoding correlation (%d voxels)", len(vox))
+    log.info(
+        "SUMMARY — per-voxel encoding correlation (%d voxels, %s)",
+        len(vox),
+        "held-out stories" if test_stories else "bootstrap CV",
+    )
     log.info("=" * 60)
     for label in sorted(
         all_corrs,
         key=lambda item: (
+            label_to_meta[item]["encoding_model"],
             label_to_meta[item]["feature_model"],
             label_to_meta[item]["summary_horizon"],
         ),
     ):
         corrs = all_corrs[label]
         log.info(
-            "  %-18s h=%-5d mean=%.4f  max=%.4f  n(r>0.1)=%d",
+            "  %-8s %-18s h=%-5d mean=%.4f  max=%.4f  n(r>0.1)=%d",
+            label_to_meta[label]["encoding_model"],
             label_to_meta[label]["feature_model"],
             label_to_meta[label]["summary_horizon"],
             corrs.mean(),

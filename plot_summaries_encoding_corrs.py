@@ -153,10 +153,15 @@ def build_meta_by_label(results):
             "label": label,
             "summary_horizon": as_scalar_int(data.get("summary_horizon"), default=-1),
             "summary_model": as_scalar_str(data.get("summary_model")),
+            "encoding_model": as_scalar_str(data.get("encoding_model"), default="ridge"),
             "feature_model": feature_model,
             "feature_backend": feature_backend,
             "embedding_model": as_scalar_str(data.get("embedding_model")),
             "summary_words": as_scalar_int(data.get("summary_words"), default=-1),
+            "evaluation_split": as_scalar_str(data.get("evaluation_split"), default="bootstrap_cv"),
+            "n_train_stories": as_scalar_int(data.get("n_train_stories"), default=-1),
+            "n_test_stories": as_scalar_int(data.get("n_test_stories"), default=0),
+            "split_tag": as_scalar_str(data.get("split_tag"), default="unknown"),
         }
     return meta
 
@@ -197,15 +202,26 @@ def should_show_backend(meta):
 
 def condition_short_label(meta):
     """Compact condition label for tables and histogram titles."""
-    label = f"{meta['feature_model']} h={meta['summary_horizon']}"
+    label = f"{meta.get('encoding_model', 'ridge')} {meta['feature_model']} h={meta['summary_horizon']}"
     if should_show_backend(meta):
         label += f" [{short_backend_name(meta['feature_backend'])}]"
+    if meta.get("evaluation_split") == "story_holdout":
+        label += f" [holdout {meta.get('n_test_stories', 0)}]"
+    elif meta.get("evaluation_split") == "bootstrap_cv":
+        label += " [cv]"
     return label
 
 
 def group_key(meta):
     """Group conditions by summary source model and feature extractor."""
-    return meta["summary_model"], meta["feature_model"], meta["feature_backend"]
+    return (
+        meta["summary_model"],
+        meta.get("encoding_model", "ridge"),
+        meta["feature_model"],
+        meta["feature_backend"],
+        meta.get("evaluation_split", "bootstrap_cv"),
+        meta.get("split_tag", "unknown"),
+    )
 
 
 def sort_key(label, meta_by_label):
@@ -213,8 +229,11 @@ def sort_key(label, meta_by_label):
     meta = meta_by_label[label]
     return (
         meta["summary_model"],
+        meta.get("encoding_model", "ridge"),
         meta["feature_model"],
         meta["feature_backend"],
+        meta.get("evaluation_split", "bootstrap_cv"),
+        meta.get("split_tag", "unknown"),
         meta["summary_horizon"],
         label,
     )
@@ -222,8 +241,12 @@ def sort_key(label, meta_by_label):
 
 def describe_group(group):
     """Readable panel title."""
-    summary_model, feature_model, feature_backend = group
-    title = f"Summary: {summary_model}\nFeatures: {pretty_feature_name(feature_model)}"
+    summary_model, encoding_model, feature_model, feature_backend, evaluation_split, split_tag = group
+    title = (
+        f"Summary: {summary_model}\n"
+        f"Features: {pretty_feature_name(feature_model)}\n"
+        f"Encoding: {encoding_model}"
+    )
     meta = {
         "feature_model": feature_model,
         "feature_backend": feature_backend,
@@ -231,12 +254,19 @@ def describe_group(group):
     }
     if should_show_backend(meta):
         title += f"\nBackend: {short_backend_name(feature_backend)}"
+    if evaluation_split == "story_holdout":
+        title += "\nEval: held-out stories"
+    else:
+        title += "\nEval: bootstrap CV"
     return title
 
 
 def describe_condition(meta):
     """Readable condition label."""
-    label = f"{pretty_feature_name(meta['feature_model'])} h={meta['summary_horizon']}"
+    label = (
+        f"{meta.get('encoding_model', 'ridge')} "
+        f"{pretty_feature_name(meta['feature_model'])} h={meta['summary_horizon']}"
+    )
     if should_show_backend(meta):
         label += f"\n{short_backend_name(meta['feature_backend'])}"
     return label
@@ -477,7 +507,10 @@ def main():
         print(
             "    "
             f"{condition_short_label(meta):<34s} "
-            f"summary_model={meta['summary_model']}"
+            f"summary_model={meta['summary_model']} "
+            f"eval={meta['evaluation_split']} "
+            f"train={meta['n_train_stories']} "
+            f"test={meta['n_test_stories']}"
         )
 
     first = next(iter(results.values()))
