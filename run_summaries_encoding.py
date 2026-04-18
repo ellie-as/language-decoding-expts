@@ -205,21 +205,24 @@ def score_encoding_predictions(stim, resp, wt):
     return score_prediction_matrix(resp, np.dot(stim, wt))
 
 
-def standardize_train_test(train_mat, test_mat=None, eps=1e-6):
+def standardize_train_test(train_mat, test_mat=None, eps=1e-6, drop_constant=True):
     """Standardize columns using training statistics and drop near-constant columns."""
     train_mat = np.asarray(train_mat, dtype=np.float64)
     test_mat = None if test_mat is None else np.asarray(test_mat, dtype=np.float64)
 
     mean = train_mat.mean(0)
     std = train_mat.std(0)
-    keep = np.isfinite(std) & (std > eps)
+    finite = np.isfinite(std)
+    keep = finite & (std > eps) if drop_constant else finite
     if not np.any(keep):
         raise ValueError(
-            f"All columns have near-zero std after transformation (eps={eps})."
+            "No finite columns remained after transformation "
+            f"(eps={eps}, drop_constant={drop_constant})."
         )
 
     mean = mean[keep]
     std = std[keep]
+    std[~np.isfinite(std) | (std <= eps)] = 1.0
     train_z = np.nan_to_num((train_mat[:, keep] - mean) / std)
     if test_mat is None:
         test_z = None
@@ -587,6 +590,13 @@ def fit_encoding_model(
             float(np.median(raw_score_std)),
             float(raw_score_std.max()),
         )
+        log.info(
+            "PLS latent diagnostics: finite=%d/%d nonzero=%d/%d",
+            int(np.isfinite(raw_score_std).sum()),
+            len(raw_score_std),
+            int((raw_score_std > 0).sum()),
+            len(raw_score_std),
+        )
         if float(raw_score_std.max()) < 1e-6:
             log.warning(
                 "PLS scores are extremely small in absolute scale; keeping any non-constant "
@@ -596,9 +606,10 @@ def fit_encoding_model(
             train_scores,
             test_scores,
             eps=0.0,
+            drop_constant=False,
         )
         log.info(
-            "Retained %d / %d PLS components after dropping near-zero latent dims",
+            "Retained %d / %d PLS components after latent standardization",
             int(keep.sum()),
             len(keep),
         )
