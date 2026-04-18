@@ -207,12 +207,12 @@ def score_encoding_predictions(stim, resp, wt):
 
 def standardize_train_test(train_mat, test_mat=None, eps=1e-6):
     """Standardize columns using training statistics and drop near-constant columns."""
-    train_mat = np.asarray(train_mat, dtype=np.float32)
-    test_mat = None if test_mat is None else np.asarray(test_mat, dtype=np.float32)
+    train_mat = np.asarray(train_mat, dtype=np.float64)
+    test_mat = None if test_mat is None else np.asarray(test_mat, dtype=np.float64)
 
     mean = train_mat.mean(0)
     std = train_mat.std(0)
-    keep = std > eps
+    keep = np.isfinite(std) & (std > eps)
     if not np.any(keep):
         raise ValueError(
             f"All columns have near-zero std after transformation (eps={eps})."
@@ -587,10 +587,15 @@ def fit_encoding_model(
             float(np.median(raw_score_std)),
             float(raw_score_std.max()),
         )
+        if float(raw_score_std.max()) < 1e-6:
+            log.warning(
+                "PLS scores are extremely small in absolute scale; keeping any non-constant "
+                "latent dimensions and standardizing them before ridge."
+            )
         train_scores, test_scores, keep = standardize_train_test(
             train_scores,
             test_scores,
-            eps=1e-6,
+            eps=0.0,
         )
         log.info(
             "Retained %d / %d PLS components after dropping near-zero latent dims",
