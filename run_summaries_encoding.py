@@ -149,6 +149,39 @@ def load_voxel_set(subject, all_voxels):
     return np.arange(all_voxels), False
 
 
+def select_pls_supervision_columns(subject, selected_voxels):
+    """Choose a smaller voxel subset to supervise the PLS stage."""
+    selected_voxels = np.asarray(selected_voxels, dtype=int)
+    responsive_voxels, found = load_voxel_set(subject, len(selected_voxels))
+    if not found:
+        log.warning(
+            "PLS supervision fallback: pretrained language-responsive voxel set is unavailable; "
+            "using all %d selected voxels as PLS targets.",
+            len(selected_voxels),
+        )
+        return np.arange(len(selected_voxels), dtype=int), "selected_all"
+
+    selected_lookup = {int(vox): idx for idx, vox in enumerate(selected_voxels)}
+    local_idx = np.array(
+        [selected_lookup[int(vox)] for vox in responsive_voxels if int(vox) in selected_lookup],
+        dtype=int,
+    )
+    if local_idx.size == 0:
+        log.warning(
+            "PLS supervision fallback: pretrained language-responsive voxels do not overlap the "
+            "selected voxel set; using all %d selected voxels as PLS targets.",
+            len(selected_voxels),
+        )
+        return np.arange(len(selected_voxels), dtype=int), "selected_all"
+
+    log.info(
+        "Using %d language-responsive voxels to supervise PLS within %d selected output voxels",
+        len(local_idx),
+        len(selected_voxels),
+    )
+    return np.sort(local_idx), "responsive_intersection"
+
+
 def zscore_columns(mat):
     """Z-score each column, guarding against constant vectors."""
     mat = np.asarray(mat)
@@ -460,6 +493,7 @@ def fit_encoding_model(
     train_rresp,
     test_rstim,
     test_rresp,
+    pls_fit_rresp=None,
 ):
     """Dispatch to the requested encoding model backend."""
     alphas = np.array([args.single_alpha]) if args.single_alpha else config.ALPHAS
@@ -534,7 +568,13 @@ def fit_encoding_model(
             max_components,
             args.pls_scale,
         )
-        train_scores = pls.fit_transform(train_rstim, train_rresp)[0].astype(np.float32, copy=False)
+        pls_targets = train_rresp if pls_fit_rresp is None else pls_fit_rresp
+        pls_targets = zscore_columns(pls_targets).astype(np.float32, copy=False)
+        log.info(
+            "PLS supervision matrix: %s (TRs x target voxels)",
+            pls_targets.shape,
+        )
+        train_scores = pls.fit_transform(train_rstim, pls_targets)[0].astype(np.float32, copy=False)
         if test_rstim is not None:
             test_scores = pls.transform(test_rstim).astype(np.float32, copy=False)
         else:
@@ -1498,6 +1538,22 @@ def main():
     else:
         test_rresp = None
 
+    if args.encoding_model == "pls-ridge":
+        pls_supervision_idx, pls_supervision_mode = select_pls_supervision_columns(
+            args.subject,
+            vox,
+        )
+        pls_fit_rresp = train_rresp[:, pls_supervision_idx]
+        log.info(
+            "PLS supervision targets: %d voxels (%s)",
+            pls_fit_rresp.shape[1],
+            pls_supervision_mode,
+        )
+    else:
+        pls_supervision_idx = None
+        pls_supervision_mode = None
+        pls_fit_rresp = None
+
     out_dir = Path(config.REPO_DIR) / args.output_dir / args.subject
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1561,6 +1617,9 @@ def main():
                         "story_holdout" if test_stories else "bootstrap_cv"
                     ),
                 }
+                if pls_fit_rresp is not None:
+                    meta["pls_supervision_mode"] = pls_supervision_mode
+                    meta["pls_supervision_voxels"] = int(pls_fit_rresp.shape[1])
                 label_to_meta[label] = meta
 
                 if args.skip_existing and out_path.exists():
@@ -1611,6 +1670,7 @@ def main():
                     train_rresp,
                     test_rstim,
                     test_rresp,
+                    pls_fit_rresp=pls_fit_rresp,
                 )
                 del train_rstim, test_rstim
 
