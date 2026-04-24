@@ -84,8 +84,10 @@ def parse_args():
         "--sessions",
         type=int,
         nargs="+",
-        default=list(range(1, 6)),
-        help="Sessions to draw stories from (passed through to run_summaries_encoding.load_story_list).",
+        default=[2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 18, 20],
+        help="Sessions to draw stories from. Defaults to the full training-session list "
+             "used by run_summaries_encoding.py (sessions 1 / 13 / 16 / 17 / 19 are absent "
+             "in sess_to_story.json).",
     )
     p.add_argument(
         "--stories",
