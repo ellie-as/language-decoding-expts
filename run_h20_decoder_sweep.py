@@ -127,7 +127,43 @@ def build_brain_and_groups(subject: str, stories, vox, response_root, resp_lengt
         Xs.append(x)
         groups.extend([s] * x.shape[0])
     X = np.vstack(Xs).astype(np.float32)
-    # Z-score across time (train stats later for test transform)
+    return X, np.array(groups)
+
+
+def build_features_and_groups(features_dir: Path, subject: str, stories, resp_lengths_by_story):
+    """Load pre-extracted features from brain_encoder_pretrain/extract_features.py.
+
+    Each story is read from <features_dir>/<subject>/<story>.npz under key 'X'.
+    Returns the concatenated feature array [T_total, d_feat] and a per-row group
+    label array. TR counts are validated against resp_lengths_by_story.
+    """
+    subj_dir = Path(features_dir) / subject
+    if not subj_dir.is_dir():
+        raise FileNotFoundError(f"Feature directory not found: {subj_dir}")
+    Xs = []
+    groups = []
+    d_feat = None
+    for s in stories:
+        path = subj_dir / f"{s}.npz"
+        if not path.is_file():
+            raise FileNotFoundError(f"Missing feature file: {path}")
+        with np.load(path) as npz:
+            if "X" not in npz.files:
+                raise ValueError(f"{path}: expected key 'X' in .npz, found {npz.files}")
+            x = npz["X"].astype(np.float32)
+        expected = resp_lengths_by_story[s]
+        if x.shape[0] != expected:
+            raise ValueError(
+                f"{s}: feature TRs {x.shape[0]} != expected {expected}. Did the checkpoint "
+                f"use the same story / z-score as the response files?"
+            )
+        if d_feat is None:
+            d_feat = int(x.shape[1])
+        elif int(x.shape[1]) != d_feat:
+            raise ValueError(f"{s}: feature dim {x.shape[1]} != expected {d_feat}")
+        Xs.append(x)
+        groups.extend([s] * x.shape[0])
+    X = np.vstack(Xs).astype(np.float32)
     return X, np.array(groups)
 
 
@@ -614,6 +650,20 @@ def parse_args():
              "before decoding. Applied after --select-voxels if both are set. Default: 0 (no PCA).",
     )
     p.add_argument(
+        "--features-dir",
+        default=None,
+        help="If set, use pre-extracted per-TR features from this directory instead of raw "
+             "voxel responses. Expects <features-dir>/<subject>/<story>.npz with key 'X'. "
+             "Produced by brain_encoder_pretrain/extract_features.py. When set, --roi and "
+             "--select-voxels are ignored (features are already a fixed-dim representation).",
+    )
+    p.add_argument(
+        "--features-tag",
+        default=None,
+        help="Short tag added to output filename when --features-dir is set (defaults to "
+             "the features-dir's last path component).",
+    )
+    p.add_argument(
         "--diagnose",
         action="store_true",
         help="Before any model training, print target-structure diagnostics "
@@ -676,29 +726,37 @@ def main():
     train_resp_lengths, total_voxels = rse.load_resp_info(args.subject, train_stories, data_train_dir=response_root)
     test_resp_lengths, _ = rse.load_resp_info(args.subject, test_stories, data_train_dir=response_root)
 
-    # Load voxels: all, full_frontal, or a single BA ROI
-    uts_id = rse.SUBJECT_TO_UTS.get(args.subject)
-    if not uts_id:
-        raise ValueError(f"Unknown subject {args.subject}")
-    roi_name = args.roi
-    if roi_name in ("all", "whole", "all_voxels"):
-        roi_name = "all"
-        vox = np.arange(total_voxels, dtype=int)
+    use_features = args.features_dir is not None
+    if use_features:
+        # Pre-extracted features from brain_encoder_pretrain; --roi / --select-voxels don't apply.
+        if args.select_voxels > 0:
+            log.warning("--select-voxels is ignored when --features-dir is set.")
+        roi_name = "features"
+        vox = None
     else:
-        if roi_name == "full_frontal":
-            roi_json = Path(args.ba_dir) / uts_id / "BA_full_frontal.json"
+        # Load voxels: all, full_frontal, or a single BA ROI
+        uts_id = rse.SUBJECT_TO_UTS.get(args.subject)
+        if not uts_id:
+            raise ValueError(f"Unknown subject {args.subject}")
+        roi_name = args.roi
+        if roi_name in ("all", "whole", "all_voxels"):
+            roi_name = "all"
+            vox = np.arange(total_voxels, dtype=int)
         else:
-            # Allow either "BA_10" or bare "10".
-            base = roi_name if roi_name.startswith("BA_") else f"BA_{roi_name}"
-            roi_json = Path(args.ba_dir) / uts_id / f"{base}.json"
-            roi_name = base
-        if not roi_json.is_file():
-            raise FileNotFoundError(f"ROI file not found: {roi_json}")
-        with open(roi_json, encoding="utf-8") as f:
-            roi_data = json.load(f)
-        vox = np.sort(np.array(list(roi_data.values())[0], dtype=int))
-        vox = vox[vox < total_voxels]
-    log.info("Using %s voxels: %d", roi_name, len(vox))
+            if roi_name == "full_frontal":
+                roi_json = Path(args.ba_dir) / uts_id / "BA_full_frontal.json"
+            else:
+                # Allow either "BA_10" or bare "10".
+                base = roi_name if roi_name.startswith("BA_") else f"BA_{roi_name}"
+                roi_json = Path(args.ba_dir) / uts_id / f"{base}.json"
+                roi_name = base
+            if not roi_json.is_file():
+                raise FileNotFoundError(f"ROI file not found: {roi_json}")
+            with open(roi_json, encoding="utf-8") as f:
+                roi_data = json.load(f)
+            vox = np.sort(np.array(list(roi_data.values())[0], dtype=int))
+            vox = vox[vox < total_voxels]
+        log.info("Using %s voxels: %d", roi_name, len(vox))
 
     # Load summaries and embeddings
     summaries_dir = Path(args.summaries_dir).expanduser().resolve()
@@ -741,8 +799,19 @@ def main():
     del Y_train
 
     # Load brain X (unscaled; we'll z-score with train stats)
-    X_train_raw, g_train = build_brain_and_groups(args.subject, train_stories, vox, response_root, train_resp_lengths)
-    X_test_raw, g_test = build_brain_and_groups(args.subject, test_stories, vox, response_root, test_resp_lengths)
+    if use_features:
+        features_dir = Path(args.features_dir).expanduser().resolve()
+        log.info("Loading pre-extracted features from %s", features_dir)
+        X_train_raw, g_train = build_features_and_groups(
+            features_dir, args.subject, train_stories, train_resp_lengths,
+        )
+        X_test_raw, g_test = build_features_and_groups(
+            features_dir, args.subject, test_stories, test_resp_lengths,
+        )
+        log.info("Feature dim: %d", X_train_raw.shape[1])
+    else:
+        X_train_raw, g_train = build_brain_and_groups(args.subject, train_stories, vox, response_root, train_resp_lengths)
+        X_test_raw, g_test = build_brain_and_groups(args.subject, test_stories, vox, response_root, test_resp_lengths)
     X_train, X_test = zscore_X_train_test(X_train_raw, X_test_raw)
     del X_train_raw, X_test_raw
 
@@ -1077,10 +1146,15 @@ def main():
         summary_model,
         f"loss-{args.loss}",
     ]
+    if use_features:
+        feat_tag = args.features_tag or Path(args.features_dir).resolve().name
+        tag_parts.append(f"feat-{feat_tag}")
     if args.target_pca and args.target_pca > 0:
         tag_parts.append(f"pca-{args.target_pca}")
-    if args.select_voxels and args.select_voxels > 0:
+    if args.select_voxels and args.select_voxels > 0 and not use_features:
         tag_parts.append(f"vox-{args.select_voxels}")
+    if args.brain_pca and args.brain_pca > 0:
+        tag_parts.append(f"brainpca-{args.brain_pca}")
     if args.skip_cv:
         tag_parts.append("no-cv")
     out_path = out_dir / ("__".join(tag_parts) + ".csv")
