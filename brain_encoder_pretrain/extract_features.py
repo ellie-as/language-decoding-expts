@@ -196,6 +196,7 @@ def main():
     model = BrainEncoderMAE(
         subject_to_voxels=subject_to_voxels,
         d_model=model_cfg["d_model"],
+        latent_dim=model_cfg.get("latent_dim", model_cfg["d_model"]),
         n_enc_layers=model_cfg["n_enc_layers"],
         n_dec_layers=model_cfg["n_dec_layers"],
         n_heads=model_cfg["n_heads"],

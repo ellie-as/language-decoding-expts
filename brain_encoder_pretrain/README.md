@@ -15,20 +15,28 @@ problems that rule out existing fMRI foundation models for this task:
 ## Architecture (MAE on TR tokens)
 
 ```
-per-subject input Linear(V_s -> d)    shared Transformer encoder
-                                    \      |
-              voxels [T, V_s] ----->  tokens [T, d]  -- mask 50% of TRs -->
-                                                     (visible tokens only)
-                                                               |
-shared Transformer decoder (small) + [mask] tokens at masked positions
-                                                               |
-per-subject output Linear(d -> V_s) ---> predict voxels at masked TRs
-loss: MSE at masked positions only, averaged over V_s per subject
+voxels [T, V_s]
+   | per-subject Linear(V_s -> latent_dim)          (per-subject params)
+   v
+latent [T, latent_dim]
+   | SHARED Linear(latent_dim -> d_model)           (cross-subject)
+   v
+tokens [T, d_model]  --> shared Transformer encoder (with [mask] tokens) -->
+                    <-- shared Transformer decoder (fills masked positions) <--
+   | SHARED Linear(d_model -> latent_dim)           (cross-subject)
+   v
+latent' [T, latent_dim]
+   | per-subject Linear(latent_dim -> V_s)          (per-subject params)
+   v
+voxels_pred [T, V_s]     loss: MSE at masked TRs only, normalized by V_s
 ```
 
-Only the per-subject projections depend on `V_s`; all other weights are shared
-across subjects. `d_model = 256`, 4 encoder layers + 2 decoder layers by
-default. The model is small enough to train on a single GPU.
+The per-subject Linear heads use a narrow `latent_dim` bottleneck so per-subject
+capacity stays small. The rest of the model (latent<->d_model projections plus
+the Transformer encoder/decoder) is shared across all subjects and is trained
+on gradients pooled from every subject in every batch. Defaults:
+`d_model = 128`, `latent_dim = 32`, 4 encoder layers + 2 decoder layers.
+With 3 LeBel subjects (~90k voxels each) this totals ~19M params.
 
 ## Files
 
@@ -54,9 +62,8 @@ signal.
 ```
 python -m brain_encoder_pretrain.train \
     --subjects S1 S2 S3 \
-    --sessions 1 2 3 4 5 \
     --chunk-len 64 --batch-size 32 \
-    --d-model 256 --n-enc-layers 4 --n-dec-layers 2 \
+    --d-model 128 --latent-dim 32 --n-enc-layers 4 --n-dec-layers 2 \
     --steps 20000 --lr 3e-4 --weight-decay 0.05 \
     --eval-every 500 --save-every 2000 \
     --output-dir brain_encoder_pretrain/runs/run1
@@ -96,7 +103,10 @@ changeset to keep the current behaviour intact.
   memory and make random windowing less effective for small stories.
 - `mask_ratio`: MAE-style 0.5 is a good default. Lower ratios (0.25) make the
   task easier and can help if the loss plateaus high.
-- `d_model`: 256 is plenty given the data size. Bigger models overfit quickly.
+- `d_model`: 128 is plenty given the data size. Bigger models overfit quickly.
+- `latent_dim`: the narrow per-subject bottleneck. 32 is a reasonable default.
+  Smaller values (16, 8) cut per-subject capacity further; larger values hurt
+  cross-subject sharing proportionally and blow up the parameter count.
 - No delays on the input - the encoder sees native BOLD; the downstream
   decoder can still add delays on the encoder output if helpful.
 - Cross-subject weight sharing is the main "foundation-model" ingredient;

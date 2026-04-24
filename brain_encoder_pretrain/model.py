@@ -30,35 +30,42 @@ def sinusoidal_position(max_len: int, d_model: int, device=None) -> torch.Tensor
     return pe
 
 
-class _SubjectProjection(nn.Module):
-    """Linear map V_s -> d_model (input side)."""
+class _VoxelToLatent(nn.Module):
+    """Per-subject Linear(V_s -> latent_dim). The only input-side per-subject params."""
 
-    def __init__(self, n_voxels: int, d_model: int):
+    def __init__(self, n_voxels: int, latent_dim: int):
         super().__init__()
-        self.proj = nn.Linear(n_voxels, d_model)
+        self.proj = nn.Linear(n_voxels, latent_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.proj(x)
 
 
-class _SubjectOutput(nn.Module):
-    """Linear map d_model -> V_s (reconstruction head)."""
+class _LatentToVoxel(nn.Module):
+    """Per-subject Linear(latent_dim -> V_s). The only output-side per-subject params."""
 
-    def __init__(self, d_model: int, n_voxels: int):
+    def __init__(self, latent_dim: int, n_voxels: int):
         super().__init__()
-        self.proj = nn.Linear(d_model, n_voxels)
+        self.proj = nn.Linear(latent_dim, n_voxels)
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         return self.proj(z)
 
 
 class BrainEncoderMAE(nn.Module):
-    """Masked-autoencoder on TR-level voxel tokens, shared across subjects."""
+    """Masked-autoencoder on TR-level voxel tokens, shared across subjects.
+
+    A narrow per-subject bottleneck (`latent_dim`) projects voxels into a shared
+    latent space; the rest of the model (latent->d_model, Transformer encoder /
+    decoder, d_model->latent) is cross-subject. This keeps almost all of the
+    capacity in shared parameters.
+    """
 
     def __init__(
         self,
         subject_to_voxels: Dict[str, int],
-        d_model: int = 256,
+        d_model: int = 128,
+        latent_dim: int = 32,
         n_enc_layers: int = 4,
         n_dec_layers: int = 2,
         n_heads: int = 8,
@@ -68,15 +75,20 @@ class BrainEncoderMAE(nn.Module):
     ):
         super().__init__()
         self.d_model = d_model
+        self.latent_dim = latent_dim
         self.max_len = max_len
 
-        # Per-subject input / output heads (handle variable voxel counts).
-        self.inputs = nn.ModuleDict(
-            {s: _SubjectProjection(n, d_model) for s, n in subject_to_voxels.items()}
+        # Per-subject bottleneck heads (the only per-subject params).
+        self.voxel_to_latent = nn.ModuleDict(
+            {s: _VoxelToLatent(n, latent_dim) for s, n in subject_to_voxels.items()}
         )
-        self.outputs = nn.ModuleDict(
-            {s: _SubjectOutput(d_model, n) for s, n in subject_to_voxels.items()}
+        self.latent_to_voxel = nn.ModuleDict(
+            {s: _LatentToVoxel(latent_dim, n) for s, n in subject_to_voxels.items()}
         )
+
+        # Shared latent <-> d_model maps (cross-subject).
+        self.latent_to_model = nn.Linear(latent_dim, d_model)
+        self.model_to_latent = nn.Linear(d_model, latent_dim)
 
         # Sinusoidal positional embedding (shared, registered as buffer).
         self.register_buffer(
@@ -112,23 +124,33 @@ class BrainEncoderMAE(nn.Module):
     # ---------- public helpers ----------
 
     def subjects(self) -> List[str]:
-        return list(self.inputs.keys())
+        return list(self.voxel_to_latent.keys())
+
+    def _project_in(self, subject: str, x: torch.Tensor) -> torch.Tensor:
+        """voxels -> latent -> d_model (per-subject bottleneck then shared expand)."""
+        latent = self.voxel_to_latent[subject](x)
+        return self.latent_to_model(latent)
+
+    def _project_out(self, subject: str, h: torch.Tensor) -> torch.Tensor:
+        """d_model -> latent -> voxels (shared compress then per-subject expand)."""
+        latent = self.model_to_latent(h)
+        return self.latent_to_voxel[subject](latent)
 
     def encode(self, subject: str, x: torch.Tensor) -> torch.Tensor:
         """Encode a full sequence (no masking).
 
         Args:
-            subject: subject id (must be in self.inputs)
+            subject: subject id
             x: [B, L, V_s] voxel timeseries
         Returns:
             [B, L, d_model] contextualized features
         """
-        if subject not in self.inputs:
+        if subject not in self.voxel_to_latent:
             raise KeyError(f"Unknown subject head: {subject}")
         L = x.shape[1]
         if L > self.max_len:
             raise ValueError(f"Sequence length {L} exceeds max_len {self.max_len}")
-        tokens = self.inputs[subject](x)  # [B, L, d]
+        tokens = self._project_in(subject, x)  # [B, L, d_model]
         tokens = tokens + self.pos_embed[:L].unsqueeze(0)
         return self.encoder(tokens)
 
@@ -168,16 +190,9 @@ class BrainEncoderMAE(nn.Module):
 
         mask = self._random_mask(B, L, mask_ratio, device)
 
-        # Project voxels -> tokens and add position.
-        tokens_full = self.inputs[subject](x) + self.pos_embed[:L].unsqueeze(0)
+        tokens_full = self._project_in(subject, x) + self.pos_embed[:L].unsqueeze(0)
 
-        # Build visible-only sequence for the encoder.
-        # We pass full tokens with an attention mask that hides masked positions.
-        # Easier: zero out masked token embeddings and rely on attention to
-        # ignore them. Use a key_padding_mask in the encoder.
         key_padding_mask = mask  # [B, L] True=ignore
-        # Replace masked positions with mask token (any value is fine since they
-        # are ignored by attention via key_padding_mask).
         tokens_enc_in = torch.where(
             mask.unsqueeze(-1),
             self.mask_token.expand(B, L, -1),
@@ -185,12 +200,11 @@ class BrainEncoderMAE(nn.Module):
         )
         enc_out = self.encoder(tokens_enc_in, src_key_padding_mask=key_padding_mask)
 
-        # Decoder: at masked positions use [mask] + pos, at visible use enc_out.
         mask_tokens = self.mask_token.expand(B, L, -1) + self.pos_embed[:L].unsqueeze(0)
         dec_in = torch.where(mask.unsqueeze(-1), mask_tokens, enc_out)
         dec_out = self.decoder(dec_in)
 
-        pred = self.outputs[subject](dec_out)  # [B, L, V_s]
+        pred = self._project_out(subject, dec_out)  # [B, L, V_s]
         return pred, x, mask
 
 

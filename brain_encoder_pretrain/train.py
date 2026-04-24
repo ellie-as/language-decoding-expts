@@ -112,7 +112,15 @@ def parse_args():
     )
 
     # Model
-    p.add_argument("--d-model", type=int, default=256)
+    p.add_argument("--d-model", type=int, default=128)
+    p.add_argument(
+        "--latent-dim",
+        type=int,
+        default=32,
+        help="Per-subject bottleneck dim: voxels -> latent -> d_model. Keeping this "
+             "small is what makes the per-subject heads cheap; most capacity lives in "
+             "the shared latent<->d_model maps and the Transformer.",
+    )
     p.add_argument("--n-enc-layers", type=int, default=4)
     p.add_argument("--n-dec-layers", type=int, default=2)
     p.add_argument("--n-heads", type=int, default=8)
@@ -222,6 +230,7 @@ def main():
         "heldout_stories": test_stories,
         "model": {
             "d_model": args.d_model,
+            "latent_dim": args.latent_dim,
             "n_enc_layers": args.n_enc_layers,
             "n_dec_layers": args.n_dec_layers,
             "n_heads": args.n_heads,
@@ -250,6 +259,7 @@ def main():
     model = BrainEncoderMAE(
         subject_to_voxels=subject_to_voxels,
         d_model=args.d_model,
+        latent_dim=args.latent_dim,
         n_enc_layers=args.n_enc_layers,
         n_dec_layers=args.n_dec_layers,
         n_heads=args.n_heads,
@@ -259,7 +269,14 @@ def main():
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters())
-    log.info("Model parameters: %.2fM", n_params / 1e6)
+    n_shared = sum(
+        p.numel() for name, p in model.named_parameters()
+        if not name.startswith("voxel_to_latent.") and not name.startswith("latent_to_voxel.")
+    )
+    log.info(
+        "Model parameters: %.2fM total, %.2fM shared across subjects (%.1f%%)",
+        n_params / 1e6, n_shared / 1e6, 100.0 * n_shared / max(1, n_params),
+    )
 
     optim = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
