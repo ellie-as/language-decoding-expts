@@ -43,6 +43,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import sys
 import warnings
 from pathlib import Path
@@ -62,8 +63,12 @@ from utils_ridge.util import make_delayed  # noqa: E402
 
 SUBJECT_TO_UTS = {"S1": "UTS01", "S2": "UTS02", "S3": "UTS03"}
 MODEL_CHOICES = ["gpt1", "gpt2", "gpt2-pool", "embedding"]
-ENCODING_MODEL_CHOICES = ["ridge", "pls-ridge", "mlp", "lgbm"]
+ENCODING_MODEL_CHOICES = ["ridge", "pca-ridge", "pls-ridge", "mlp", "lgbm"]
 DEFAULT_HOLDOUT_COUNT = 5
+LOCAL_DEFAULT_SUMMARIES_DIR = REPO_DIR / "generate_summaries" / "outputs"
+LOCAL_DEFAULT_BA_DIR = REPO_DIR / "ba_indices"
+DEFAULT_MOUNTED_PROJECT_ROOT = Path("/Volumes/behrens/ellie/language-decoding-expts")
+DEFAULT_LOCAL_CACHE_ROOT = REPO_DIR / ".local_compute_cache"
 SUMMARY_FILE_RE = re.compile(
     r"^(?P<story>[^.]+)\.(?P<model>.+)\.ctx(?P<horizon>\d+)\.jsonl$"
 )
@@ -115,6 +120,115 @@ def _load_gpt2_with_retry(model_name_or_path, device, n_retries=4):
         "copy the cache to the cluster, or pass --gpt2-model /path/to/local/gpt2.\n"
         f"Original error: {last_err}"
     ) from last_err
+
+
+def is_relative_to(path, base):
+    """Return True when ``path`` is inside ``base``."""
+    try:
+        path.relative_to(base)
+        return True
+    except ValueError:
+        return False
+
+
+def uses_default_path(raw_value, default_path):
+    """Detect whether a CLI path argument still points at its local default."""
+    return Path(raw_value).expanduser().resolve() == default_path.expanduser().resolve()
+
+
+def configure_local_compute_mode(args):
+    """Remap data/model reads to the mounted project while keeping code/output local."""
+    mounted_root = Path(args.mounted_project_root).expanduser().resolve()
+    if not mounted_root.is_dir():
+        raise FileNotFoundError(
+            f"--local-compute-mode expected a mounted project root at {mounted_root}"
+        )
+
+    required_dirs = {
+        "data_train": mounted_root / "data_train",
+        "data_lm": mounted_root / "data_lm",
+        "models": mounted_root / "models",
+    }
+    missing = [name for name, path in required_dirs.items() if not path.is_dir()]
+    if missing:
+        raise FileNotFoundError(
+            f"Mounted project root {mounted_root} is missing required directories: {missing}"
+        )
+
+    config.DATA_TRAIN_DIR = str(required_dirs["data_train"])
+    config.DATA_LM_DIR = str(required_dirs["data_lm"])
+    config.MODEL_DIR = str(required_dirs["models"])
+    config.DATA_TEST_DIR = str(mounted_root / "data_test")
+
+    if uses_default_path(args.summaries_dir, LOCAL_DEFAULT_SUMMARIES_DIR):
+        args.summaries_dir = str(mounted_root / "generate_summaries" / "outputs")
+    if uses_default_path(args.ba_dir, LOCAL_DEFAULT_BA_DIR):
+        args.ba_dir = str(mounted_root / "ba_indices")
+
+    log.info("Local compute mode enabled")
+    log.info("  code / outputs repo: %s", REPO_DIR)
+    log.info("  mounted data root:  %s", mounted_root)
+    log.info("  DATA_TRAIN_DIR -> %s", config.DATA_TRAIN_DIR)
+    log.info("  DATA_LM_DIR    -> %s", config.DATA_LM_DIR)
+    log.info("  MODEL_DIR      -> %s", config.MODEL_DIR)
+    return mounted_root
+
+
+def resolve_output_dir(args, mounted_root=None):
+    """Resolve the output directory and guard against writes into the mounted tree."""
+    out_dir = Path(args.output_dir).expanduser()
+    if not out_dir.is_absolute():
+        out_dir = Path(config.REPO_DIR) / out_dir
+    out_dir = out_dir.resolve()
+
+    if mounted_root is not None and is_relative_to(out_dir, mounted_root):
+        raise ValueError(
+            f"--local-compute-mode forbids writing outputs into the mounted tree: {out_dir}"
+        )
+    return out_dir
+
+
+def stage_local_response_cache(subject, stories, mounted_data_train_dir, cache_root):
+    """Mirror needed response files locally for faster reads from mounted storage."""
+    mounted_data_train_dir = Path(mounted_data_train_dir).expanduser().resolve()
+    cache_root = Path(cache_root).expanduser().resolve()
+    source_subject_dir = mounted_data_train_dir / "train_response" / subject
+    target_data_train_dir = cache_root / "data_train"
+    target_subject_dir = target_data_train_dir / "train_response" / subject
+    target_subject_dir.mkdir(parents=True, exist_ok=True)
+
+    copied = 0
+    reused = 0
+    total_bytes = 0
+    for idx, story in enumerate(stories, start=1):
+        src = source_subject_dir / f"{story}.hf5"
+        dst = target_subject_dir / f"{story}.hf5"
+        if not src.exists():
+            raise FileNotFoundError(f"Missing mounted response file: {src}")
+
+        src_size = src.stat().st_size
+        total_bytes += src_size
+        if dst.exists() and dst.stat().st_size == src_size:
+            reused += 1
+            continue
+
+        log.info(
+            "Caching response file locally [%d/%d]: %s",
+            idx,
+            len(stories),
+            src.name,
+        )
+        shutil.copyfile(src, dst)
+        copied += 1
+
+    log.info(
+        "Local response cache ready at %s (%d reused, %d copied, %.2f GB total)",
+        target_subject_dir,
+        reused,
+        copied,
+        total_bytes / (1024 ** 3),
+    )
+    return target_data_train_dir
 
 
 def load_ba_rois(ba_subject_dir):
@@ -367,7 +481,7 @@ def fit_chunked_mlp(
     validation_fraction=0.1,
     n_iter_no_change=10,
 ):
-    """Fit one-hidden-layer PyTorch MLP regressors over chunks of output voxels."""
+    """Fit a one-hidden-layer PyTorch MLP, optionally chunking output voxels."""
     if eval_stim is None or eval_resp is None:
         raise ValueError(
             "MLP encoding requires held-out test stories. "
@@ -404,6 +518,137 @@ def fit_chunked_mlp(
     rstim_t = torch.tensor(rstim, dtype=torch.float32, device=device)
     eval_stim_t = torch.tensor(eval_stim, dtype=torch.float32, device=device)
 
+    def batched_index_slices(indices_np):
+        for batch_start in range(0, len(indices_np), batch_size):
+            yield indices_np[batch_start:batch_start + batch_size]
+
+    def standardize_targets(resp_batch, y_mean, y_std):
+        return np.nan_to_num((resp_batch - y_mean) / y_std).astype(np.float32, copy=False)
+
+    def compute_val_loss(model, stim_t, resp_np, idx_np, y_mean, y_std):
+        total_loss = 0.0
+        total_count = 0
+        model.eval()
+        with torch.no_grad():
+            for batch_idx_np in batched_index_slices(idx_np):
+                batch_idx_t = torch.tensor(batch_idx_np, dtype=torch.long, device=device)
+                batch_target = torch.tensor(
+                    standardize_targets(resp_np[batch_idx_np], y_mean, y_std),
+                    dtype=torch.float32,
+                    device=device,
+                )
+                pred = model(stim_t[batch_idx_t])
+                batch_loss = torch.nn.functional.mse_loss(pred, batch_target, reduction="sum")
+                total_loss += batch_loss.item()
+                total_count += batch_target.numel()
+        return total_loss / max(total_count, 1)
+
+    def batched_prediction_corrs(model, stim_t, resp_np, pred_batch_size):
+        n_rows, n_targets = resp_np.shape
+        sum_true = np.zeros(n_targets, dtype=np.float64)
+        sum_pred = np.zeros(n_targets, dtype=np.float64)
+        sum_true_sq = np.zeros(n_targets, dtype=np.float64)
+        sum_pred_sq = np.zeros(n_targets, dtype=np.float64)
+        sum_cross = np.zeros(n_targets, dtype=np.float64)
+
+        model.eval()
+        with torch.no_grad():
+            for start in range(0, n_rows, pred_batch_size):
+                end = min(start + pred_batch_size, n_rows)
+                pred = model(stim_t[start:end]).detach().cpu().numpy().astype(np.float64, copy=False)
+                true = resp_np[start:end].astype(np.float64, copy=False)
+                sum_true += true.sum(0)
+                sum_pred += pred.sum(0)
+                sum_true_sq += np.square(true).sum(0)
+                sum_pred_sq += np.square(pred).sum(0)
+                sum_cross += (true * pred).sum(0)
+
+        n = float(n_rows)
+        numer = sum_cross - (sum_true * sum_pred) / n
+        denom = np.sqrt(
+            np.maximum(sum_true_sq - (sum_true ** 2) / n, 0.0)
+            * np.maximum(sum_pred_sq - (sum_pred ** 2) / n, 0.0)
+        )
+        corrs = np.zeros(n_targets, dtype=np.float64)
+        valid = denom > 0
+        corrs[valid] = numer[valid] / denom[valid]
+        corrs[~np.isfinite(corrs)] = 0
+        return corrs.astype(np.float32, copy=False)
+
+    n_train = rstim.shape[0]
+    use_early_stopping = early_stopping and n_train >= 10
+    if use_early_stopping:
+        n_val = max(1, int(round(n_train * validation_fraction)))
+        n_val = min(n_val, n_train - 1)
+        rng = np.random.default_rng(42)
+        perm = rng.permutation(n_train)
+        val_idx_np = perm[:n_val]
+        fit_idx_np = perm[n_val:]
+    else:
+        fit_idx_np = np.arange(n_train)
+        val_idx_np = None
+
+    joint_output = output_chunk_size <= 0 or output_chunk_size >= n_voxels
+    pred_batch_size = max(batch_size, 1024)
+
+    if joint_output:
+        log.info("  Joint output model [0:%d] / %d", n_voxels, n_voxels)
+
+        y_mean = rresp.mean(0)
+        y_std = rresp.std(0)
+        y_std[y_std == 0] = 1
+
+        model = ChunkMLP(rstim.shape[1], n_voxels).to(device)
+        optimizer = torch.optim.Adam(
+            model.parameters(),
+            lr=learning_rate_init,
+            weight_decay=alpha,
+        )
+        loss_fn = torch.nn.MSELoss()
+        best_val = float("inf")
+        best_state = None
+        patience = 0
+
+        for epoch in range(max_iter):
+            model.train()
+            shuffled_np = fit_idx_np[np.random.permutation(len(fit_idx_np))]
+            for batch_idx_np in batched_index_slices(shuffled_np):
+                batch_idx_t = torch.tensor(batch_idx_np, dtype=torch.long, device=device)
+                batch_target = torch.tensor(
+                    standardize_targets(rresp[batch_idx_np], y_mean, y_std),
+                    dtype=torch.float32,
+                    device=device,
+                )
+                optimizer.zero_grad(set_to_none=True)
+                pred = model(rstim_t[batch_idx_t])
+                loss = loss_fn(pred, batch_target)
+                loss.backward()
+                optimizer.step()
+
+            if use_early_stopping:
+                val_loss = compute_val_loss(model, rstim_t, rresp, val_idx_np, y_mean, y_std)
+                if val_loss < best_val - 1e-6:
+                    best_val = val_loss
+                    best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                    patience = 0
+                else:
+                    patience += 1
+                    if patience >= n_iter_no_change:
+                        log.info(
+                            "    early stop at epoch %d with val_loss=%.6f",
+                            epoch + 1,
+                            best_val,
+                        )
+                        break
+
+        if best_state is not None:
+            model.load_state_dict(best_state)
+            model.to(device)
+
+        all_corrs[:] = batched_prediction_corrs(model, eval_stim_t, eval_resp, pred_batch_size)
+        all_train_fit_corrs[:] = batched_prediction_corrs(model, rstim_t, rresp, pred_batch_size)
+        return all_corrs, None, np.full(n_voxels, np.nan), all_train_fit_corrs
+
     for start in range(0, n_voxels, output_chunk_size):
         end = min(start + output_chunk_size, n_voxels)
         log.info("  Output chunk [%d:%d] / %d", start, end, n_voxels)
@@ -421,16 +666,7 @@ def fit_chunked_mlp(
             weight_decay=alpha,
         )
         loss_fn = torch.nn.MSELoss()
-
-        n_train = rstim.shape[0]
-        use_early_stopping = early_stopping and n_train >= 10
         if use_early_stopping:
-            n_val = max(1, int(round(n_train * validation_fraction)))
-            n_val = min(n_val, n_train - 1)
-            rng = np.random.default_rng(42)
-            perm = rng.permutation(n_train)
-            val_idx_np = perm[:n_val]
-            fit_idx_np = perm[n_val:]
             fit_idx = torch.tensor(fit_idx_np, dtype=torch.long, device=device)
             val_idx = torch.tensor(val_idx_np, dtype=torch.long, device=device)
             best_val = float("inf")
@@ -524,6 +760,91 @@ def fit_encoding_model(
             use_corr=True,
         )
         return corrs, wt, cv_corrs, None
+
+    if args.encoding_model == "pca-ridge":
+        if args.save_weights:
+            raise ValueError("--save-weights is not yet supported for --encoding-model pca-ridge.")
+
+        from sklearn.decomposition import PCA
+
+        max_components = min(
+            args.pca_n_components,
+            train_rstim.shape[0] - 1,
+            train_rstim.shape[1],
+        )
+        if max_components < 1:
+            raise ValueError(
+                "PCA needs at least one component. Check the number of training TRs "
+                "and delayed features."
+            )
+        if max_components < args.pca_n_components:
+            log.info(
+                "Reducing PCA components from requested %d to %d based on data shape",
+                args.pca_n_components,
+                max_components,
+            )
+
+        pca = PCA(
+            n_components=max_components,
+            whiten=args.pca_whiten,
+            svd_solver=args.pca_svd_solver,
+            random_state=42,
+        )
+        log.info(
+            "Fitting PCA transform (n_components=%d, whiten=%s, svd_solver=%s) on training stories...",
+            max_components,
+            args.pca_whiten,
+            args.pca_svd_solver,
+        )
+        train_scores = pca.fit_transform(train_rstim).astype(np.float32, copy=False)
+        if test_rstim is not None:
+            test_scores = pca.transform(test_rstim).astype(np.float32, copy=False)
+        else:
+            test_scores = None
+
+        explained = getattr(pca, "explained_variance_ratio_", None)
+        if explained is not None and len(explained) > 0:
+            log.info(
+                "PCA explained variance: total=%.4f first=%.4f median=%.4f last=%.4f",
+                float(np.sum(explained)),
+                float(explained[0]),
+                float(np.median(explained)),
+                float(explained[-1]),
+            )
+
+        train_scores, test_scores, keep = standardize_train_test(
+            train_scores,
+            test_scores,
+            eps=1e-8,
+        )
+        log.info(
+            "Retained %d / %d PCA components after latent standardization",
+            int(keep.sum()),
+            len(keep),
+        )
+
+        log.info(
+            "Bootstrap ridge regression on PCA scores (%d boots, chunklen=%d, nchunks=%d, alphas=%s)...",
+            args.nboots,
+            config.CHUNKLEN,
+            nchunks,
+            alphas,
+        )
+        corrs, wt, cv_corrs = chunked_bootstrap_ridge(
+            train_scores,
+            train_rresp,
+            chunk_size=args.voxel_chunk_size,
+            eval_stim=test_scores,
+            eval_resp=test_rresp,
+            return_weights=False,
+            alphas=alphas,
+            nboots=args.nboots,
+            chunklen=config.CHUNKLEN,
+            nchunks=nchunks,
+            use_corr=True,
+        )
+        del train_scores, test_scores, pca, wt
+        return corrs, None, cv_corrs, None
 
     if args.encoding_model == "pls-ridge":
         if args.save_weights:
@@ -641,7 +962,7 @@ def fit_encoding_model(
         if args.save_weights:
             raise ValueError("--save-weights is not supported for --encoding-model mlp.")
         if args.single_alpha is not None:
-            raise ValueError("--single-alpha only applies to --encoding-model ridge or pls-ridge.")
+            raise ValueError("--single-alpha only applies to --encoding-model ridge, pca-ridge, or pls-ridge.")
 
         mlp_params = {
             "output_chunk_size": args.mlp_output_chunk_size,
@@ -667,7 +988,7 @@ def fit_encoding_model(
     if args.save_weights:
         raise ValueError("--save-weights is only supported for --encoding-model ridge.")
     if args.single_alpha is not None:
-        raise ValueError("--single-alpha only applies to --encoding-model ridge or pls-ridge.")
+        raise ValueError("--single-alpha only applies to --encoding-model ridge, pca-ridge, or pls-ridge.")
 
     lgbm_params = {
         "n_estimators": args.lgbm_n_estimators,
@@ -851,9 +1172,10 @@ def resolve_summary_horizons(index, stories, summary_model, requested_horizons=N
     return common_horizons
 
 
-def load_resp_info(subject, stories):
+def load_resp_info(subject, stories, data_train_dir=None):
     """Read response shapes without loading the full response matrices."""
-    resp_dir = Path(config.DATA_TRAIN_DIR) / "train_response" / subject
+    base_dir = Path(data_train_dir) if data_train_dir is not None else Path(config.DATA_TRAIN_DIR)
+    resp_dir = base_dir / "train_response" / subject
     lengths = {}
     n_voxels = None
     for story in stories:
@@ -1248,8 +1570,32 @@ def parse_args():
         help="Disable story-level holdout and report only within-training bootstrap CV.",
     )
     parser.add_argument(
+        "--local-compute-mode",
+        action="store_true",
+        help=(
+            "Read data/models/summaries from a mounted remote project tree while keeping "
+            "this local checkout as the active codebase and local output destination."
+        ),
+    )
+    parser.add_argument(
+        "--mounted-project-root",
+        default=str(DEFAULT_MOUNTED_PROJECT_ROOT),
+        help=(
+            "Mounted mirror of the remote language-decoding-expts project used by "
+            "--local-compute-mode."
+        ),
+    )
+    parser.add_argument(
+        "--local-cache-root",
+        default=str(DEFAULT_LOCAL_CACHE_ROOT),
+        help=(
+            "Local cache root used by --local-compute-mode for staged response files. "
+            "Never points into the mounted tree."
+        ),
+    )
+    parser.add_argument(
         "--summaries-dir",
-        default=str(REPO_DIR / "generate_summaries" / "outputs"),
+        default=str(LOCAL_DEFAULT_SUMMARIES_DIR),
         help="Directory containing summary JSONL files.",
     )
     parser.add_argument(
@@ -1295,7 +1641,7 @@ def parse_args():
     )
     parser.add_argument(
         "--ba-dir",
-        default=str(REPO_DIR / "ba_indices"),
+        default=str(LOCAL_DEFAULT_BA_DIR),
         help="Directory containing per-subject Brodmann area indices.",
     )
     parser.add_argument("--nboots", type=int, default=config.NBOOTS)
@@ -1303,7 +1649,24 @@ def parse_args():
         "--single-alpha",
         type=float,
         default=None,
-        help="Use a single fixed ridge alpha instead of cross-validated search (ridge / pls-ridge).",
+        help="Use a single fixed ridge alpha instead of cross-validated search (ridge / pca-ridge / pls-ridge).",
+    )
+    parser.add_argument(
+        "--pca-n-components",
+        type=int,
+        default=256,
+        help="Number of latent components for --encoding-model pca-ridge.",
+    )
+    parser.add_argument(
+        "--pca-whiten",
+        action="store_true",
+        help="Whiten PCA scores before ridge for --encoding-model pca-ridge.",
+    )
+    parser.add_argument(
+        "--pca-svd-solver",
+        default="randomized",
+        choices=["auto", "full", "covariance_eigh", "arpack", "randomized"],
+        help="SVD solver for --encoding-model pca-ridge.",
     )
     parser.add_argument(
         "--pls-n-components",
@@ -1331,8 +1694,12 @@ def parse_args():
     parser.add_argument(
         "--mlp-output-chunk-size",
         type=int,
-        default=512,
-        help="Number of voxel outputs per one-hidden-layer PyTorch MLP when --encoding-model mlp.",
+        default=0,
+        help=(
+            "Number of voxel outputs per one-hidden-layer PyTorch MLP when "
+            "--encoding-model mlp. Use 0 or a value >= n_voxels to train one "
+            "joint model over all selected voxels."
+        ),
     )
     parser.add_argument(
         "--mlp-hidden-dim",
@@ -1483,6 +1850,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+    mounted_root = configure_local_compute_mode(args) if args.local_compute_mode else None
     device = config.EM_DEVICE
     log.info("Device: %s", device)
 
@@ -1498,6 +1866,7 @@ def main():
     summaries_dir = Path(args.summaries_dir).expanduser().resolve()
     if not summaries_dir.is_dir():
         raise FileNotFoundError(f"No summaries directory found at {summaries_dir}")
+    log.info("Summaries directory: %s", summaries_dir)
 
     summary_index = build_summary_index(summaries_dir)
     summary_model = resolve_summary_model(summary_index, stories, args.summary_model)
@@ -1508,10 +1877,34 @@ def main():
     log.info("Summary horizons: %s", summary_horizons)
     log.info("Feature models: %s", args.models)
     log.info("Encoding model: %s", args.encoding_model)
+    log.info("BA directory: %s", Path(args.ba_dir).expanduser().resolve())
 
-    train_resp_lengths, total_voxels = load_resp_info(args.subject, train_stories)
+    if args.local_compute_mode:
+        local_cache_root = Path(args.local_cache_root).expanduser().resolve()
+        if mounted_root is not None and is_relative_to(local_cache_root, mounted_root):
+            raise ValueError(
+                f"--local-cache-root must not live inside the mounted tree: {local_cache_root}"
+            )
+        response_data_train_dir = stage_local_response_cache(
+            args.subject,
+            stories,
+            mounted_data_train_dir=config.DATA_TRAIN_DIR,
+            cache_root=local_cache_root,
+        )
+    else:
+        response_data_train_dir = config.DATA_TRAIN_DIR
+
+    train_resp_lengths, total_voxels = load_resp_info(
+        args.subject,
+        train_stories,
+        data_train_dir=response_data_train_dir,
+    )
     if test_stories:
-        test_resp_lengths, test_total_voxels = load_resp_info(args.subject, test_stories)
+        test_resp_lengths, test_total_voxels = load_resp_info(
+            args.subject,
+            test_stories,
+            data_train_dir=response_data_train_dir,
+        )
         if test_total_voxels != total_voxels:
             raise ValueError(
                 f"Train/test response voxel counts do not match: "
@@ -1546,10 +1939,22 @@ def main():
     else:
         vox, _ = load_voxel_set(args.subject, total_voxels)
 
-    train_rresp = get_resp(args.subject, train_stories, stack=True, vox=vox)
+    train_rresp = get_resp(
+        args.subject,
+        train_stories,
+        stack=True,
+        vox=vox,
+        response_root=response_data_train_dir,
+    )
     log.info("Training response matrix: %s (TRs x voxels)", train_rresp.shape)
     if test_stories:
-        test_rresp = get_resp(args.subject, test_stories, stack=True, vox=vox)
+        test_rresp = get_resp(
+            args.subject,
+            test_stories,
+            stack=True,
+            vox=vox,
+            response_root=response_data_train_dir,
+        )
         log.info("Held-out test response matrix: %s (TRs x voxels)", test_rresp.shape)
     else:
         test_rresp = None
@@ -1570,8 +1975,9 @@ def main():
         pls_supervision_mode = None
         pls_fit_rresp = None
 
-    out_dir = Path(config.REPO_DIR) / args.output_dir / args.subject
+    out_dir = resolve_output_dir(args, mounted_root=mounted_root) / args.subject
     out_dir.mkdir(parents=True, exist_ok=True)
+    log.info("Output directory: %s", out_dir)
 
     all_corrs = {}
     label_to_meta = {}
@@ -1698,7 +2104,7 @@ def main():
                     corrs.max(),
                     (corrs > 0.1).sum(),
                 )
-                if args.encoding_model == "ridge" and test_stories:
+                if args.encoding_model in {"ridge", "pca-ridge", "pls-ridge"} and test_stories:
                     log.info(
                         "  Training bootstrap-CV mean r=%.4f | max r=%.4f | n(r>0.1)=%d",
                         cv_corrs.mean(),
@@ -1721,6 +2127,9 @@ def main():
                     ),
                     voxels=vox,
                     encoding_model=np.array(args.encoding_model),
+                    pca_n_components=np.array(args.pca_n_components),
+                    pca_whiten=np.array(args.pca_whiten),
+                    pca_svd_solver=np.array(args.pca_svd_solver),
                     pls_n_components=np.array(args.pls_n_components),
                     pls_scale=np.array(args.pls_scale),
                     mlp_output_chunk_size=np.array(args.mlp_output_chunk_size),
@@ -1747,6 +2156,22 @@ def main():
                         "story_holdout" if test_stories else "bootstrap_cv"
                     ),
                     condition_label=np.array(label),
+                    local_compute_mode=np.array(args.local_compute_mode),
+                    mounted_project_root=np.array(
+                        str(mounted_root) if mounted_root is not None else ""
+                    ),
+                    local_cache_root=np.array(
+                        str(Path(args.local_cache_root).expanduser().resolve())
+                        if args.local_compute_mode
+                        else ""
+                    ),
+                    data_train_dir=np.array(config.DATA_TRAIN_DIR),
+                    response_data_train_dir=np.array(str(response_data_train_dir)),
+                    data_lm_dir=np.array(config.DATA_LM_DIR),
+                    model_dir=np.array(config.MODEL_DIR),
+                    summaries_dir=np.array(str(summaries_dir)),
+                    ba_dir=np.array(str(Path(args.ba_dir).expanduser().resolve())),
+                    output_dir=np.array(str(out_dir)),
                 )
                 if args.save_weights and wt is not None:
                     save_dict["weights"] = wt
@@ -1762,6 +2187,9 @@ def main():
     summary["summary_model"] = np.array(summary_model)
     summary["feature_models"] = np.array(args.models)
     summary["encoding_model"] = np.array(args.encoding_model)
+    summary["pca_n_components"] = np.array(args.pca_n_components)
+    summary["pca_whiten"] = np.array(args.pca_whiten)
+    summary["pca_svd_solver"] = np.array(args.pca_svd_solver)
     summary["pls_n_components"] = np.array(args.pls_n_components)
     summary["pls_scale"] = np.array(args.pls_scale)
     summary["mlp_output_chunk_size"] = np.array(args.mlp_output_chunk_size)
@@ -1774,6 +2202,22 @@ def main():
     summary["mlp_early_stopping"] = np.array(args.mlp_early_stopping)
     summary["embedding_model"] = np.array(args.embedding_model)
     summary["gpt2_model"] = np.array(args.gpt2_model)
+    summary["local_compute_mode"] = np.array(args.local_compute_mode)
+    summary["mounted_project_root"] = np.array(
+        str(mounted_root) if mounted_root is not None else ""
+    )
+    summary["local_cache_root"] = np.array(
+        str(Path(args.local_cache_root).expanduser().resolve())
+        if args.local_compute_mode
+        else ""
+    )
+    summary["data_train_dir"] = np.array(config.DATA_TRAIN_DIR)
+    summary["response_data_train_dir"] = np.array(str(response_data_train_dir))
+    summary["data_lm_dir"] = np.array(config.DATA_LM_DIR)
+    summary["model_dir"] = np.array(config.MODEL_DIR)
+    summary["summaries_dir"] = np.array(str(summaries_dir))
+    summary["ba_dir"] = np.array(str(Path(args.ba_dir).expanduser().resolve()))
+    summary["output_dir"] = np.array(str(out_dir))
     summary["voxels"] = vox
     summary["stories"] = np.array(stories)
     summary["train_stories"] = np.array(train_stories)

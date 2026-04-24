@@ -1,6 +1,7 @@
 numpy
 torch
 transformers
+sentence-transformers
 h5py
 scipy
 nltk
@@ -9,3 +10,6 @@ datasets
 bert_score
 nibabel
 openai
+matplotlib
+lightgbm
+scikit-learn

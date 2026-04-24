@@ -150,22 +150,18 @@ def extract_gpt1_features(stories, word_seqs, context_words, device,
 def extract_gpt2_features(stories, word_seqs, context_length, device,
                           model_name_or_path="openai-community/gpt2",
                           pool=False):
-    """GPT-2 (small) layer-9 hidden states with a sliding word window.
+    """GPT-2 (small) layer-9 hidden states, word-aligned.
 
-    Uses layer 9 (of 12) to match GPT-1 extraction, since intermediate layers
-    encode richer semantic features than the final prediction layer.
+    Tokenises the context window word by word so that BPE token boundaries
+    are tracked per stimulus word, matching the one-token-per-word alignment
+    that GPT-1 gets natively from its word-level vocabulary.
 
-    For each word position, the preceding *context_length - 1* words plus the
-    current word are concatenated, BPE-tokenised, and fed through GPT-2.
-
-    If *pool* is False (default), the hidden state of the **last BPE token**
-    is returned.  If *pool* is True, the hidden states are **mean-pooled**
-    over all tokens in the sequence.
-
-    *model_name_or_path* is passed to ``from_pretrained`` (Hub id or local dir).
+    *pool=False*: hidden state at the **last BPE token of the current word**.
+    *pool=True* : **mean-pool over the current word's BPE tokens only**
+                  (not the entire sequence).
     """
     _configure_huggingface_downloads()
-    pool_tag = " (mean-pool)" if pool else " (last-token)"
+    pool_tag = " (mean-pool over current word)" if pool else " (last BPE of current word)"
     log.info("Loading GPT-2 from %r%s", model_name_or_path, pool_tag)
     tokenizer, model = _load_gpt2_with_retry(model_name_or_path, device)
     hidden_dim = model.config.n_embd
@@ -178,19 +174,36 @@ def extract_gpt2_features(stories, word_seqs, context_length, device,
 
         for i in range(n):
             start = max(0, i - context_length + 1)
-            text = " ".join(w for w in words[start:i + 1] if w.strip())
-            ids = tokenizer.encode(text) if text.strip() else []
-            if len(ids) == 0:
+            window = words[start:i + 1]
+
+            all_ids = []
+            cur_word_start = 0
+            for j, w in enumerate(window):
+                w_text = w.strip()
+                if not w_text:
+                    continue
+                piece = (" " + w_text) if all_ids else w_text
+                w_ids = tokenizer.encode(piece)
+                if j == len(window) - 1:
+                    cur_word_start = len(all_ids)
+                all_ids.extend(w_ids)
+
+            if not all_ids:
                 vecs[i] = vecs[i - 1] if i > 0 else 0.0
                 continue
-            if len(ids) > 1024:
-                ids = ids[-1024:]
-            ids_t = torch.tensor([ids], device=device)
+
+            if len(all_ids) > 1024:
+                drop = len(all_ids) - 1024
+                all_ids = all_ids[-1024:]
+                cur_word_start = max(0, cur_word_start - drop)
+
+            ids_t = torch.tensor([all_ids], device=device)
             with torch.no_grad():
                 out = model(ids_t, output_hidden_states=True)
-            hidden = out.hidden_states[config.GPT_LAYER][0]  # layer 9, (seq_len, hidden_dim)
+            hidden = out.hidden_states[config.GPT_LAYER][0]
+
             if pool:
-                vecs[i] = hidden.mean(dim=0).cpu().numpy()
+                vecs[i] = hidden[cur_word_start:].mean(dim=0).cpu().numpy()
             else:
                 vecs[i] = hidden[-1].cpu().numpy()
 

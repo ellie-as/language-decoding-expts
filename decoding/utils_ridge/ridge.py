@@ -49,11 +49,11 @@ def ridge(stim, resp, alpha, singcutoff=1e-10, normalpha=False):
 
     # Compute weights for each alpha
     ualphas = np.unique(nalphas)
-    wt = np.zeros((stim.shape[1], resp.shape[1]))
+    wt = np.zeros((stim.shape[1], resp.shape[1]), dtype=np.float32)
     for ua in ualphas:
         selvox = np.nonzero(nalphas==ua)[0]
-        #awt = reduce(np.dot, [Vh.T, np.diag(S/(S**2+ua**2)), UR[:,selvox]])
-        awt = Vh.T.dot(np.diag(S/(S**2+ua**2))).dot(UR[:,selvox])
+        d = S/(S**2+ua**2)
+        awt = (Vh.T * d).dot(UR[:,selvox])
         wt[:,selvox] = awt
 
     return wt
@@ -328,10 +328,11 @@ def bootstrap_ridge(Rstim, Rresp, alphas, nboots, chunklen, nchunks, dtype=np.si
 
     logger.info("Computing weights for each response using entire training set..")
     UR = np.dot(U.T, np.nan_to_num(Rresp))
-    wt = np.zeros((Rstim.shape[1], Rresp.shape[1]))
+    wt = np.zeros((Rstim.shape[1], Rresp.shape[1]), dtype=dtype)
     for ai,alpha in enumerate(nalphas):
         selvox = np.nonzero(valphas==alpha)[0]
-        awt = reduce(np.dot, [Vh.T, np.diag(S/(S**2+alpha**2)), UR[:,selvox]])
+        d = S/(S**2+alpha**2)
+        awt = (Vh.T * d).dot(UR[:,selvox])
         wt[:,selvox] = awt
 
     return wt, valphas, allRcorrs
