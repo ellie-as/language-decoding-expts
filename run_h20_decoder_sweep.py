@@ -149,6 +149,130 @@ def multitask_elasticnet_fit_predict(Xtr, Ytr, Xte, alpha: float, l1_ratio: floa
     return model, pred
 
 
+# -----------------------------
+# PyTorch decoders
+# -----------------------------
+
+def _resolve_torch_device(pref: str = "auto"):
+    import torch
+
+    if pref == "cuda":
+        return torch.device("cuda")
+    if pref == "mps":
+        return torch.device("mps")
+    if pref == "cpu":
+        return torch.device("cpu")
+    # auto
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+def _build_torch_model(arch: str, in_dim: int, out_dim: int, **kwargs):
+    """Return an nn.Module for the requested architecture."""
+    import torch.nn as nn
+
+    if arch == "linear":
+        return nn.Linear(in_dim, out_dim, bias=True)
+    if arch == "lowrank":
+        k = int(kwargs["rank"])
+        return nn.Sequential(
+            nn.Linear(in_dim, k, bias=False),
+            nn.Linear(k, out_dim, bias=True),
+        )
+    if arch == "mlp":
+        hidden = int(kwargs["hidden"])
+        dropout = float(kwargs.get("dropout", 0.2))
+        return nn.Sequential(
+            nn.Linear(in_dim, hidden, bias=True),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, out_dim, bias=True),
+        )
+    raise ValueError(f"Unknown arch: {arch}")
+
+
+def torch_fit_predict(
+    Xtr, Ytr, Xte,
+    arch: str,
+    device,
+    *,
+    weight_decay: float = 1e-3,
+    lr: float = 1e-3,
+    max_epochs: int = 300,
+    patience: int = 25,
+    batch_size: int = 256,
+    val_frac: float = 0.1,
+    seed: int = 0,
+    **arch_kwargs,
+):
+    """Train an nn.Module with AdamW + early stopping on an internal val split.
+
+    Returns (trained_model, predictions_on_Xte_as_np).
+    """
+    import torch
+    import torch.nn as nn
+
+    torch.manual_seed(seed)
+    rng = np.random.default_rng(seed)
+
+    Xtr = np.asarray(Xtr, dtype=np.float32)
+    Ytr = np.asarray(Ytr, dtype=np.float32)
+    Xte = np.asarray(Xte, dtype=np.float32)
+
+    n = Xtr.shape[0]
+    perm = rng.permutation(n)
+    n_val = max(1, int(round(val_frac * n)))
+    val_idx = perm[:n_val]
+    tr_idx = perm[n_val:]
+
+    Xtr_t = torch.from_numpy(Xtr[tr_idx]).to(device)
+    Ytr_t = torch.from_numpy(Ytr[tr_idx]).to(device)
+    Xva_t = torch.from_numpy(Xtr[val_idx]).to(device)
+    Yva_t = torch.from_numpy(Ytr[val_idx]).to(device)
+    Xte_t = torch.from_numpy(Xte).to(device)
+
+    model = _build_torch_model(arch, Xtr.shape[1], Ytr.shape[1], **arch_kwargs).to(device)
+    optim = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    loss_fn = nn.MSELoss()
+
+    best_val = float("inf")
+    best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+    bad_epochs = 0
+
+    n_train = Xtr_t.shape[0]
+    for _ in range(max_epochs):
+        model.train()
+        idx = torch.randperm(n_train, device=device)
+        for start in range(0, n_train, batch_size):
+            b = idx[start:start + batch_size]
+            optim.zero_grad(set_to_none=True)
+            pred = model(Xtr_t[b])
+            loss = loss_fn(pred, Ytr_t[b])
+            loss.backward()
+            optim.step()
+
+        model.eval()
+        with torch.no_grad():
+            val_loss = float(loss_fn(model(Xva_t), Yva_t).item())
+        if val_loss < best_val - 1e-6:
+            best_val = val_loss
+            best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+            bad_epochs = 0
+        else:
+            bad_epochs += 1
+            if bad_epochs >= patience:
+                break
+
+    model.load_state_dict(best_state)
+    model.eval()
+    with torch.no_grad():
+        pred_te = model(Xte_t).detach().cpu().numpy().astype(np.float32)
+    return model, pred_te
+
+
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--subject", default="S1")
@@ -170,7 +294,34 @@ def parse_args():
     p.add_argument("--summary-model", default="gpt-4o-mini")
     p.add_argument("--horizon", type=int, default=20)
     p.add_argument("--feature-model", default="embedding", choices=list(EMBEDDING_MODELS.keys()))
+    p.add_argument(
+        "--roi",
+        default="full_frontal",
+        help="ROI to decode from. Either a per-ROI name (e.g. BA_10, BA_45) or 'full_frontal' "
+             "to use all frontal voxels. Default: full_frontal.",
+    )
     p.add_argument("--nfolds", type=int, default=5)
+    p.add_argument(
+        "--skip-torch",
+        action="store_true",
+        help="Skip PyTorch model sweep (linear/low-rank/MLP).",
+    )
+    p.add_argument(
+        "--skip-sklearn",
+        action="store_true",
+        help="Skip the slow sklearn sweeps (ridge, ridge+rankk, PLS, ElasticNet).",
+    )
+    p.add_argument(
+        "--skip-cv",
+        action="store_true",
+        help="Skip cross-validation. Fit each config on all training stories and "
+             "evaluate directly on the held-out test stories. Every config is reported.",
+    )
+    p.add_argument(
+        "--torch-device",
+        default="auto",
+        help="Device for PyTorch models: 'auto' (cuda > mps > cpu), 'cuda', 'mps', or 'cpu'.",
+    )
     p.add_argument("--output-dir", default="summary_decoding_results")
     p.add_argument("--seed", type=int, default=0)
     return p.parse_args()
@@ -222,16 +373,25 @@ def main():
     train_resp_lengths, total_voxels = rse.load_resp_info(args.subject, train_stories, data_train_dir=response_root)
     test_resp_lengths, _ = rse.load_resp_info(args.subject, test_stories, data_train_dir=response_root)
 
-    # Full frontal voxels
+    # Load ROI voxels (per-ROI BA or full_frontal)
     uts_id = rse.SUBJECT_TO_UTS.get(args.subject)
     if not uts_id:
         raise ValueError(f"Unknown subject {args.subject}")
-    frontal_path = Path(args.ba_dir) / uts_id / "BA_full_frontal.json"
-    with open(frontal_path, encoding="utf-8") as f:
-        frontal = json.load(f)
-    vox = np.sort(np.array(list(frontal.values())[0], dtype=int))
+    roi_name = args.roi
+    if roi_name == "full_frontal":
+        roi_json = Path(args.ba_dir) / uts_id / "BA_full_frontal.json"
+    else:
+        # Allow either "BA_10" or bare "10".
+        base = roi_name if roi_name.startswith("BA_") else f"BA_{roi_name}"
+        roi_json = Path(args.ba_dir) / uts_id / f"{base}.json"
+        roi_name = base
+    if not roi_json.is_file():
+        raise FileNotFoundError(f"ROI file not found: {roi_json}")
+    with open(roi_json, encoding="utf-8") as f:
+        roi_data = json.load(f)
+    vox = np.sort(np.array(list(roi_data.values())[0], dtype=int))
     vox = vox[vox < total_voxels]
-    log.info("Using full_frontal voxels: %d", len(vox))
+    log.info("Using %s voxels: %d", roi_name, len(vox))
 
     # Load summaries and embeddings
     summaries_dir = Path(args.summaries_dir).expanduser().resolve()
@@ -279,9 +439,13 @@ def main():
     X_train, X_test = zscore_X_train_test(X_train_raw, X_test_raw)
     del X_train_raw, X_test_raw
 
-    # CV folds over training stories
-    folds = list(group_kfold_splits(g_train, n_splits=args.nfolds, seed=args.seed))
-    log.info("Prepared %d group folds over training stories", len(folds))
+    # CV folds over training stories (only needed when CV is enabled)
+    if args.skip_cv:
+        folds = []
+        log.info("Skipping CV fold construction (--skip-cv).")
+    else:
+        folds = list(group_kfold_splits(g_train, n_splits=args.nfolds, seed=args.seed))
+        log.info("Prepared %d group folds over training stories", len(folds))
 
     results = []
 
@@ -299,103 +463,246 @@ def main():
             "retrieval_mean_rank_test": float(mean_rank),
         }
 
-    # ---- Ridge sweep (alpha) ----
-    ridge_alphas = np.logspace(0, 8, 25)
-    best = None
-    for ai, alpha in enumerate(ridge_alphas):
-        log.info("Ridge CV: alpha %d/%d = %.3g", ai + 1, len(ridge_alphas), float(alpha))
-        cv_scores = []
-        for fi, (tr_idx, va_idx) in enumerate(folds):
-            log.info("  fold %d/%d (train=%d, val=%d)", fi + 1, len(folds), len(tr_idx), len(va_idx))
-            _, pred_va = ridge_fit_predict(X_train[tr_idx], Y_train_z[tr_idx], X_train[va_idx], alpha)
-            cv_scores.append(dim_r(Y_train_z[va_idx], pred_va))
-        mean_cv = float(np.mean(cv_scores))
-        log.info("  alpha=%.3g mean_cv_dim_r=%.4f", float(alpha), mean_cv)
-        if best is None or mean_cv > best["cv"]:
-            best = {"alpha": float(alpha), "cv": mean_cv}
-    log.info("Best ridge alpha by train-story CV: %.3g (cv dim_r=%.4f)", best["alpha"], best["cv"])
-    ridge_model, pred_test = ridge_fit_predict(X_train, Y_train_z, X_test, best["alpha"])
-    results.append(eval_on_test("ridge", {"alpha": best["alpha"], "cv_dim_r": best["cv"]}, pred_test))
-
-    # ---- Ridge + rank-k truncation ----
-    # Use best ridge alpha then sweep rank
-    ranks = [8, 16, 32, 64, 128]
-    best_rr = None
-    for k in ranks:
-        cv_scores = []
-        for tr_idx, va_idx in folds:
-            mdl, _ = ridge_fit_predict(X_train[tr_idx], Y_train_z[tr_idx], X_train[va_idx], best["alpha"])
-            pred_va = ridge_rankk_predict_from_model(mdl, X_train[va_idx], k)
-            cv_scores.append(dim_r(Y_train_z[va_idx], pred_va))
-        mean_cv = float(np.mean(cv_scores))
-        if best_rr is None or mean_cv > best_rr["cv"]:
-            best_rr = {"rank": int(k), "cv": mean_cv}
-    log.info("Best ridge+rankk by train-story CV: k=%d (cv dim_r=%.4f)", best_rr["rank"], best_rr["cv"])
-    # Fit on full train and evaluate
-    ridge_model_full, _ = ridge_fit_predict(X_train, Y_train_z, X_test, best["alpha"])
-    pred_test_rr = ridge_rankk_predict_from_model(ridge_model_full, X_test, best_rr["rank"])
-    results.append(
-        eval_on_test(
-            "ridge_rankk",
-            {"alpha": best["alpha"], "rank": best_rr["rank"], "cv_dim_r": best_rr["cv"]},
-            pred_test_rr,
-        )
-    )
-
-    # ---- PLS sweep ----
-    pls_comps = [8, 16, 32, 64, 128]
-    best_pls = None
-    for nc in pls_comps:
-        cv_scores = []
-        for tr_idx, va_idx in folds:
-            _, pred_va = pls_fit_predict(X_train[tr_idx], Y_train_z[tr_idx], X_train[va_idx], nc)
-            cv_scores.append(dim_r(Y_train_z[va_idx], pred_va))
-        mean_cv = float(np.mean(cv_scores))
-        if best_pls is None or mean_cv > best_pls["cv"]:
-            best_pls = {"n_components": int(nc), "cv": mean_cv}
-    log.info("Best PLS by train-story CV: n=%d (cv dim_r=%.4f)", best_pls["n_components"], best_pls["cv"])
-    _, pred_test_pls = pls_fit_predict(X_train, Y_train_z, X_test, best_pls["n_components"])
-    results.append(eval_on_test("pls", {"n_components": best_pls["n_components"], "cv_dim_r": best_pls["cv"]}, pred_test_pls))
-
-    # ---- MultiTaskElasticNet sweep (small grid) ----
-    en_alphas = [1e-4, 1e-3, 1e-2, 1e-1]
-    en_l1 = [0.05, 0.1, 0.2, 0.5]
-    best_en = None
-    for a in en_alphas:
-        for l1 in en_l1:
-            cv_scores = []
-            for tr_idx, va_idx in folds:
-                try:
-                    _, pred_va = multitask_elasticnet_fit_predict(X_train[tr_idx], Y_train_z[tr_idx], X_train[va_idx], a, l1)
-                except Exception:
-                    cv_scores = None
-                    break
-                cv_scores.append(dim_r(Y_train_z[va_idx], pred_va))
-            if not cv_scores:
-                continue
-            mean_cv = float(np.mean(cv_scores))
-            if best_en is None or mean_cv > best_en["cv"]:
-                best_en = {"alpha": float(a), "l1_ratio": float(l1), "cv": mean_cv}
-    if best_en is not None:
-        log.info("Best ElasticNet by train-story CV: a=%.1e l1=%.2f (cv dim_r=%.4f)", best_en["alpha"], best_en["l1_ratio"], best_en["cv"])
-        _, pred_test_en = multitask_elasticnet_fit_predict(X_train, Y_train_z, X_test, best_en["alpha"], best_en["l1_ratio"])
-        results.append(
-            eval_on_test(
-                "elasticnet",
-                {"alpha": best_en["alpha"], "l1_ratio": best_en["l1_ratio"], "cv_dim_r": best_en["cv"]},
-                pred_test_en,
-            )
-        )
+    # ---- sklearn sweeps (ridge / ridge+rankk / PLS / ElasticNet) ----
+    if args.skip_sklearn:
+        log.info("Skipping sklearn sweeps (--skip-sklearn).")
     else:
-        log.warning("ElasticNet sweep failed for all settings.")
+        # ---- Ridge sweep (alpha) ----
+        ridge_alphas = np.logspace(0, 8, 25)
+        if args.skip_cv:
+            log.info("Ridge: --skip-cv, fitting each alpha on full train and testing on test.")
+            best = None
+            for ai, alpha in enumerate(ridge_alphas):
+                log.info("  Ridge alpha %d/%d = %.3g", ai + 1, len(ridge_alphas), float(alpha))
+                _, pred_test = ridge_fit_predict(X_train, Y_train_z, X_test, alpha)
+                results.append(eval_on_test("ridge", {"alpha": float(alpha)}, pred_test))
+                if best is None or results[-1]["dim_r_test"] > best["dim_r_test"]:
+                    best = {"alpha": float(alpha), "dim_r_test": results[-1]["dim_r_test"]}
+            log.info("Best ridge on test: alpha=%.3g dim_r=%.4f", best["alpha"], best["dim_r_test"])
+        else:
+            best = None
+            for ai, alpha in enumerate(ridge_alphas):
+                log.info("Ridge CV: alpha %d/%d = %.3g", ai + 1, len(ridge_alphas), float(alpha))
+                cv_scores = []
+                for fi, (tr_idx, va_idx) in enumerate(folds):
+                    log.info("  fold %d/%d (train=%d, val=%d)", fi + 1, len(folds), len(tr_idx), len(va_idx))
+                    _, pred_va = ridge_fit_predict(X_train[tr_idx], Y_train_z[tr_idx], X_train[va_idx], alpha)
+                    cv_scores.append(dim_r(Y_train_z[va_idx], pred_va))
+                mean_cv = float(np.mean(cv_scores))
+                log.info("  alpha=%.3g mean_cv_dim_r=%.4f", float(alpha), mean_cv)
+                if best is None or mean_cv > best["cv"]:
+                    best = {"alpha": float(alpha), "cv": mean_cv}
+            log.info("Best ridge alpha by train-story CV: %.3g (cv dim_r=%.4f)", best["alpha"], best["cv"])
+            ridge_model, pred_test = ridge_fit_predict(X_train, Y_train_z, X_test, best["alpha"])
+            results.append(eval_on_test("ridge", {"alpha": best["alpha"], "cv_dim_r": best["cv"]}, pred_test))
+
+        # ---- Ridge + rank-k truncation ----
+        ranks = [8, 16, 32, 64, 128]
+        if args.skip_cv:
+            log.info("Ridge+rankk: --skip-cv, using best ridge alpha=%.3g and testing each rank.", best["alpha"])
+            ridge_model_full, _ = ridge_fit_predict(X_train, Y_train_z, X_test, best["alpha"])
+            for k in ranks:
+                pred_test_rr = ridge_rankk_predict_from_model(ridge_model_full, X_test, k)
+                results.append(
+                    eval_on_test(
+                        "ridge_rankk",
+                        {"alpha": best["alpha"], "rank": int(k)},
+                        pred_test_rr,
+                    )
+                )
+        else:
+            best_rr = None
+            for k in ranks:
+                cv_scores = []
+                for tr_idx, va_idx in folds:
+                    mdl, _ = ridge_fit_predict(X_train[tr_idx], Y_train_z[tr_idx], X_train[va_idx], best["alpha"])
+                    pred_va = ridge_rankk_predict_from_model(mdl, X_train[va_idx], k)
+                    cv_scores.append(dim_r(Y_train_z[va_idx], pred_va))
+                mean_cv = float(np.mean(cv_scores))
+                if best_rr is None or mean_cv > best_rr["cv"]:
+                    best_rr = {"rank": int(k), "cv": mean_cv}
+            log.info("Best ridge+rankk by train-story CV: k=%d (cv dim_r=%.4f)", best_rr["rank"], best_rr["cv"])
+            ridge_model_full, _ = ridge_fit_predict(X_train, Y_train_z, X_test, best["alpha"])
+            pred_test_rr = ridge_rankk_predict_from_model(ridge_model_full, X_test, best_rr["rank"])
+            results.append(
+                eval_on_test(
+                    "ridge_rankk",
+                    {"alpha": best["alpha"], "rank": best_rr["rank"], "cv_dim_r": best_rr["cv"]},
+                    pred_test_rr,
+                )
+            )
+
+        # ---- PLS sweep ----
+        pls_comps = [8, 16, 32, 64, 128]
+        if args.skip_cv:
+            log.info("PLS: --skip-cv, testing each n_components on held-out test.")
+            for nc in pls_comps:
+                _, pred_test_pls = pls_fit_predict(X_train, Y_train_z, X_test, nc)
+                results.append(eval_on_test("pls", {"n_components": int(nc)}, pred_test_pls))
+        else:
+            best_pls = None
+            for nc in pls_comps:
+                cv_scores = []
+                for tr_idx, va_idx in folds:
+                    _, pred_va = pls_fit_predict(X_train[tr_idx], Y_train_z[tr_idx], X_train[va_idx], nc)
+                    cv_scores.append(dim_r(Y_train_z[va_idx], pred_va))
+                mean_cv = float(np.mean(cv_scores))
+                if best_pls is None or mean_cv > best_pls["cv"]:
+                    best_pls = {"n_components": int(nc), "cv": mean_cv}
+            log.info("Best PLS by train-story CV: n=%d (cv dim_r=%.4f)", best_pls["n_components"], best_pls["cv"])
+            _, pred_test_pls = pls_fit_predict(X_train, Y_train_z, X_test, best_pls["n_components"])
+            results.append(eval_on_test("pls", {"n_components": best_pls["n_components"], "cv_dim_r": best_pls["cv"]}, pred_test_pls))
+
+        # ---- MultiTaskElasticNet sweep (small grid) ----
+        en_alphas = [1e-4, 1e-3, 1e-2, 1e-1]
+        en_l1 = [0.05, 0.1, 0.2, 0.5]
+        if args.skip_cv:
+            log.info("ElasticNet: --skip-cv, testing each (alpha, l1_ratio) on held-out test.")
+            for a in en_alphas:
+                for l1 in en_l1:
+                    try:
+                        _, pred_test_en = multitask_elasticnet_fit_predict(
+                            X_train, Y_train_z, X_test, a, l1,
+                        )
+                    except Exception as e:
+                        log.warning("  ElasticNet (a=%.1e, l1=%.2f) failed: %s", a, l1, e)
+                        continue
+                    results.append(
+                        eval_on_test(
+                            "elasticnet",
+                            {"alpha": float(a), "l1_ratio": float(l1)},
+                            pred_test_en,
+                        )
+                    )
+        else:
+            best_en = None
+            for a in en_alphas:
+                for l1 in en_l1:
+                    cv_scores = []
+                    for tr_idx, va_idx in folds:
+                        try:
+                            _, pred_va = multitask_elasticnet_fit_predict(X_train[tr_idx], Y_train_z[tr_idx], X_train[va_idx], a, l1)
+                        except Exception:
+                            cv_scores = None
+                            break
+                        cv_scores.append(dim_r(Y_train_z[va_idx], pred_va))
+                    if not cv_scores:
+                        continue
+                    mean_cv = float(np.mean(cv_scores))
+                    if best_en is None or mean_cv > best_en["cv"]:
+                        best_en = {"alpha": float(a), "l1_ratio": float(l1), "cv": mean_cv}
+            if best_en is not None:
+                log.info("Best ElasticNet by train-story CV: a=%.1e l1=%.2f (cv dim_r=%.4f)", best_en["alpha"], best_en["l1_ratio"], best_en["cv"])
+                _, pred_test_en = multitask_elasticnet_fit_predict(X_train, Y_train_z, X_test, best_en["alpha"], best_en["l1_ratio"])
+                results.append(
+                    eval_on_test(
+                        "elasticnet",
+                        {"alpha": best_en["alpha"], "l1_ratio": best_en["l1_ratio"], "cv_dim_r": best_en["cv"]},
+                        pred_test_en,
+                    )
+                )
+            else:
+                log.warning("ElasticNet sweep failed for all settings.")
+
+    # ---- PyTorch sweep (linear / low-rank / MLP) ----
+    if not args.skip_torch:
+        try:
+            import torch  # noqa: F401
+        except ImportError:
+            log.warning("PyTorch not available; skipping torch sweep.")
+        else:
+            device = _resolve_torch_device(args.torch_device)
+            log.info("Torch device: %s", device)
+
+            # Configs chosen with limited training data in mind: small bottlenecks,
+            # strong weight decay, early stopping. Each config runs CV across folds
+            # for hyperparameter selection (on train-story dim_r), then a final fit
+            # on all train stories for test eval.
+            torch_configs = []
+            # Linear baseline (weight-decay sweep)
+            for wd in [1e-4, 1e-3, 1e-2, 1e-1]:
+                torch_configs.append({"arch": "linear", "weight_decay": wd})
+            # Low-rank linear
+            for k in [8, 16, 32, 64]:
+                for wd in [1e-3, 1e-2]:
+                    torch_configs.append({"arch": "lowrank", "rank": k, "weight_decay": wd})
+            # MLP (small, regularized)
+            for hidden in [32, 64, 128]:
+                for dropout in [0.1, 0.3]:
+                    for wd in [1e-3, 1e-2]:
+                        torch_configs.append(
+                            {"arch": "mlp", "hidden": hidden, "dropout": dropout, "weight_decay": wd}
+                        )
+
+            if args.skip_cv:
+                log.info("Torch: --skip-cv, fitting each config on full train and testing on test.")
+                for ci, cfg in enumerate(torch_configs):
+                    log.info("Torch %d/%d: %s", ci + 1, len(torch_configs), cfg)
+                    try:
+                        _, pred_te = torch_fit_predict(
+                            X_train, Y_train_z, X_test,
+                            device=device, seed=args.seed, **cfg,
+                        )
+                    except Exception as e:  # pragma: no cover
+                        log.warning("  torch config failed (%s): %s", cfg, e)
+                        continue
+                    arch = cfg["arch"]
+                    params = {k: v for k, v in cfg.items() if k != "arch"}
+                    results.append(eval_on_test(f"torch_{arch}", params, pred_te))
+            else:
+                def _run_torch_cv(cfg):
+                    cv_scores = []
+                    for fi, (tr_idx, va_idx) in enumerate(folds):
+                        _, pred_va = torch_fit_predict(
+                            X_train[tr_idx], Y_train_z[tr_idx], X_train[va_idx],
+                            device=device, seed=args.seed, **cfg,
+                        )
+                        cv_scores.append(dim_r(Y_train_z[va_idx], pred_va))
+                    return float(np.mean(cv_scores))
+
+                best_by_arch: dict = {}
+                for ci, cfg in enumerate(torch_configs):
+                    log.info("Torch CV %d/%d: %s", ci + 1, len(torch_configs), cfg)
+                    try:
+                        cv = _run_torch_cv(cfg)
+                    except Exception as e:  # pragma: no cover
+                        log.warning("  torch config failed (%s): %s", cfg, e)
+                        continue
+                    log.info("  cv dim_r=%.4f", cv)
+                    arch = cfg["arch"]
+                    if arch not in best_by_arch or cv > best_by_arch[arch]["cv"]:
+                        best_by_arch[arch] = {"cfg": cfg, "cv": cv}
+
+                for arch, best_cfg in best_by_arch.items():
+                    cfg = best_cfg["cfg"]
+                    log.info("Best torch-%s cv dim_r=%.4f (%s)", arch, best_cfg["cv"], cfg)
+                    try:
+                        _, pred_te = torch_fit_predict(
+                            X_train, Y_train_z, X_test,
+                            device=device, seed=args.seed, **cfg,
+                        )
+                    except Exception as e:  # pragma: no cover
+                        log.warning("  torch final fit failed: %s", e)
+                        continue
+                    params = {k: v for k, v in cfg.items() if k != "arch"}
+                    params["cv_dim_r"] = float(best_cfg["cv"])
+                    results.append(eval_on_test(f"torch_{arch}", params, pred_te))
 
     # Sort and save
     results_sorted = sorted(results, key=lambda r: r["dim_r_test"], reverse=True)
     out_dir = Path(args.output_dir) / args.subject
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"h20_sweep__full_frontal__{args.feature_model}__{summary_model}__holdout-5.csv"
+    out_path = out_dir / f"h20_sweep__{roi_name}__{args.feature_model}__{summary_model}__holdout-5.csv"
+    # Union all keys so rows with extra arch-specific params (rank, hidden, ...) are preserved.
+    all_keys: list = []
+    seen = set()
+    for r in results_sorted:
+        for k in r.keys():
+            if k not in seen:
+                seen.add(k)
+                all_keys.append(k)
     with open(out_path, "w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(results_sorted[0].keys()))
+        writer = csv.DictWriter(f, fieldnames=all_keys)
         writer.writeheader()
         writer.writerows(results_sorted)
 
