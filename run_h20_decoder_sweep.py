@@ -52,6 +52,56 @@ logging.basicConfig(
 log = logging.getLogger("h20_sweep")
 
 
+def story_retrieval_metrics(true_emb: np.ndarray, pred_emb: np.ndarray, groups: np.ndarray):
+    """Story-level retrieval.
+
+    Two complementary scores (chance = 1/n_stories for both top1 variants):
+
+    - argmax_in_correct:   for each test TR i, take argmax over j of
+                           cos(pred[i], true[j]). Return fraction where
+                           groups[argmax] == groups[i]. (Easy case: nearest
+                           TR tends to be within-story due to temporal
+                           smoothness, so this is a liberal metric.)
+    - mean_sim_top1 / mrr: for each test TR i, compute mean cos(pred[i], true[j])
+                           restricted to each story c (averaging over j in c),
+                           rank stories by that score, and return top1 / MRR
+                           over stories.
+    """
+    t = true_emb.astype(np.float32, copy=False)
+    p = pred_emb.astype(np.float32, copy=False)
+    t_n = t / np.clip(np.linalg.norm(t, axis=1, keepdims=True), 1e-12, None)
+    p_n = p / np.clip(np.linalg.norm(p, axis=1, keepdims=True), 1e-12, None)
+
+    sim = p_n @ t_n.T  # (T, T)
+    groups = np.asarray(groups)
+    uniq = np.unique(groups)
+    n_stories = len(uniq)
+
+    argmax_j = np.argmax(sim, axis=1)
+    argmax_in_correct = float((groups[argmax_j] == groups).mean())
+
+    story_cols = {s: np.nonzero(groups == s)[0] for s in uniq}
+    mean_sim_per_story = np.stack(
+        [sim[:, cols].mean(axis=1) for s, cols in story_cols.items()],
+        axis=1,
+    )  # (T, n_stories)
+    ordered = list(story_cols.keys())
+    correct_col = np.array([ordered.index(g) for g in groups])
+    correct_score = mean_sim_per_story[np.arange(sim.shape[0]), correct_col]
+    ranks = 1 + (mean_sim_per_story > correct_score[:, None]).sum(axis=1)
+    mean_sim_top1 = float((ranks == 1).mean())
+    mean_sim_mrr = float((1.0 / ranks).mean())
+    mean_sim_mean_rank = float(ranks.mean())
+
+    return {
+        "n_stories": int(n_stories),
+        "argmax_in_correct_story": argmax_in_correct,
+        "story_top1": mean_sim_top1,
+        "story_mrr": mean_sim_mrr,
+        "story_mean_rank": mean_sim_mean_rank,
+    }
+
+
 def dim_r(true_emb: np.ndarray, pred_emb: np.ndarray) -> float:
     """Mean Pearson r per embedding dimension across time."""
     A = true_emb.astype(np.float64, copy=False)
@@ -745,8 +795,9 @@ def main():
         # un-zscore for retrieval metrics against the original Y_test.
         pred_test_z = _invert_target(pred_test)
         pred_test_unz = (pred_test_z * y_sd + y_mu).astype(np.float32)
-        dimr = dim_r(Y_test_z, pred_test_z)  # dim_r in full-dim z-scored space
+        dimr = dim_r(Y_test_z, pred_test_z)
         top1, mrr, mean_rank = retrieval_metrics(Y_test, pred_test_unz)
+        story = story_retrieval_metrics(Y_test, pred_test_unz, g_test)
         return {
             "model": model_name,
             **params,
@@ -754,6 +805,11 @@ def main():
             "retrieval_top1_test": float(top1),
             "retrieval_mrr_test": float(mrr),
             "retrieval_mean_rank_test": float(mean_rank),
+            "story_argmax_in_correct": float(story["argmax_in_correct_story"]),
+            "story_top1": float(story["story_top1"]),
+            "story_mrr": float(story["story_mrr"]),
+            "story_mean_rank": float(story["story_mean_rank"]),
+            "n_test_stories": int(story["n_stories"]),
         }
 
     # ---- sklearn sweeps (ridge / ridge+rankk / PLS / ElasticNet) ----
@@ -1019,15 +1075,27 @@ def main():
         writer.writerows(results_sorted)
 
     log.info("Saved sweep results to %s", out_path)
-    log.info("Top models:")
+    n_test_stories = results_sorted[0].get("n_test_stories", 0)
+    log.info(
+        "Top models (story-level metrics: chance top1=1/%d=%.3f):",
+        max(1, n_test_stories), 1.0 / max(1, n_test_stories),
+    )
+    hidden = {
+        "model", "dim_r_test", "retrieval_top1_test", "retrieval_mrr_test",
+        "retrieval_mean_rank_test", "story_argmax_in_correct", "story_top1",
+        "story_mrr", "story_mean_rank", "n_test_stories",
+    }
     for r in results_sorted[:5]:
         log.info(
-            "  %-12s dim_r=%.4f top1=%.3f mrr=%.3f (params=%s)",
+            "  %-12s dim_r=%.4f TR_top1=%.3f TR_mrr=%.3f | story_top1=%.3f story_mrr=%.3f story_argmax=%.3f (params=%s)",
             r["model"],
             r["dim_r_test"],
             r["retrieval_top1_test"],
             r["retrieval_mrr_test"],
-            {k: v for k, v in r.items() if k not in {"model", "dim_r_test", "retrieval_top1_test", "retrieval_mrr_test", "retrieval_mean_rank_test"}},
+            r.get("story_top1", float("nan")),
+            r.get("story_mrr", float("nan")),
+            r.get("story_argmax_in_correct", float("nan")),
+            {k: v for k, v in r.items() if k not in hidden},
         )
 
 
