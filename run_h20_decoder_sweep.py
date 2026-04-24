@@ -302,8 +302,8 @@ def torch_fit_predict(
     temperature: float = 0.07,
     weight_decay: float = 1e-3,
     lr: float = 1e-3,
-    max_epochs: int = 300,
-    patience: int = 25,
+    max_epochs: int = 1000,
+    patience: int = 50,
     batch_size: int = 256,
     val_frac: float = 0.1,
     seed: int = 0,
@@ -607,6 +607,13 @@ def parse_args():
              "before decoding. Default: 0 (use all ROI voxels).",
     )
     p.add_argument(
+        "--brain-pca",
+        type=int,
+        default=0,
+        help="If >0, fit PCA on X_train and project both X_train and X_test to K components "
+             "before decoding. Applied after --select-voxels if both are set. Default: 0 (no PCA).",
+    )
+    p.add_argument(
         "--diagnose",
         action="store_true",
         help="Before any model training, print target-structure diagnostics "
@@ -762,6 +769,18 @@ def main():
         X_train = X_train[:, sel_idx]
         X_test = X_test[:, sel_idx]
         log.info("After voxel selection: X_train shape %s", X_train.shape)
+
+    # Optional input-side PCA (applied after voxel selection if both are set)
+    if args.brain_pca and args.brain_pca > 0:
+        from sklearn.decomposition import PCA as _PCA
+
+        K_x = int(min(args.brain_pca, X_train.shape[0] - 1, X_train.shape[1]))
+        log.info("Brain PCA: %d components (of %d voxels)", K_x, X_train.shape[1])
+        x_pca = _PCA(n_components=K_x, random_state=args.seed)
+        X_train = x_pca.fit_transform(X_train).astype(np.float32)
+        X_test = x_pca.transform(X_test).astype(np.float32)
+        explained_x = float(np.sum(x_pca.explained_variance_ratio_))
+        log.info("  brain PCA explained variance: %.3f", explained_x)
 
     # Optional target-side PCA (model learns to predict PCs; we invert for eval)
     if args.target_pca and args.target_pca > 0:
