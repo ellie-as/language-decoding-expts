@@ -322,6 +322,108 @@ def torch_fit_predict(
     return model, pred_te
 
 
+def _unit_normalize(X: np.ndarray) -> np.ndarray:
+    n = np.linalg.norm(X, axis=1, keepdims=True)
+    n[n == 0] = 1.0
+    return (X / n).astype(np.float32)
+
+
+def diagnose_targets(
+    Y_test: np.ndarray,
+    g_test: np.ndarray,
+    *,
+    log_fn=print,
+    retrieval_fn=None,
+    lags=(1, 2, 5, 10, 20, 50),
+    windows=(1, 3, 10, 20),
+    noise_scales=(0.0, 0.1, 0.3, 1.0, 3.0),
+    shift_ks=(1, 2, 5, 10),
+    seed: int = 0,
+):
+    """Print diagnostics about target structure and retrieval ceilings.
+
+    Computes:
+    1. Target autocorrelation: mean cos(Y[t], Y[t+lag]) for each lag, within-story.
+    2. Nearest-other-TR distance distribution: for each TR, how far (in TRs) is
+       the most-similar OTHER TR within the same story? (Tells us: when an
+       oracle picks a non-self TR, how close is it?)
+    3. Within-window retrieval using oracle pred=Y_test: fraction of TRs where
+       the argmax-over-non-self lies within ±w TRs.
+    4. Noise-sensitivity: pred = Y + sigma * Gaussian; top1/mrr as sigma varies.
+    5. Shifted-oracle retrieval: pred[i] = Y[i+k]; top1/mrr as k varies.
+    """
+    if retrieval_fn is None:
+        retrieval_fn = retrieval_metrics
+
+    rng = np.random.default_rng(seed)
+    Y = Y_test.astype(np.float32, copy=False)
+    Y_unit = _unit_normalize(Y)
+    groups = np.asarray(g_test)
+    T = Y.shape[0]
+
+    # --- 1. Autocorrelation within story ---
+    log_fn("  [1] Target autocorrelation (mean cos_sim within-story):")
+    log_fn("       lag      mean_cos    n_pairs")
+    per_lag_rows = []
+    for lag in lags:
+        sims = []
+        for s in np.unique(groups):
+            idx = np.nonzero(groups == s)[0]
+            if len(idx) <= lag:
+                continue
+            a = Y_unit[idx[:-lag]]
+            b = Y_unit[idx[lag:]]
+            sims.append((a * b).sum(axis=1))
+        if not sims:
+            continue
+        flat = np.concatenate(sims)
+        per_lag_rows.append((lag, float(flat.mean()), int(flat.size)))
+        log_fn(f"       {lag:>3d}       {flat.mean():+.4f}     {flat.size}")
+
+    # --- 2. Nearest-other-TR (within story) distance distribution ---
+    log_fn("  [2] Distance (|Δt|) to most-similar OTHER TR, within same story:")
+    lags_found = []
+    for s in np.unique(groups):
+        idx = np.nonzero(groups == s)[0]
+        if len(idx) < 3:
+            continue
+        Ys = Y_unit[idx]
+        sim = Ys @ Ys.T
+        np.fill_diagonal(sim, -np.inf)
+        nn = np.argmax(sim, axis=1)
+        lags_found.append(np.abs(nn - np.arange(len(idx))))
+    if lags_found:
+        flat = np.concatenate(lags_found)
+        log_fn(
+            f"       median={np.median(flat):.1f}  p75={np.percentile(flat,75):.1f}  "
+            f"p90={np.percentile(flat,90):.1f}  p95={np.percentile(flat,95):.1f}  "
+            f"max={flat.max()}"
+        )
+        for w in windows:
+            frac = float((flat <= w).mean())
+            log_fn(f"       frac(|Δt| ≤ {w:>2d}): {frac:.3f}")
+
+    # --- 3. Noise-sensitivity of retrieval when predictions ARE the true targets ---
+    log_fn("  [3] Retrieval under additive noise on oracle predictions:")
+    log_fn("       sigma        top1     mrr      mean_rank")
+    Y_std_per_dim = float(Y.std(axis=0).mean())
+    for sigma_mult in noise_scales:
+        noise = rng.standard_normal(Y.shape).astype(np.float32) * (sigma_mult * Y_std_per_dim)
+        pred = Y + noise
+        top1, mrr, mean_rank = retrieval_fn(Y, pred)
+        log_fn(f"       {sigma_mult:>4.1f}        {top1:.3f}    {mrr:.3f}    {mean_rank:.1f}")
+
+    # --- 4. Shifted-oracle retrieval ---
+    log_fn("  [4] Shifted oracle (pred[i] = Y[i+k]) retrieval on full test set:")
+    log_fn("       k            top1     mrr      mean_rank")
+    for k in shift_ks:
+        if k <= 0 or k >= T:
+            continue
+        pred = np.roll(Y, -k, axis=0)
+        top1, mrr, mean_rank = retrieval_fn(Y, pred)
+        log_fn(f"       {k:>3d}          {top1:.3f}    {mrr:.3f}    {mean_rank:.1f}")
+
+
 def select_voxels_by_encoding(
     X_train: np.ndarray,
     Y_train_z: np.ndarray,
@@ -454,6 +556,18 @@ def parse_args():
         help="If >0, pre-select top N voxels by encoding-model CV r on training stories, "
              "before decoding. Default: 0 (use all ROI voxels).",
     )
+    p.add_argument(
+        "--diagnose",
+        action="store_true",
+        help="Before any model training, print target-structure diagnostics "
+             "(autocorrelation, nearest-neighbor distances, noise-sensitivity of "
+             "retrieval, shifted-oracle retrieval).",
+    )
+    p.add_argument(
+        "--diagnose-only",
+        action="store_true",
+        help="Run diagnostics and exit without training any model. Implies --diagnose.",
+    )
     p.add_argument("--output-dir", default="summary_decoding_results")
     p.add_argument("--seed", type=int, default=0)
     return p.parse_args()
@@ -570,6 +684,21 @@ def main():
     X_test_raw, g_test = build_brain_and_groups(args.subject, test_stories, vox, response_root, test_resp_lengths)
     X_train, X_test = zscore_X_train_test(X_train_raw, X_test_raw)
     del X_train_raw, X_test_raw
+
+    # Target-structure diagnostics (no model training required)
+    if args.diagnose or args.diagnose_only:
+        log.info("=== Target diagnostics (horizon=%d, %d test TRs, %d stories) ===",
+                 args.horizon, Y_test.shape[0], len(np.unique(g_test)))
+        diagnose_targets(
+            Y_test, g_test,
+            log_fn=log.info,
+            retrieval_fn=retrieval_metrics,
+            seed=args.seed,
+        )
+        log.info("=== end diagnostics ===")
+        if args.diagnose_only:
+            log.info("--diagnose-only set; exiting without training.")
+            return
 
     # Optional voxel selection using a cheap encoding model
     if args.select_voxels and args.select_voxels > 0:
