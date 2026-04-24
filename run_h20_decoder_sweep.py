@@ -554,8 +554,8 @@ def parse_args():
     p.add_argument(
         "--roi",
         default="full_frontal",
-        help="ROI to decode from. Either a per-ROI name (e.g. BA_10, BA_45) or 'full_frontal' "
-             "to use all frontal voxels. Default: full_frontal.",
+        help="Voxel set: 'all' (every voxel the subject has), 'full_frontal' (all frontal), "
+             "or a single BA ROI name (e.g. BA_10, BA_45, or just '10'). Default: full_frontal.",
     )
     p.add_argument("--nfolds", type=int, default=5)
     p.add_argument(
@@ -669,24 +669,28 @@ def main():
     train_resp_lengths, total_voxels = rse.load_resp_info(args.subject, train_stories, data_train_dir=response_root)
     test_resp_lengths, _ = rse.load_resp_info(args.subject, test_stories, data_train_dir=response_root)
 
-    # Load ROI voxels (per-ROI BA or full_frontal)
+    # Load voxels: all, full_frontal, or a single BA ROI
     uts_id = rse.SUBJECT_TO_UTS.get(args.subject)
     if not uts_id:
         raise ValueError(f"Unknown subject {args.subject}")
     roi_name = args.roi
-    if roi_name == "full_frontal":
-        roi_json = Path(args.ba_dir) / uts_id / "BA_full_frontal.json"
+    if roi_name in ("all", "whole", "all_voxels"):
+        roi_name = "all"
+        vox = np.arange(total_voxels, dtype=int)
     else:
-        # Allow either "BA_10" or bare "10".
-        base = roi_name if roi_name.startswith("BA_") else f"BA_{roi_name}"
-        roi_json = Path(args.ba_dir) / uts_id / f"{base}.json"
-        roi_name = base
-    if not roi_json.is_file():
-        raise FileNotFoundError(f"ROI file not found: {roi_json}")
-    with open(roi_json, encoding="utf-8") as f:
-        roi_data = json.load(f)
-    vox = np.sort(np.array(list(roi_data.values())[0], dtype=int))
-    vox = vox[vox < total_voxels]
+        if roi_name == "full_frontal":
+            roi_json = Path(args.ba_dir) / uts_id / "BA_full_frontal.json"
+        else:
+            # Allow either "BA_10" or bare "10".
+            base = roi_name if roi_name.startswith("BA_") else f"BA_{roi_name}"
+            roi_json = Path(args.ba_dir) / uts_id / f"{base}.json"
+            roi_name = base
+        if not roi_json.is_file():
+            raise FileNotFoundError(f"ROI file not found: {roi_json}")
+        with open(roi_json, encoding="utf-8") as f:
+            roi_data = json.load(f)
+        vox = np.sort(np.array(list(roi_data.values())[0], dtype=int))
+        vox = vox[vox < total_voxels]
     log.info("Using %s voxels: %d", roi_name, len(vox))
 
     # Load summaries and embeddings
