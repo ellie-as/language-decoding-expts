@@ -194,11 +194,62 @@ def _build_torch_model(arch: str, in_dim: int, out_dim: int, **kwargs):
     raise ValueError(f"Unknown arch: {arch}")
 
 
+def _loss_from_kind(kind: str, temperature: float):
+    """Return a callable loss(pred, target) for the named kind."""
+    import torch
+    import torch.nn.functional as F
+
+    if kind == "mse":
+        return lambda pred, target: F.mse_loss(pred, target)
+    if kind == "cosine":
+        def _cos(pred, target):
+            p = F.normalize(pred, dim=-1)
+            t = F.normalize(target, dim=-1)
+            return (1.0 - (p * t).sum(dim=-1)).mean()
+        return _cos
+    if kind == "infonce":
+        def _nce(pred, target):
+            p = F.normalize(pred, dim=-1)
+            t = F.normalize(target, dim=-1)
+            logits = (p @ t.T) / float(temperature)
+            labels = torch.arange(logits.shape[0], device=logits.device)
+            # Symmetric InfoNCE (pred->target and target->pred)
+            return 0.5 * (F.cross_entropy(logits, labels) + F.cross_entropy(logits.T, labels))
+        return _nce
+    raise ValueError(f"Unknown loss: {kind}")
+
+
+def _group_val_split(n: int, groups, val_frac: float, seed: int):
+    """Return (tr_idx, val_idx). If groups is not None, hold out whole groups for val."""
+    rng = np.random.default_rng(seed)
+    if groups is not None:
+        groups = np.asarray(groups)
+        uniq = np.unique(groups)
+        rng.shuffle(uniq)
+        n_val_g = max(1, int(round(val_frac * len(uniq))))
+        val_g = set(uniq[:n_val_g].tolist())
+        val_mask = np.array([g in val_g for g in groups])
+        val_idx = np.nonzero(val_mask)[0]
+        tr_idx = np.nonzero(~val_mask)[0]
+        if len(tr_idx) == 0:
+            # Fallback: random TR split
+            perm = rng.permutation(n)
+            n_val = max(1, int(round(val_frac * n)))
+            return perm[n_val:], perm[:n_val]
+        return tr_idx, val_idx
+    perm = rng.permutation(n)
+    n_val = max(1, int(round(val_frac * n)))
+    return perm[n_val:], perm[:n_val]
+
+
 def torch_fit_predict(
     Xtr, Ytr, Xte,
     arch: str,
     device,
     *,
+    groups=None,
+    loss: str = "infonce",
+    temperature: float = 0.07,
     weight_decay: float = 1e-3,
     lr: float = 1e-3,
     max_epochs: int = 300,
@@ -210,23 +261,21 @@ def torch_fit_predict(
 ):
     """Train an nn.Module with AdamW + early stopping on an internal val split.
 
+    If `groups` is provided (length == Xtr.shape[0]), the early-stopping val set
+    holds out whole groups (stories), not random TRs, to avoid leakage from
+    temporal autocorrelation.
+
     Returns (trained_model, predictions_on_Xte_as_np).
     """
     import torch
-    import torch.nn as nn
 
     torch.manual_seed(seed)
-    rng = np.random.default_rng(seed)
 
     Xtr = np.asarray(Xtr, dtype=np.float32)
     Ytr = np.asarray(Ytr, dtype=np.float32)
     Xte = np.asarray(Xte, dtype=np.float32)
 
-    n = Xtr.shape[0]
-    perm = rng.permutation(n)
-    n_val = max(1, int(round(val_frac * n)))
-    val_idx = perm[:n_val]
-    tr_idx = perm[n_val:]
+    tr_idx, val_idx = _group_val_split(Xtr.shape[0], groups, val_frac, seed)
 
     Xtr_t = torch.from_numpy(Xtr[tr_idx]).to(device)
     Ytr_t = torch.from_numpy(Ytr[tr_idx]).to(device)
@@ -236,7 +285,7 @@ def torch_fit_predict(
 
     model = _build_torch_model(arch, Xtr.shape[1], Ytr.shape[1], **arch_kwargs).to(device)
     optim = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-    loss_fn = nn.MSELoss()
+    loss_fn = _loss_from_kind(loss, temperature)
 
     best_val = float("inf")
     best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
@@ -250,8 +299,8 @@ def torch_fit_predict(
             b = idx[start:start + batch_size]
             optim.zero_grad(set_to_none=True)
             pred = model(Xtr_t[b])
-            loss = loss_fn(pred, Ytr_t[b])
-            loss.backward()
+            loss_val = loss_fn(pred, Ytr_t[b])
+            loss_val.backward()
             optim.step()
 
         model.eval()
@@ -271,6 +320,62 @@ def torch_fit_predict(
     with torch.no_grad():
         pred_te = model(Xte_t).detach().cpu().numpy().astype(np.float32)
     return model, pred_te
+
+
+def select_voxels_by_encoding(
+    X_train: np.ndarray,
+    Y_train_z: np.ndarray,
+    g_train: np.ndarray,
+    n_select: int,
+    alpha: float = 10.0,
+    seed: int = 0,
+):
+    """Rank voxels by 2-fold (story-grouped) CV r of an encoding ridge (Y -> X_v).
+
+    Returns (sorted_voxel_indices, per_voxel_r). Sorted by decreasing r.
+    """
+    def _fit_ridge_closed(Y, X, alpha):
+        # Y: (T, D), X: (T, V) -> W: (D, V) = (YtY + aI)^-1 Yt X
+        D = Y.shape[1]
+        YtY = (Y.T @ Y).astype(np.float64)
+        YtY[np.diag_indices_from(YtY)] += float(alpha)
+        W = np.linalg.solve(YtY, (Y.T @ X).astype(np.float64))
+        return W.astype(np.float32)
+
+    uniq = np.unique(g_train)
+    rng = np.random.default_rng(seed)
+    rng.shuffle(uniq)
+    half = max(1, len(uniq) // 2)
+    g_a = set(uniq[:half].tolist())
+    mask_a = np.array([g in g_a for g in g_train])
+    idx_a = np.nonzero(mask_a)[0]
+    idx_b = np.nonzero(~mask_a)[0]
+
+    log.info("Voxel selection: encoding ridge on %d train stories (alpha=%.2g)", len(uniq), alpha)
+    W_ab = _fit_ridge_closed(Y_train_z[idx_a], X_train[idx_a], alpha)
+    pred_b = (Y_train_z[idx_b] @ W_ab).astype(np.float32)
+    W_ba = _fit_ridge_closed(Y_train_z[idx_b], X_train[idx_b], alpha)
+    pred_a = (Y_train_z[idx_a] @ W_ba).astype(np.float32)
+
+    pred_full = np.empty_like(X_train, dtype=np.float32)
+    pred_full[idx_a] = pred_a
+    pred_full[idx_b] = pred_b
+
+    A = X_train - X_train.mean(axis=0, keepdims=True)
+    B = pred_full - pred_full.mean(axis=0, keepdims=True)
+    num = (A * B).sum(axis=0)
+    den = np.sqrt((A * A).sum(axis=0) * (B * B).sum(axis=0))
+    r = np.divide(num, den, out=np.zeros_like(num, dtype=np.float32), where=den != 0)
+    r = np.nan_to_num(r)
+
+    n_keep = min(int(n_select), r.shape[0])
+    top_idx = np.argsort(-r)[:n_keep]
+    log.info(
+        "Voxel selection: kept %d/%d voxels; top r=%.3f, median r=%.3f",
+        n_keep, r.shape[0], float(r[top_idx[0]]) if n_keep else float("nan"),
+        float(np.median(r[top_idx])) if n_keep else float("nan"),
+    )
+    return np.sort(top_idx), r
 
 
 def parse_args():
@@ -321,6 +426,33 @@ def parse_args():
         "--torch-device",
         default="auto",
         help="Device for PyTorch models: 'auto' (cuda > mps > cpu), 'cuda', 'mps', or 'cpu'.",
+    )
+    p.add_argument(
+        "--target-pca",
+        type=int,
+        default=0,
+        help="If >0, fit PCA on Y_train and train models to predict K components. "
+             "Predictions are inverted before evaluation. Default: 0 (no PCA).",
+    )
+    p.add_argument(
+        "--loss",
+        default="infonce",
+        choices=["mse", "cosine", "infonce"],
+        help="Loss for PyTorch models. 'infonce' is in-batch contrastive (recommended for "
+             "retrieval metrics). 'cosine' is 1-cos_sim. 'mse' is standard regression.",
+    )
+    p.add_argument(
+        "--temperature",
+        type=float,
+        default=0.07,
+        help="Temperature for InfoNCE loss.",
+    )
+    p.add_argument(
+        "--select-voxels",
+        type=int,
+        default=0,
+        help="If >0, pre-select top N voxels by encoding-model CV r on training stories, "
+             "before decoding. Default: 0 (use all ROI voxels).",
     )
     p.add_argument("--output-dir", default="summary_decoding_results")
     p.add_argument("--seed", type=int, default=0)
@@ -439,6 +571,36 @@ def main():
     X_train, X_test = zscore_X_train_test(X_train_raw, X_test_raw)
     del X_train_raw, X_test_raw
 
+    # Optional voxel selection using a cheap encoding model
+    if args.select_voxels and args.select_voxels > 0:
+        sel_idx, _ = select_voxels_by_encoding(
+            X_train, Y_train_z, g_train, n_select=args.select_voxels, seed=args.seed,
+        )
+        X_train = X_train[:, sel_idx]
+        X_test = X_test[:, sel_idx]
+        log.info("After voxel selection: X_train shape %s", X_train.shape)
+
+    # Optional target-side PCA (model learns to predict PCs; we invert for eval)
+    if args.target_pca and args.target_pca > 0:
+        from sklearn.decomposition import PCA
+
+        K = int(min(args.target_pca, Y_train_z.shape[0], Y_train_z.shape[1]))
+        log.info("Target PCA: %d components (of %d)", K, Y_train_z.shape[1])
+        y_pca = PCA(n_components=K, random_state=args.seed)
+        Y_train_model = y_pca.fit_transform(Y_train_z).astype(np.float32)
+        Y_test_model = y_pca.transform(Y_test_z).astype(np.float32)
+        explained = float(np.sum(y_pca.explained_variance_ratio_))
+        log.info("  explained variance: %.3f", explained)
+
+        def _invert_target(pred_model_space: np.ndarray) -> np.ndarray:
+            return y_pca.inverse_transform(pred_model_space).astype(np.float32)
+    else:
+        Y_train_model = Y_train_z
+        Y_test_model = Y_test_z
+
+        def _invert_target(pred_model_space: np.ndarray) -> np.ndarray:
+            return pred_model_space
+
     # CV folds over training stories (only needed when CV is enabled)
     if args.skip_cv:
         folds = []
@@ -450,9 +612,11 @@ def main():
     results = []
 
     def eval_on_test(model_name, params, pred_test):
-        # un-zscore target space for eval
-        pred_test_unz = (pred_test * y_sd + y_mu).astype(np.float32)
-        dimr = dim_r(Y_test_z, pred_test)  # dim_r in z-scored space is fine (scale-invariant)
+        # Invert PCA (if enabled) back to full-dim z-scored embedding space, then
+        # un-zscore for retrieval metrics against the original Y_test.
+        pred_test_z = _invert_target(pred_test)
+        pred_test_unz = (pred_test_z * y_sd + y_mu).astype(np.float32)
+        dimr = dim_r(Y_test_z, pred_test_z)  # dim_r in full-dim z-scored space
         top1, mrr, mean_rank = retrieval_metrics(Y_test, pred_test_unz)
         return {
             "model": model_name,
@@ -474,7 +638,7 @@ def main():
             best = None
             for ai, alpha in enumerate(ridge_alphas):
                 log.info("  Ridge alpha %d/%d = %.3g", ai + 1, len(ridge_alphas), float(alpha))
-                _, pred_test = ridge_fit_predict(X_train, Y_train_z, X_test, alpha)
+                _, pred_test = ridge_fit_predict(X_train, Y_train_model, X_test, alpha)
                 results.append(eval_on_test("ridge", {"alpha": float(alpha)}, pred_test))
                 if best is None or results[-1]["dim_r_test"] > best["dim_r_test"]:
                     best = {"alpha": float(alpha), "dim_r_test": results[-1]["dim_r_test"]}
@@ -486,21 +650,21 @@ def main():
                 cv_scores = []
                 for fi, (tr_idx, va_idx) in enumerate(folds):
                     log.info("  fold %d/%d (train=%d, val=%d)", fi + 1, len(folds), len(tr_idx), len(va_idx))
-                    _, pred_va = ridge_fit_predict(X_train[tr_idx], Y_train_z[tr_idx], X_train[va_idx], alpha)
-                    cv_scores.append(dim_r(Y_train_z[va_idx], pred_va))
+                    _, pred_va = ridge_fit_predict(X_train[tr_idx], Y_train_model[tr_idx], X_train[va_idx], alpha)
+                    cv_scores.append(dim_r(Y_train_model[va_idx], pred_va))
                 mean_cv = float(np.mean(cv_scores))
                 log.info("  alpha=%.3g mean_cv_dim_r=%.4f", float(alpha), mean_cv)
                 if best is None or mean_cv > best["cv"]:
                     best = {"alpha": float(alpha), "cv": mean_cv}
             log.info("Best ridge alpha by train-story CV: %.3g (cv dim_r=%.4f)", best["alpha"], best["cv"])
-            ridge_model, pred_test = ridge_fit_predict(X_train, Y_train_z, X_test, best["alpha"])
+            ridge_model, pred_test = ridge_fit_predict(X_train, Y_train_model, X_test, best["alpha"])
             results.append(eval_on_test("ridge", {"alpha": best["alpha"], "cv_dim_r": best["cv"]}, pred_test))
 
         # ---- Ridge + rank-k truncation ----
         ranks = [8, 16, 32, 64, 128]
         if args.skip_cv:
             log.info("Ridge+rankk: --skip-cv, using best ridge alpha=%.3g and testing each rank.", best["alpha"])
-            ridge_model_full, _ = ridge_fit_predict(X_train, Y_train_z, X_test, best["alpha"])
+            ridge_model_full, _ = ridge_fit_predict(X_train, Y_train_model, X_test, best["alpha"])
             for k in ranks:
                 pred_test_rr = ridge_rankk_predict_from_model(ridge_model_full, X_test, k)
                 results.append(
@@ -515,14 +679,14 @@ def main():
             for k in ranks:
                 cv_scores = []
                 for tr_idx, va_idx in folds:
-                    mdl, _ = ridge_fit_predict(X_train[tr_idx], Y_train_z[tr_idx], X_train[va_idx], best["alpha"])
+                    mdl, _ = ridge_fit_predict(X_train[tr_idx], Y_train_model[tr_idx], X_train[va_idx], best["alpha"])
                     pred_va = ridge_rankk_predict_from_model(mdl, X_train[va_idx], k)
-                    cv_scores.append(dim_r(Y_train_z[va_idx], pred_va))
+                    cv_scores.append(dim_r(Y_train_model[va_idx], pred_va))
                 mean_cv = float(np.mean(cv_scores))
                 if best_rr is None or mean_cv > best_rr["cv"]:
                     best_rr = {"rank": int(k), "cv": mean_cv}
             log.info("Best ridge+rankk by train-story CV: k=%d (cv dim_r=%.4f)", best_rr["rank"], best_rr["cv"])
-            ridge_model_full, _ = ridge_fit_predict(X_train, Y_train_z, X_test, best["alpha"])
+            ridge_model_full, _ = ridge_fit_predict(X_train, Y_train_model, X_test, best["alpha"])
             pred_test_rr = ridge_rankk_predict_from_model(ridge_model_full, X_test, best_rr["rank"])
             results.append(
                 eval_on_test(
@@ -537,20 +701,20 @@ def main():
         if args.skip_cv:
             log.info("PLS: --skip-cv, testing each n_components on held-out test.")
             for nc in pls_comps:
-                _, pred_test_pls = pls_fit_predict(X_train, Y_train_z, X_test, nc)
+                _, pred_test_pls = pls_fit_predict(X_train, Y_train_model, X_test, nc)
                 results.append(eval_on_test("pls", {"n_components": int(nc)}, pred_test_pls))
         else:
             best_pls = None
             for nc in pls_comps:
                 cv_scores = []
                 for tr_idx, va_idx in folds:
-                    _, pred_va = pls_fit_predict(X_train[tr_idx], Y_train_z[tr_idx], X_train[va_idx], nc)
-                    cv_scores.append(dim_r(Y_train_z[va_idx], pred_va))
+                    _, pred_va = pls_fit_predict(X_train[tr_idx], Y_train_model[tr_idx], X_train[va_idx], nc)
+                    cv_scores.append(dim_r(Y_train_model[va_idx], pred_va))
                 mean_cv = float(np.mean(cv_scores))
                 if best_pls is None or mean_cv > best_pls["cv"]:
                     best_pls = {"n_components": int(nc), "cv": mean_cv}
             log.info("Best PLS by train-story CV: n=%d (cv dim_r=%.4f)", best_pls["n_components"], best_pls["cv"])
-            _, pred_test_pls = pls_fit_predict(X_train, Y_train_z, X_test, best_pls["n_components"])
+            _, pred_test_pls = pls_fit_predict(X_train, Y_train_model, X_test, best_pls["n_components"])
             results.append(eval_on_test("pls", {"n_components": best_pls["n_components"], "cv_dim_r": best_pls["cv"]}, pred_test_pls))
 
         # ---- MultiTaskElasticNet sweep (small grid) ----
@@ -562,7 +726,7 @@ def main():
                 for l1 in en_l1:
                     try:
                         _, pred_test_en = multitask_elasticnet_fit_predict(
-                            X_train, Y_train_z, X_test, a, l1,
+                            X_train, Y_train_model, X_test, a, l1,
                         )
                     except Exception as e:
                         log.warning("  ElasticNet (a=%.1e, l1=%.2f) failed: %s", a, l1, e)
@@ -581,11 +745,11 @@ def main():
                     cv_scores = []
                     for tr_idx, va_idx in folds:
                         try:
-                            _, pred_va = multitask_elasticnet_fit_predict(X_train[tr_idx], Y_train_z[tr_idx], X_train[va_idx], a, l1)
+                            _, pred_va = multitask_elasticnet_fit_predict(X_train[tr_idx], Y_train_model[tr_idx], X_train[va_idx], a, l1)
                         except Exception:
                             cv_scores = None
                             break
-                        cv_scores.append(dim_r(Y_train_z[va_idx], pred_va))
+                        cv_scores.append(dim_r(Y_train_model[va_idx], pred_va))
                     if not cv_scores:
                         continue
                     mean_cv = float(np.mean(cv_scores))
@@ -593,7 +757,7 @@ def main():
                         best_en = {"alpha": float(a), "l1_ratio": float(l1), "cv": mean_cv}
             if best_en is not None:
                 log.info("Best ElasticNet by train-story CV: a=%.1e l1=%.2f (cv dim_r=%.4f)", best_en["alpha"], best_en["l1_ratio"], best_en["cv"])
-                _, pred_test_en = multitask_elasticnet_fit_predict(X_train, Y_train_z, X_test, best_en["alpha"], best_en["l1_ratio"])
+                _, pred_test_en = multitask_elasticnet_fit_predict(X_train, Y_train_model, X_test, best_en["alpha"], best_en["l1_ratio"])
                 results.append(
                     eval_on_test(
                         "elasticnet",
@@ -614,25 +778,26 @@ def main():
             device = _resolve_torch_device(args.torch_device)
             log.info("Torch device: %s", device)
 
-            # Configs chosen with limited training data in mind: small bottlenecks,
-            # strong weight decay, early stopping. Each config runs CV across folds
-            # for hyperparameter selection (on train-story dim_r), then a final fit
-            # on all train stories for test eval.
+            # Small set of configs. With limited data, prefer low-rank mappings and
+            # small MLPs with strong regularization. Early stopping uses a
+            # story-grouped val split within the training data.
             torch_configs = []
-            # Linear baseline (weight-decay sweep)
-            for wd in [1e-4, 1e-3, 1e-2, 1e-1]:
+            for wd in [1e-3, 1e-2, 1e-1]:
                 torch_configs.append({"arch": "linear", "weight_decay": wd})
-            # Low-rank linear
-            for k in [8, 16, 32, 64]:
+            for k in [16, 32, 64]:
                 for wd in [1e-3, 1e-2]:
                     torch_configs.append({"arch": "lowrank", "rank": k, "weight_decay": wd})
-            # MLP (small, regularized)
-            for hidden in [32, 64, 128]:
-                for dropout in [0.1, 0.3]:
-                    for wd in [1e-3, 1e-2]:
-                        torch_configs.append(
-                            {"arch": "mlp", "hidden": hidden, "dropout": dropout, "weight_decay": wd}
-                        )
+            for hidden in [64, 128]:
+                for wd in [1e-3, 1e-2]:
+                    torch_configs.append(
+                        {"arch": "mlp", "hidden": hidden, "dropout": 0.3, "weight_decay": wd}
+                    )
+
+            shared_torch_kwargs = {
+                "loss": args.loss,
+                "temperature": args.temperature,
+            }
+            log.info("Torch loss=%s temperature=%.3f", args.loss, args.temperature)
 
             if args.skip_cv:
                 log.info("Torch: --skip-cv, fitting each config on full train and testing on test.")
@@ -640,8 +805,10 @@ def main():
                     log.info("Torch %d/%d: %s", ci + 1, len(torch_configs), cfg)
                     try:
                         _, pred_te = torch_fit_predict(
-                            X_train, Y_train_z, X_test,
-                            device=device, seed=args.seed, **cfg,
+                            X_train, Y_train_model, X_test,
+                            device=device, seed=args.seed,
+                            groups=g_train,
+                            **shared_torch_kwargs, **cfg,
                         )
                     except Exception as e:  # pragma: no cover
                         log.warning("  torch config failed (%s): %s", cfg, e)
@@ -654,10 +821,12 @@ def main():
                     cv_scores = []
                     for fi, (tr_idx, va_idx) in enumerate(folds):
                         _, pred_va = torch_fit_predict(
-                            X_train[tr_idx], Y_train_z[tr_idx], X_train[va_idx],
-                            device=device, seed=args.seed, **cfg,
+                            X_train[tr_idx], Y_train_model[tr_idx], X_train[va_idx],
+                            device=device, seed=args.seed,
+                            groups=g_train[tr_idx],
+                            **shared_torch_kwargs, **cfg,
                         )
-                        cv_scores.append(dim_r(Y_train_z[va_idx], pred_va))
+                        cv_scores.append(dim_r(Y_train_model[va_idx], pred_va))
                     return float(np.mean(cv_scores))
 
                 best_by_arch: dict = {}
@@ -678,8 +847,10 @@ def main():
                     log.info("Best torch-%s cv dim_r=%.4f (%s)", arch, best_cfg["cv"], cfg)
                     try:
                         _, pred_te = torch_fit_predict(
-                            X_train, Y_train_z, X_test,
-                            device=device, seed=args.seed, **cfg,
+                            X_train, Y_train_model, X_test,
+                            device=device, seed=args.seed,
+                            groups=g_train,
+                            **shared_torch_kwargs, **cfg,
                         )
                     except Exception as e:  # pragma: no cover
                         log.warning("  torch final fit failed: %s", e)
@@ -692,7 +863,19 @@ def main():
     results_sorted = sorted(results, key=lambda r: r["dim_r_test"], reverse=True)
     out_dir = Path(args.output_dir) / args.subject
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"h20_sweep__{roi_name}__{args.feature_model}__{summary_model}__holdout-5.csv"
+    tag_parts = [
+        f"h20_sweep__{roi_name}",
+        args.feature_model,
+        summary_model,
+        f"loss-{args.loss}",
+    ]
+    if args.target_pca and args.target_pca > 0:
+        tag_parts.append(f"pca-{args.target_pca}")
+    if args.select_voxels and args.select_voxels > 0:
+        tag_parts.append(f"vox-{args.select_voxels}")
+    if args.skip_cv:
+        tag_parts.append("no-cv")
+    out_path = out_dir / ("__".join(tag_parts) + ".csv")
     # Union all keys so rows with extra arch-specific params (rank, hidden, ...) are preserved.
     all_keys: list = []
     seen = set()
