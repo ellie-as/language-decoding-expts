@@ -24,6 +24,7 @@ import argparse
 import csv
 import json
 import logging
+import re
 import sys
 from pathlib import Path
 
@@ -37,7 +38,9 @@ import config  # noqa: E402
 import run_summaries_encoding as rse  # noqa: E402
 from run_h20_decoder_sweep import (  # noqa: E402
     dim_r,
+    pls_fit_predict,
     ridge_fit_predict,
+    ridge_rankk_predict_from_model,
     story_retrieval_metrics,
     torch_fit_predict,
 )
@@ -59,10 +62,17 @@ logging.basicConfig(
 )
 log = logging.getLogger("direct_text_decoding")
 
+WORD_RE = re.compile(r"^[^A-Za-z0-9']+|[^A-Za-z0-9']+$")
+
 
 def _safe_text(words) -> str:
     text = " ".join(str(w).strip() for w in words if str(w).strip())
     return text if text else ""
+
+
+def normalize_word(word: str) -> str:
+    """Normalize TextGrid tokens for lookup in word-vector vocabularies."""
+    return WORD_RE.sub("", str(word).lower()).strip()
 
 
 def build_recent_texts_for_story(wordseq, response_len: int, window_trs: int, target_lag: int):
@@ -114,6 +124,93 @@ def embed_texts(model, texts, emb_dim: int, batch_size: int):
     return out
 
 
+def collect_story_vocab(wordseqs, stories):
+    vocab = set()
+    for story in stories:
+        for word in wordseqs[story].data:
+            w = normalize_word(word)
+            if w:
+                vocab.add(w)
+    return vocab
+
+
+def load_word_vectors_for_vocab(path, needed_vocab):
+    """Load only needed word vectors from a text .vec/.txt embedding file.
+
+    Supports standard word2vec/GloVe text format. If the first line looks like
+    a word2vec header ("N D"), it is skipped.
+    """
+    path = Path(path).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"Word-vector file not found: {path}")
+    needed_vocab = set(needed_vocab)
+    vectors = {}
+    dim = None
+    log.info("Loading word vectors from %s for %d needed words", path, len(needed_vocab))
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        for line_no, line in enumerate(f, start=1):
+            parts = line.rstrip().split()
+            if not parts:
+                continue
+            if line_no == 1 and len(parts) == 2:
+                try:
+                    int(parts[0])
+                    int(parts[1])
+                    continue
+                except ValueError:
+                    pass
+            word = normalize_word(parts[0])
+            if word not in needed_vocab:
+                continue
+            try:
+                vec = np.asarray([float(x) for x in parts[1:]], dtype=np.float32)
+            except ValueError:
+                continue
+            if dim is None:
+                dim = int(vec.shape[0])
+            if vec.shape[0] != dim:
+                continue
+            vectors[word] = vec
+            if len(vectors) == len(needed_vocab):
+                break
+    if not vectors:
+        raise ValueError(f"No matching word vectors found in {path}")
+    log.info(
+        "Loaded %d/%d needed word vectors (dim=%d)",
+        len(vectors), len(needed_vocab), dim,
+    )
+    return vectors, int(dim)
+
+
+def load_gensim_vectors_for_vocab(model_name, needed_vocab):
+    """Load vectors via gensim.downloader, keeping only story words."""
+    try:
+        import gensim.downloader as api
+    except Exception as e:
+        raise RuntimeError(
+            "gensim is not installed. Install gensim or pass --word-vector-path "
+            "to a local GloVe/word2vec text file."
+        ) from e
+    log.info("Loading gensim word-vector model: %s", model_name)
+    kv = api.load(model_name)
+    vectors = {}
+    for word in needed_vocab:
+        if word in kv:
+            vectors[word] = np.asarray(kv[word], dtype=np.float32)
+    if not vectors:
+        raise ValueError(f"No story words found in gensim model {model_name}")
+    dim = int(next(iter(vectors.values())).shape[0])
+    log.info("Loaded %d/%d needed word vectors (dim=%d)", len(vectors), len(needed_vocab), dim)
+    return vectors, dim
+
+
+def load_word_vectors(args, wordseqs, stories):
+    needed = collect_story_vocab(wordseqs, stories)
+    if args.word_vector_path:
+        return load_word_vectors_for_vocab(args.word_vector_path, needed)
+    return load_gensim_vectors_for_vocab(args.word_vector_model, needed)
+
+
 def build_text_targets(
     stories,
     wordseqs,
@@ -139,6 +236,76 @@ def build_text_targets(
         Ys.append(y)
         all_texts.extend(texts)
         groups.extend([story] * len(texts))
+    return np.vstack(Ys).astype(np.float32), all_texts, np.asarray(groups)
+
+
+def build_word2vec_mean_targets_for_story(
+    wordseq,
+    response_len: int,
+    window_trs: int,
+    target_lag: int,
+    word_vectors,
+    emb_dim: int,
+):
+    """Mean word-vector target over words in the recent text window."""
+    words = np.asarray(wordseq.data)
+    word_times = np.asarray(wordseq.data_times, dtype=np.float64)
+    tr_times = np.asarray(wordseq.tr_times, dtype=np.float64)
+    if len(tr_times) < TRIM_START + response_len:
+        raise ValueError(
+            f"wordseq has only {len(tr_times)} TRs but response_len={response_len} "
+            f"requires at least {TRIM_START + response_len}"
+        )
+    tr = float(np.median(np.diff(tr_times))) if len(tr_times) > 1 else 2.0
+    half_tr = tr / 2.0
+
+    # Pre-normalize lookup to avoid doing string work inside every window.
+    per_word = []
+    for w in words:
+        vec = word_vectors.get(normalize_word(w))
+        per_word.append(vec)
+
+    targets = np.zeros((response_len, emb_dim), dtype=np.float32)
+    texts = []
+    for i in range(response_len):
+        stim_idx = TRIM_START + i - int(target_lag)
+        if stim_idx < 0:
+            texts.append("")
+            continue
+        end_t = tr_times[stim_idx] + half_tr
+        start_t = end_t - float(window_trs) * tr
+        idx = np.nonzero((word_times >= start_t) & (word_times < end_t))[0]
+        vecs = [per_word[j] for j in idx if per_word[j] is not None]
+        if vecs:
+            targets[i] = np.mean(vecs, axis=0).astype(np.float32)
+        texts.append(_safe_text(words[idx]))
+    return targets, texts
+
+
+def build_word2vec_mean_targets(
+    stories,
+    wordseqs,
+    resp_lengths,
+    word_vectors,
+    emb_dim: int,
+    window_trs: int,
+    target_lag: int,
+):
+    Ys = []
+    all_texts = []
+    groups = []
+    for story in stories:
+        y, texts = build_word2vec_mean_targets_for_story(
+            wordseqs[story],
+            response_len=resp_lengths[story],
+            window_trs=window_trs,
+            target_lag=target_lag,
+            word_vectors=word_vectors,
+            emb_dim=emb_dim,
+        )
+        Ys.append(y)
+        all_texts.extend(texts)
+        groups.extend([story] * y.shape[0])
     return np.vstack(Ys).astype(np.float32), all_texts, np.asarray(groups)
 
 
@@ -264,6 +431,79 @@ def evaluate_predictions(true_test, pred_test, groups_test, paragraph_window, pa
     }
 
 
+def circular_shift_within_stories(true_emb, groups, rng, min_shift: int = 25):
+    """Break temporal alignment while preserving each story's target autocorrelation.
+
+    This is a stricter null than random row shuffling: each held-out story keeps
+    its internal target trajectory, but the trajectory is circularly shifted
+    relative to the brain predictions. Story identity is preserved, temporal
+    alignment is not.
+    """
+    shifted = np.empty_like(true_emb)
+    groups = np.asarray(groups)
+    for story in np.unique(groups):
+        idx = np.nonzero(groups == story)[0]
+        n = len(idx)
+        if n <= 1:
+            shifted[idx] = true_emb[idx]
+            continue
+        valid = np.arange(1, n)
+        far = valid[(valid >= min_shift) & (valid <= n - min_shift)]
+        if len(far) == 0:
+            far = valid
+        shift = int(rng.choice(far))
+        shifted[idx] = np.roll(true_emb[idx], shift=shift, axis=0)
+    return shifted
+
+
+def add_null_metrics(row, true_test, pred_test, groups_test, args, window_trs, target_lag, model_name):
+    """Attach circular-shift null statistics to one result row."""
+    if args.null_iters <= 0:
+        return
+    seed = (
+        int(args.seed)
+        + 1009 * int(window_trs)
+        + 9173 * int(target_lag)
+        + sum(ord(c) for c in str(model_name))
+    )
+    rng = np.random.default_rng(seed)
+    null_dim = []
+    null_tr_top1 = []
+    null_story = []
+    null_para_story = []
+    null_para_top1 = []
+    for _ in range(args.null_iters):
+        shifted_true = circular_shift_within_stories(
+            true_test, groups_test, rng, min_shift=args.null_min_shift,
+        )
+        if args.null_eval == "dim":
+            null_dim.append(dim_r(shifted_true, pred_test))
+        else:
+            met = evaluate_predictions(
+                shifted_true, pred_test, groups_test,
+                paragraph_window=args.paragraph_window_trs,
+                paragraph_stride=args.paragraph_stride_trs,
+            )
+            null_dim.append(met["dim_r_test"])
+            null_tr_top1.append(met["tr_top1"])
+            null_story.append(met["story_top1"])
+            null_para_story.append(met["paragraph_story_top1"])
+            null_para_top1.append(met["paragraph_top1"])
+
+    def summarize(prefix, observed, values):
+        values = np.asarray(values, dtype=np.float64)
+        row[f"{prefix}_null_mean"] = float(values.mean())
+        row[f"{prefix}_null_p95"] = float(np.percentile(values, 95))
+        row[f"{prefix}_null_p"] = float((1 + np.sum(values >= observed)) / (len(values) + 1))
+
+    summarize("dim_r", row["dim_r_test"], null_dim)
+    if args.null_eval == "all":
+        summarize("tr_top1", row["tr_top1"], null_tr_top1)
+        summarize("story_top1", row["story_top1"], null_story)
+        summarize("paragraph_story_top1", row["paragraph_story_top1"], null_para_story)
+        summarize("paragraph_top1", row["paragraph_top1"], null_para_top1)
+
+
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--subject", required=True)
@@ -284,9 +524,34 @@ def parse_args():
         default="full_frontal",
         help="Voxel set: all, full_frontal, BA_10, BA_45, etc.",
     )
-    p.add_argument("--window-trs", nargs="+", type=int, default=[1, 2, 3, 5, 8, 10])
-    p.add_argument("--target-lags", nargs="+", type=int, default=[1, 2, 3, 4])
+    p.add_argument(
+        "--focused",
+        action="store_true",
+        help="Shortcut for the current best raw-text region: --window-trs 2 3 "
+             "--target-lags 2. Explicit --window-trs/--target-lags override this.",
+    )
+    p.add_argument("--window-trs", nargs="+", type=int, default=None)
+    p.add_argument("--target-lags", nargs="+", type=int, default=None)
+    p.add_argument(
+        "--target-kind",
+        default="sentence",
+        choices=["sentence", "word2vec_mean"],
+        help="'sentence' embeds the whole text window with a sentence-transformer. "
+             "'word2vec_mean' averages one static word vector per word in the window.",
+    )
     p.add_argument("--feature-model", default="embedding", choices=list(EMBEDDING_MODELS.keys()))
+    p.add_argument(
+        "--word-vector-path",
+        default=None,
+        help="Path to a local GloVe/word2vec text file for --target-kind word2vec_mean. "
+             "If omitted, tries gensim.downloader with --word-vector-model.",
+    )
+    p.add_argument(
+        "--word-vector-model",
+        default="glove-wiki-gigaword-300",
+        help="gensim.downloader model name used when --target-kind word2vec_mean and "
+             "--word-vector-path is omitted.",
+    )
     p.add_argument("--embed-batch-size", type=int, default=128)
     p.add_argument("--brain-pca", type=int, default=512)
     p.add_argument("--target-pca", type=int, default=50)
@@ -295,6 +560,34 @@ def parse_args():
     p.add_argument("--torch-device", default="auto", choices=["auto", "cuda", "mps", "cpu"])
     p.add_argument("--skip-torch", action="store_true")
     p.add_argument("--skip-sklearn", action="store_true")
+    p.add_argument(
+        "--sklearn-models",
+        nargs="+",
+        default=["ridge", "ridge_rankk", "pls"],
+        choices=["ridge", "ridge_rankk", "pls"],
+        help="Sklearn baselines to run when --skip-sklearn is not set.",
+    )
+    p.add_argument("--ridge-alphas", nargs="+", type=float, default=[1e2, 1e3, 1e4, 1e5, 1e6])
+    p.add_argument("--ridge-ranks", nargs="+", type=int, default=[8, 16, 32, 64])
+    p.add_argument("--pls-components", nargs="+", type=int, default=[8, 16, 32, 64])
+    p.add_argument(
+        "--null-iters",
+        type=int,
+        default=0,
+        help="If >0, compute circular-shift null metrics for every fitted model.",
+    )
+    p.add_argument(
+        "--null-min-shift",
+        type=int,
+        default=25,
+        help="Minimum within-story circular shift in TRs for the null.",
+    )
+    p.add_argument(
+        "--null-eval",
+        default="dim",
+        choices=["dim", "all"],
+        help="'dim' computes only dim_r nulls (fast). 'all' also recomputes retrieval nulls.",
+    )
     p.add_argument("--paragraph-window-trs", type=int, default=15)
     p.add_argument("--paragraph-stride-trs", type=int, default=5)
     p.add_argument("--output-dir", default="direct_text_decoding/results")
@@ -307,6 +600,16 @@ def parse_args():
 def main():
     args = parse_args()
     np.random.seed(args.seed)
+
+    if args.window_trs is None:
+        args.window_trs = [2, 3] if args.focused else [1, 2, 3, 5, 8, 10]
+    if args.target_lags is None:
+        args.target_lags = [2] if args.focused else [1, 2, 3, 4]
+    if args.focused:
+        log.info(
+            "Focused sweep: window_trs=%s target_lags=%s",
+            args.window_trs, args.target_lags,
+        )
 
     mounted_root = None
     if args.local_compute_mode:
@@ -353,8 +656,18 @@ def main():
     log.info("Loading word sequences for raw story text...")
     wordseqs = get_story_wordseqs(stories)
 
-    emb_model_name, emb_dim = EMBEDDING_MODELS[args.feature_model]
-    encoder, emb_dim = load_encoder(emb_model_name, device="cpu")
+    encoder = None
+    word_vectors = None
+    if args.target_kind == "sentence":
+        emb_model_name, emb_dim = EMBEDDING_MODELS[args.feature_model]
+        encoder, emb_dim = load_encoder(emb_model_name, device="cpu")
+        target_label = args.feature_model
+    else:
+        word_vectors, emb_dim = load_word_vectors(args, wordseqs, stories)
+        target_label = (
+            Path(args.word_vector_path).stem if args.word_vector_path
+            else args.word_vector_model
+        )
 
     log.info("Loading brain responses...")
     X_train_raw, g_train = build_brain_and_groups(
@@ -380,16 +693,26 @@ def main():
             log.info("Target: previous %d TRs of raw text, lag=%d", window_trs, target_lag)
             log.info("=" * 72)
 
-            Y_train, _, _ = build_text_targets(
-                train_stories, wordseqs, train_resp_lengths, encoder, emb_dim,
-                window_trs=window_trs, target_lag=target_lag,
-                batch_size=args.embed_batch_size,
-            )
-            Y_test, test_texts, y_groups_test = build_text_targets(
-                test_stories, wordseqs, test_resp_lengths, encoder, emb_dim,
-                window_trs=window_trs, target_lag=target_lag,
-                batch_size=args.embed_batch_size,
-            )
+            if args.target_kind == "sentence":
+                Y_train, _, _ = build_text_targets(
+                    train_stories, wordseqs, train_resp_lengths, encoder, emb_dim,
+                    window_trs=window_trs, target_lag=target_lag,
+                    batch_size=args.embed_batch_size,
+                )
+                Y_test, test_texts, y_groups_test = build_text_targets(
+                    test_stories, wordseqs, test_resp_lengths, encoder, emb_dim,
+                    window_trs=window_trs, target_lag=target_lag,
+                    batch_size=args.embed_batch_size,
+                )
+            else:
+                Y_train, _, _ = build_word2vec_mean_targets(
+                    train_stories, wordseqs, train_resp_lengths, word_vectors, emb_dim,
+                    window_trs=window_trs, target_lag=target_lag,
+                )
+                Y_test, test_texts, y_groups_test = build_word2vec_mean_targets(
+                    test_stories, wordseqs, test_resp_lengths, word_vectors, emb_dim,
+                    window_trs=window_trs, target_lag=target_lag,
+                )
             if not np.array_equal(y_groups_test, g_test):
                 raise ValueError("Target and brain group labels are misaligned.")
 
@@ -410,6 +733,8 @@ def main():
                     "model": model_name,
                     "window_trs": int(window_trs),
                     "target_lag": int(target_lag),
+                    "target_kind": args.target_kind,
+                    "target_label": target_label,
                     "roi": roi_name,
                     "n_voxels": int(len(vox)),
                     "brain_pca": int(args.brain_pca),
@@ -421,19 +746,57 @@ def main():
                         paragraph_stride=args.paragraph_stride_trs,
                     ),
                 }
+                add_null_metrics(
+                    row, Y_test, pred, g_test, args,
+                    window_trs=window_trs,
+                    target_lag=target_lag,
+                    model_name=model_name,
+                )
                 results.append(row)
+                null_txt = ""
+                if args.null_iters > 0:
+                    null_txt = (
+                        f" dim_null_mean={row['dim_r_null_mean']:.4f}"
+                        f" p={row['dim_r_null_p']:.3f}"
+                    )
                 log.info(
                     "  %-12s dim_r=%.4f TR_top1=%.3f story_top1=%.3f "
-                    "para_top1=%.3f para_story=%.3f params=%s",
+                    "para_top1=%.3f para_story=%.3f%s params=%s",
                     model_name, row["dim_r_test"], row["tr_top1"], row["story_top1"],
-                    row["paragraph_top1"], row["paragraph_story_top1"], params,
+                    row["paragraph_top1"], row["paragraph_story_top1"], null_txt, params,
                 )
 
             if not args.skip_sklearn:
-                for alpha in [1e2, 1e3, 1e4, 1e5, 1e6]:
-                    log.info("Fitting ridge alpha=%g", alpha)
-                    _, pred_model = ridge_fit_predict(X_train_model, Y_train_model, X_test_model, alpha)
-                    add_result("ridge", {"alpha": float(alpha)}, pred_model)
+                if "ridge" in args.sklearn_models or "ridge_rankk" in args.sklearn_models:
+                    fitted_ridges = {}
+                    for alpha in args.ridge_alphas:
+                        log.info("Fitting ridge alpha=%g", alpha)
+                        ridge_model, pred_model = ridge_fit_predict(
+                            X_train_model, Y_train_model, X_test_model, alpha,
+                        )
+                        fitted_ridges[float(alpha)] = ridge_model
+                        if "ridge" in args.sklearn_models:
+                            add_result("ridge", {"alpha": float(alpha)}, pred_model)
+                        if "ridge_rankk" in args.sklearn_models:
+                            for rank in args.ridge_ranks:
+                                if rank > min(X_train_model.shape[1], Y_train_model.shape[1]):
+                                    continue
+                                log.info("  Applying ridge rank-k alpha=%g rank=%d", alpha, rank)
+                                pred_rank = ridge_rankk_predict_from_model(ridge_model, X_test_model, rank)
+                                add_result(
+                                    "ridge_rankk",
+                                    {"alpha": float(alpha), "rank": int(rank)},
+                                    pred_rank,
+                                )
+                if "pls" in args.sklearn_models:
+                    for n_comp in args.pls_components:
+                        if n_comp > min(X_train_model.shape[0] - 1, X_train_model.shape[1], Y_train_model.shape[1]):
+                            continue
+                        log.info("Fitting PLS n_components=%d", n_comp)
+                        _, pred_model = pls_fit_predict(
+                            X_train_model, Y_train_model, X_test_model, n_comp,
+                        )
+                        add_result("pls", {"n_components": int(n_comp)}, pred_model)
 
             if not args.skip_torch:
                 torch_configs = [
@@ -477,10 +840,14 @@ def main():
     out_dir = Path(args.output_dir) / args.subject
     out_dir.mkdir(parents=True, exist_ok=True)
     tag = (
-        f"text_window__{roi_name}__{args.feature_model}"
+        f"text_window__{roi_name}__{args.target_kind}__{target_label}"
         f"__brainpca-{args.brain_pca}__targetpca-{args.target_pca}"
         f"__loss-{args.loss}"
     )
+    if args.focused:
+        tag += "__focused"
+    if args.null_iters > 0:
+        tag += f"__null-{args.null_iters}-{args.null_eval}"
     out_csv = out_dir / f"{tag}.csv"
     all_keys = []
     seen = set()
@@ -496,12 +863,15 @@ def main():
     log.info("Saved results to %s", out_csv)
     log.info("Top models (paragraph/story metrics are the key readout):")
     for row in results_sorted[:10]:
+        null_txt = ""
+        if "dim_r_null_mean" in row:
+            null_txt = f" dim_null={row['dim_r_null_mean']:.4f} p={row['dim_r_null_p']:.3f}"
         log.info(
             "  %-12s win=%d lag=%d dim_r=%.4f TR_top1=%.3f "
-            "story=%.3f para_top1=%.3f para_story=%.3f params=%s",
+            "story=%.3f para_top1=%.3f para_story=%.3f%s params=%s",
             row["model"], row["window_trs"], row["target_lag"], row["dim_r_test"],
             row["tr_top1"], row["story_top1"], row["paragraph_top1"],
-            row["paragraph_story_top1"],
+            row["paragraph_story_top1"], null_txt,
             {k: row[k] for k in ("alpha", "rank", "hidden", "dropout", "weight_decay") if k in row},
         )
 

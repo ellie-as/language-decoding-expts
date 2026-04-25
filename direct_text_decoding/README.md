@@ -33,6 +33,55 @@ python -m direct_text_decoding.run_text_window_decoding \
 
 This writes a CSV under `direct_text_decoding/results/S1/`.
 
+## Focused follow-up with null controls
+
+After the broad sweep, the strongest time-locked signal was around 2-3 TR text
+windows with a 2-TR BOLD lag. Use `--focused` to restrict to that region, run
+sklearn ridge / rank-truncated ridge / PLS baselines, and compute circular-shift
+nulls:
+
+```bash
+python -m direct_text_decoding.run_text_window_decoding \
+  --subject S1 \
+  --roi full_frontal \
+  --focused \
+  --brain-pca 500 \
+  --target-pca 100 \
+  --loss infonce \
+  --torch-device cuda \
+  --null-iters 100
+```
+
+The null circularly shifts each held-out story's target trajectory relative to
+the predictions, preserving story identity and target autocorrelation while
+breaking TR-level alignment. The key fields are `dim_r_null_mean`,
+`dim_r_null_p95`, and `dim_r_null_p`.
+
+For retrieval nulls too, add `--null-eval all` (slower).
+
+## Word2vec/GloVe mean targets
+
+To decode the mean static word vector over the recent text window instead of a
+sentence-transformer embedding, use:
+
+```bash
+python -m direct_text_decoding.run_text_window_decoding \
+  --subject S1 \
+  --roi full_frontal \
+  --focused \
+  --target-kind word2vec_mean \
+  --word-vector-path /path/to/glove.6B.300d.txt \
+  --brain-pca 500 \
+  --target-pca 100 \
+  --loss infonce \
+  --torch-device cuda \
+  --null-iters 100
+```
+
+If `--word-vector-path` is omitted, the script tries to load
+`glove-wiki-gigaword-300` via `gensim.downloader`. Passing a local vector file is
+more reliable on the server.
+
 ## Faster smoke test
 
 ```bash
