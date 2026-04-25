@@ -35,6 +35,17 @@ python fmri_text_mae/src/train_retrieval_baseline.py \
   --config fmri_text_mae/configs/baseline_retrieval.yaml
 ```
 
+Sweep full-frontal Brodmann-area voxels with simple sklearn decoders:
+
+```bash
+python fmri_text_mae/src/sweep_full_frontal_retrieval.py \
+  --subject S1 \
+  --roi BA_full_frontal \
+  --models pca_ridge pls \
+  --window-lens-tr 4 8 10 \
+  --hrf-lags-sec 2 4 6
+```
+
 Train the masked multimodal model:
 
 ```bash
