@@ -44,9 +44,9 @@ nulls:
 python -m direct_text_decoding.run_text_window_decoding \
   --subject S1 \
   --roi full_frontal \
-  --focused \
+  --focused-with-10s \
   --brain-pca 500 \
-  --target-pca 100 \
+  --target-pca 32 50 75 100 150 200 0 \
   --loss infonce \
   --torch-device cuda \
   --null-iters 100
@@ -68,11 +68,11 @@ sentence-transformer embedding, use:
 python -m direct_text_decoding.run_text_window_decoding \
   --subject S1 \
   --roi full_frontal \
-  --focused \
+  --focused-with-10s \
   --target-kind word2vec_mean \
   --word-vector-path /path/to/glove.6B.300d.txt \
   --brain-pca 500 \
-  --target-pca 100 \
+  --target-pca 16 32 50 100 0 \
   --loss infonce \
   --torch-device cuda \
   --null-iters 100
@@ -81,6 +81,13 @@ python -m direct_text_decoding.run_text_window_decoding \
 If `--word-vector-path` is omitted, the script tries to load
 `glove-wiki-gigaword-300` via `gensim.downloader`. Passing a local vector file is
 more reliable on the server.
+
+Other static-vector target variants:
+
+- `--target-kind content_word2vec_mean`: averages only non-stopword content
+  words in the window.
+- `--target-kind idf_word2vec_mean`: averages all words with IDF weights
+  computed from the training stories.
 
 ## Faster smoke test
 

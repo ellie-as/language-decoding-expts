@@ -64,6 +64,15 @@ log = logging.getLogger("direct_text_decoding")
 
 WORD_RE = re.compile(r"^[^A-Za-z0-9']+|[^A-Za-z0-9']+$")
 
+STOPWORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "been", "but", "by", "for",
+    "from", "had", "has", "have", "he", "her", "hers", "him", "his", "i",
+    "in", "is", "it", "its", "me", "my", "of", "on", "or", "our", "ours",
+    "she", "so", "that", "the", "their", "them", "then", "there", "these",
+    "they", "this", "to", "was", "we", "were", "what", "when", "where",
+    "which", "who", "will", "with", "you", "your",
+}
+
 
 def _safe_text(words) -> str:
     text = " ".join(str(w).strip() for w in words if str(w).strip())
@@ -73,6 +82,11 @@ def _safe_text(words) -> str:
 def normalize_word(word: str) -> str:
     """Normalize TextGrid tokens for lookup in word-vector vocabularies."""
     return WORD_RE.sub("", str(word).lower()).strip()
+
+
+def is_content_word(word: str) -> bool:
+    word = normalize_word(word)
+    return bool(word) and any(ch.isalpha() for ch in word) and word not in STOPWORDS
 
 
 def build_recent_texts_for_story(wordseq, response_len: int, window_trs: int, target_lag: int):
@@ -211,6 +225,21 @@ def load_word_vectors(args, wordseqs, stories):
     return load_gensim_vectors_for_vocab(args.word_vector_model, needed)
 
 
+def compute_story_idf(wordseqs, train_stories):
+    """Compute simple story-document IDF over normalized training-story words."""
+    df = {}
+    for story in train_stories:
+        words = {
+            normalize_word(w)
+            for w in wordseqs[story].data
+            if normalize_word(w)
+        }
+        for w in words:
+            df[w] = df.get(w, 0) + 1
+    n_docs = max(1, len(train_stories))
+    return {w: float(np.log((1 + n_docs) / (1 + c)) + 1.0) for w, c in df.items()}
+
+
 def build_text_targets(
     stories,
     wordseqs,
@@ -246,8 +275,10 @@ def build_word2vec_mean_targets_for_story(
     target_lag: int,
     word_vectors,
     emb_dim: int,
+    target_kind: str,
+    idf_weights=None,
 ):
-    """Mean word-vector target over words in the recent text window."""
+    """Static word-vector target over words in the recent text window."""
     words = np.asarray(wordseq.data)
     word_times = np.asarray(wordseq.data_times, dtype=np.float64)
     tr_times = np.asarray(wordseq.tr_times, dtype=np.float64)
@@ -261,9 +292,20 @@ def build_word2vec_mean_targets_for_story(
 
     # Pre-normalize lookup to avoid doing string work inside every window.
     per_word = []
+    per_weight = []
     for w in words:
-        vec = word_vectors.get(normalize_word(w))
+        nw = normalize_word(w)
+        vec = word_vectors.get(nw)
+        keep = True
+        weight = 1.0
+        if target_kind == "content_word2vec_mean":
+            keep = is_content_word(nw)
+        elif target_kind == "idf_word2vec_mean":
+            weight = float((idf_weights or {}).get(nw, 1.0))
+        if not keep:
+            vec = None
         per_word.append(vec)
+        per_weight.append(weight)
 
     targets = np.zeros((response_len, emb_dim), dtype=np.float32)
     texts = []
@@ -277,7 +319,9 @@ def build_word2vec_mean_targets_for_story(
         idx = np.nonzero((word_times >= start_t) & (word_times < end_t))[0]
         vecs = [per_word[j] for j in idx if per_word[j] is not None]
         if vecs:
-            targets[i] = np.mean(vecs, axis=0).astype(np.float32)
+            weights = np.asarray([per_weight[j] for j in idx if per_word[j] is not None], dtype=np.float32)
+            weights = weights / max(float(weights.sum()), 1e-12)
+            targets[i] = np.sum(np.vstack(vecs) * weights[:, None], axis=0).astype(np.float32)
         texts.append(_safe_text(words[idx]))
     return targets, texts
 
@@ -290,6 +334,8 @@ def build_word2vec_mean_targets(
     emb_dim: int,
     window_trs: int,
     target_lag: int,
+    target_kind: str,
+    idf_weights=None,
 ):
     Ys = []
     all_texts = []
@@ -302,6 +348,8 @@ def build_word2vec_mean_targets(
             target_lag=target_lag,
             word_vectors=word_vectors,
             emb_dim=emb_dim,
+            target_kind=target_kind,
+            idf_weights=idf_weights,
         )
         Ys.append(y)
         all_texts.extend(texts)
@@ -530,14 +578,21 @@ def parse_args():
         help="Shortcut for the current best raw-text region: --window-trs 2 3 "
              "--target-lags 2. Explicit --window-trs/--target-lags override this.",
     )
+    p.add_argument(
+        "--focused-with-10s",
+        action="store_true",
+        help="Focused sweep plus a ~10s window: --window-trs 2 3 5 --target-lags 2.",
+    )
     p.add_argument("--window-trs", nargs="+", type=int, default=None)
     p.add_argument("--target-lags", nargs="+", type=int, default=None)
     p.add_argument(
         "--target-kind",
         default="sentence",
-        choices=["sentence", "word2vec_mean"],
+        choices=["sentence", "word2vec_mean", "content_word2vec_mean", "idf_word2vec_mean"],
         help="'sentence' embeds the whole text window with a sentence-transformer. "
-             "'word2vec_mean' averages one static word vector per word in the window.",
+             "'word2vec_mean' averages one static word vector per word in the window. "
+             "'content_word2vec_mean' excludes common function words. "
+             "'idf_word2vec_mean' IDF-weights words using training stories.",
     )
     p.add_argument("--feature-model", default="embedding", choices=list(EMBEDDING_MODELS.keys()))
     p.add_argument(
@@ -554,7 +609,13 @@ def parse_args():
     )
     p.add_argument("--embed-batch-size", type=int, default=128)
     p.add_argument("--brain-pca", type=int, default=512)
-    p.add_argument("--target-pca", type=int, default=50)
+    p.add_argument(
+        "--target-pca",
+        nargs="+",
+        type=int,
+        default=[50],
+        help="One or more target PCA dimensions to sweep. Use 0 for no target PCA.",
+    )
     p.add_argument("--loss", default="infonce", choices=["mse", "cosine", "infonce"])
     p.add_argument("--temperature", type=float, default=0.07)
     p.add_argument("--torch-device", default="auto", choices=["auto", "cuda", "mps", "cpu"])
@@ -601,11 +662,17 @@ def main():
     args = parse_args()
     np.random.seed(args.seed)
 
+    focused_any = args.focused or args.focused_with_10s
     if args.window_trs is None:
-        args.window_trs = [2, 3] if args.focused else [1, 2, 3, 5, 8, 10]
+        if args.focused_with_10s:
+            args.window_trs = [2, 3, 5]
+        elif args.focused:
+            args.window_trs = [2, 3]
+        else:
+            args.window_trs = [1, 2, 3, 5, 8, 10]
     if args.target_lags is None:
-        args.target_lags = [2] if args.focused else [1, 2, 3, 4]
-    if args.focused:
+        args.target_lags = [2] if focused_any else [1, 2, 3, 4]
+    if focused_any:
         log.info(
             "Focused sweep: window_trs=%s target_lags=%s",
             args.window_trs, args.target_lags,
@@ -658,12 +725,16 @@ def main():
 
     encoder = None
     word_vectors = None
+    idf_weights = None
     if args.target_kind == "sentence":
         emb_model_name, emb_dim = EMBEDDING_MODELS[args.feature_model]
         encoder, emb_dim = load_encoder(emb_model_name, device="cpu")
         target_label = args.feature_model
     else:
         word_vectors, emb_dim = load_word_vectors(args, wordseqs, stories)
+        if args.target_kind == "idf_word2vec_mean":
+            idf_weights = compute_story_idf(wordseqs, train_stories)
+            log.info("Computed IDF weights from %d training stories", len(train_stories))
         target_label = (
             Path(args.word_vector_path).stem if args.word_vector_path
             else args.word_vector_model
@@ -708,125 +779,132 @@ def main():
                 Y_train, _, _ = build_word2vec_mean_targets(
                     train_stories, wordseqs, train_resp_lengths, word_vectors, emb_dim,
                     window_trs=window_trs, target_lag=target_lag,
+                    target_kind=args.target_kind,
+                    idf_weights=idf_weights,
                 )
                 Y_test, test_texts, y_groups_test = build_word2vec_mean_targets(
                     test_stories, wordseqs, test_resp_lengths, word_vectors, emb_dim,
                     window_trs=window_trs, target_lag=target_lag,
+                    target_kind=args.target_kind,
+                    idf_weights=idf_weights,
                 )
             if not np.array_equal(y_groups_test, g_test):
                 raise ValueError("Target and brain group labels are misaligned.")
 
             Y_train_z, Y_test_z, y_mu, y_sd = zscore_train_test(Y_train, Y_test)
-            Y_train_model, Y_test_model, target_pca = maybe_pca(
-                Y_train_z, Y_test_z, args.target_pca, "target",
-            )
-
-            def invert_target(pred_model):
-                pred_z = pred_model
-                if target_pca is not None:
-                    pred_z = target_pca.inverse_transform(pred_model).astype(np.float32)
-                return (pred_z * y_sd + y_mu).astype(np.float32)
-
-            def add_result(model_name, params, pred_model):
-                pred = invert_target(pred_model)
-                row = {
-                    "model": model_name,
-                    "window_trs": int(window_trs),
-                    "target_lag": int(target_lag),
-                    "target_kind": args.target_kind,
-                    "target_label": target_label,
-                    "roi": roi_name,
-                    "n_voxels": int(len(vox)),
-                    "brain_pca": int(args.brain_pca),
-                    "target_pca": int(args.target_pca),
-                    **params,
-                    **evaluate_predictions(
-                        Y_test, pred, g_test,
-                        paragraph_window=args.paragraph_window_trs,
-                        paragraph_stride=args.paragraph_stride_trs,
-                    ),
-                }
-                add_null_metrics(
-                    row, Y_test, pred, g_test, args,
-                    window_trs=window_trs,
-                    target_lag=target_lag,
-                    model_name=model_name,
-                )
-                results.append(row)
-                null_txt = ""
-                if args.null_iters > 0:
-                    null_txt = (
-                        f" dim_null_mean={row['dim_r_null_mean']:.4f}"
-                        f" p={row['dim_r_null_p']:.3f}"
-                    )
-                log.info(
-                    "  %-12s dim_r=%.4f TR_top1=%.3f story_top1=%.3f "
-                    "para_top1=%.3f para_story=%.3f%s params=%s",
-                    model_name, row["dim_r_test"], row["tr_top1"], row["story_top1"],
-                    row["paragraph_top1"], row["paragraph_story_top1"], null_txt, params,
+            for target_pca_dim in args.target_pca:
+                log.info("Target PCA setting: %d", target_pca_dim)
+                Y_train_model, Y_test_model, target_pca = maybe_pca(
+                    Y_train_z, Y_test_z, target_pca_dim, "target",
                 )
 
-            if not args.skip_sklearn:
-                if "ridge" in args.sklearn_models or "ridge_rankk" in args.sklearn_models:
-                    fitted_ridges = {}
-                    for alpha in args.ridge_alphas:
-                        log.info("Fitting ridge alpha=%g", alpha)
-                        ridge_model, pred_model = ridge_fit_predict(
-                            X_train_model, Y_train_model, X_test_model, alpha,
-                        )
-                        fitted_ridges[float(alpha)] = ridge_model
-                        if "ridge" in args.sklearn_models:
-                            add_result("ridge", {"alpha": float(alpha)}, pred_model)
-                        if "ridge_rankk" in args.sklearn_models:
-                            for rank in args.ridge_ranks:
-                                if rank > min(X_train_model.shape[1], Y_train_model.shape[1]):
-                                    continue
-                                log.info("  Applying ridge rank-k alpha=%g rank=%d", alpha, rank)
-                                pred_rank = ridge_rankk_predict_from_model(ridge_model, X_test_model, rank)
-                                add_result(
-                                    "ridge_rankk",
-                                    {"alpha": float(alpha), "rank": int(rank)},
-                                    pred_rank,
-                                )
-                if "pls" in args.sklearn_models:
-                    for n_comp in args.pls_components:
-                        if n_comp > min(X_train_model.shape[0] - 1, X_train_model.shape[1], Y_train_model.shape[1]):
-                            continue
-                        log.info("Fitting PLS n_components=%d", n_comp)
-                        _, pred_model = pls_fit_predict(
-                            X_train_model, Y_train_model, X_test_model, n_comp,
-                        )
-                        add_result("pls", {"n_components": int(n_comp)}, pred_model)
+                def invert_target(pred_model):
+                    pred_z = pred_model
+                    if target_pca is not None:
+                        pred_z = target_pca.inverse_transform(pred_model).astype(np.float32)
+                    return (pred_z * y_sd + y_mu).astype(np.float32)
 
-            if not args.skip_torch:
-                torch_configs = [
-                    ("linear", {"weight_decay": 1e-3}),
-                    ("linear", {"weight_decay": 1e-2}),
-                    ("lowrank", {"rank": 16, "weight_decay": 1e-3}),
-                    ("lowrank", {"rank": 32, "weight_decay": 1e-3}),
-                    ("mlp", {"hidden": 64, "dropout": 0.3, "weight_decay": 1e-3}),
-                    ("mlp", {"hidden": 128, "dropout": 0.3, "weight_decay": 1e-3}),
-                ]
-                for arch, cfg in torch_configs:
-                    log.info("Fitting torch_%s params=%s", arch, cfg)
-                    _, pred_model = torch_fit_predict(
-                        X_train_model, Y_train_model, X_test_model,
-                        arch=arch,
-                        device=device,
-                        groups=g_train,
-                        loss=args.loss,
-                        temperature=args.temperature,
-                        lr=1e-3,
-                        max_epochs=1000,
-                        patience=50,
-                        batch_size=256,
-                        seed=args.seed,
-                        **cfg,
+                def add_result(model_name, params, pred_model):
+                    pred = invert_target(pred_model)
+                    row = {
+                        "model": model_name,
+                        "window_trs": int(window_trs),
+                        "target_lag": int(target_lag),
+                        "target_kind": args.target_kind,
+                        "target_label": target_label,
+                        "roi": roi_name,
+                        "n_voxels": int(len(vox)),
+                        "brain_pca": int(args.brain_pca),
+                        "target_pca": int(target_pca_dim),
+                        **params,
+                        **evaluate_predictions(
+                            Y_test, pred, g_test,
+                            paragraph_window=args.paragraph_window_trs,
+                            paragraph_stride=args.paragraph_stride_trs,
+                        ),
+                    }
+                    add_null_metrics(
+                        row, Y_test, pred, g_test, args,
+                        window_trs=window_trs,
+                        target_lag=target_lag,
+                        model_name=f"{model_name}_pca{target_pca_dim}",
                     )
-                    add_result(f"torch_{arch}", cfg, pred_model)
+                    results.append(row)
+                    null_txt = ""
+                    if args.null_iters > 0:
+                        null_txt = (
+                            f" dim_null_mean={row['dim_r_null_mean']:.4f}"
+                            f" p={row['dim_r_null_p']:.3f}"
+                        )
+                    log.info(
+                        "  %-12s pca=%d dim_r=%.4f TR_top1=%.3f story_top1=%.3f "
+                        "para_top1=%.3f para_story=%.3f%s params=%s",
+                        model_name, target_pca_dim, row["dim_r_test"], row["tr_top1"],
+                        row["story_top1"], row["paragraph_top1"],
+                        row["paragraph_story_top1"], null_txt, params,
+                    )
+
+                if not args.skip_sklearn:
+                    if "ridge" in args.sklearn_models or "ridge_rankk" in args.sklearn_models:
+                        for alpha in args.ridge_alphas:
+                            log.info("Fitting ridge alpha=%g", alpha)
+                            ridge_model, pred_model = ridge_fit_predict(
+                                X_train_model, Y_train_model, X_test_model, alpha,
+                            )
+                            if "ridge" in args.sklearn_models:
+                                add_result("ridge", {"alpha": float(alpha)}, pred_model)
+                            if "ridge_rankk" in args.sklearn_models:
+                                for rank in args.ridge_ranks:
+                                    if rank > min(X_train_model.shape[1], Y_train_model.shape[1]):
+                                        continue
+                                    log.info("  Applying ridge rank-k alpha=%g rank=%d", alpha, rank)
+                                    pred_rank = ridge_rankk_predict_from_model(ridge_model, X_test_model, rank)
+                                    add_result(
+                                        "ridge_rankk",
+                                        {"alpha": float(alpha), "rank": int(rank)},
+                                        pred_rank,
+                                    )
+                    if "pls" in args.sklearn_models:
+                        for n_comp in args.pls_components:
+                            if n_comp > min(X_train_model.shape[0] - 1, X_train_model.shape[1], Y_train_model.shape[1]):
+                                continue
+                            log.info("Fitting PLS n_components=%d", n_comp)
+                            _, pred_model = pls_fit_predict(
+                                X_train_model, Y_train_model, X_test_model, n_comp,
+                            )
+                            add_result("pls", {"n_components": int(n_comp)}, pred_model)
+
+                if not args.skip_torch:
+                    torch_configs = [
+                        ("linear", {"weight_decay": 1e-3}),
+                        ("linear", {"weight_decay": 1e-2}),
+                        ("lowrank", {"rank": 16, "weight_decay": 1e-3}),
+                        ("lowrank", {"rank": 32, "weight_decay": 1e-3}),
+                        ("mlp", {"hidden": 64, "dropout": 0.3, "weight_decay": 1e-3}),
+                        ("mlp", {"hidden": 128, "dropout": 0.3, "weight_decay": 1e-3}),
+                    ]
+                    for arch, cfg in torch_configs:
+                        log.info("Fitting torch_%s params=%s", arch, cfg)
+                        _, pred_model = torch_fit_predict(
+                            X_train_model, Y_train_model, X_test_model,
+                            arch=arch,
+                            device=device,
+                            groups=g_train,
+                            loss=args.loss,
+                            temperature=args.temperature,
+                            lr=1e-3,
+                            max_epochs=1000,
+                            patience=50,
+                            batch_size=256,
+                            seed=args.seed,
+                            **cfg,
+                        )
+                        add_result(f"torch_{arch}", cfg, pred_model)
+
+                del Y_train_model, Y_test_model
 
             # Keep memory bounded across sweep cells.
-            del Y_train, Y_test, Y_train_z, Y_test_z, Y_train_model, Y_test_model, test_texts
+            del Y_train, Y_test, Y_train_z, Y_test_z, test_texts
 
     results_sorted = sorted(
         results,
@@ -839,12 +917,15 @@ def main():
 
     out_dir = Path(args.output_dir) / args.subject
     out_dir.mkdir(parents=True, exist_ok=True)
+    pca_tag = "-".join(str(x) for x in args.target_pca)
     tag = (
         f"text_window__{roi_name}__{args.target_kind}__{target_label}"
-        f"__brainpca-{args.brain_pca}__targetpca-{args.target_pca}"
+        f"__brainpca-{args.brain_pca}__targetpca-{pca_tag}"
         f"__loss-{args.loss}"
     )
-    if args.focused:
+    if args.focused_with_10s:
+        tag += "__focused-10s"
+    elif args.focused:
         tag += "__focused"
     if args.null_iters > 0:
         tag += f"__null-{args.null_iters}-{args.null_eval}"
@@ -861,19 +942,35 @@ def main():
         writer.writeheader()
         writer.writerows(results_sorted)
     log.info("Saved results to %s", out_csv)
-    log.info("Top models (paragraph/story metrics are the key readout):")
-    for row in results_sorted[:10]:
-        null_txt = ""
-        if "dim_r_null_mean" in row:
-            null_txt = f" dim_null={row['dim_r_null_mean']:.4f} p={row['dim_r_null_p']:.3f}"
-        log.info(
-            "  %-12s win=%d lag=%d dim_r=%.4f TR_top1=%.3f "
-            "story=%.3f para_top1=%.3f para_story=%.3f%s params=%s",
-            row["model"], row["window_trs"], row["target_lag"], row["dim_r_test"],
-            row["tr_top1"], row["story_top1"], row["paragraph_top1"],
-            row["paragraph_story_top1"], null_txt,
-            {k: row[k] for k in ("alpha", "rank", "hidden", "dropout", "weight_decay") if k in row},
-        )
+
+    def _param_dict(row):
+        return {
+            k: row[k]
+            for k in ("alpha", "rank", "n_components", "hidden", "dropout", "weight_decay")
+            if k in row
+        }
+
+    def _print_rows(title, rows):
+        log.info(title)
+        for row in rows[:10]:
+            null_txt = ""
+            if "dim_r_null_mean" in row:
+                null_txt = f" dim_null={row['dim_r_null_mean']:.4f} p={row['dim_r_null_p']:.3f}"
+            log.info(
+                "  %-12s win=%d lag=%d pca=%d dim_r=%.4f TR_top1=%.3f "
+                "story=%.3f para_top1=%.3f para_story=%.3f%s params=%s",
+                row["model"], row["window_trs"], row["target_lag"], row["target_pca"],
+                row["dim_r_test"], row["tr_top1"], row["story_top1"], row["paragraph_top1"],
+                row["paragraph_story_top1"], null_txt, _param_dict(row),
+            )
+
+    dim_sorted = sorted(
+        results,
+        key=lambda r: np.nan_to_num(r.get("dim_r_test", -1.0), nan=-1.0),
+        reverse=True,
+    )
+    _print_rows("Top models by dim_r (primary time-locked readout):", dim_sorted)
+    _print_rows("Top models by paragraph/story retrieval:", results_sorted)
 
 
 if __name__ == "__main__":
