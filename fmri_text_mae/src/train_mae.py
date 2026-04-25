@@ -11,17 +11,17 @@ from torch.utils.data import DataLoader
 
 if __package__ is None or __package__ == "":
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from datasets import FmriTextWindowDataset
     from losses import info_nce_loss, masked_bold_mse, masked_text_cross_entropy
     from models import FmriTextMAE, MaskingConfig
     from tokenization import load_tokenizer
     from utils import batch_to_device, ensure_dir, get_device, load_config, save_json, set_seed
+    from window_dataset import FmriTextWindowDataset
 else:
-    from .datasets import FmriTextWindowDataset
     from .losses import info_nce_loss, masked_bold_mse, masked_text_cross_entropy
     from .models import FmriTextMAE, MaskingConfig
     from .tokenization import load_tokenizer
     from .utils import batch_to_device, ensure_dir, get_device, load_config, save_json, set_seed
+    from .window_dataset import FmriTextWindowDataset
 
 
 def build_model(cfg, dataset, tokenizer) -> FmriTextMAE:

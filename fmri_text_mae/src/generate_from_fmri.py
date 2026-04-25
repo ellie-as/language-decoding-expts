@@ -10,15 +10,15 @@ from torch.utils.data import DataLoader
 
 if __package__ is None or __package__ == "":
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from datasets import FmriTextWindowDataset
     from evaluate_generation import build_model
     from tokenization import decode_token_ids, load_tokenizer
     from utils import batch_to_device, get_device, load_config
+    from window_dataset import FmriTextWindowDataset
 else:
-    from .datasets import FmriTextWindowDataset
     from .evaluate_generation import build_model
     from .tokenization import decode_token_ids, load_tokenizer
     from .utils import batch_to_device, get_device, load_config
+    from .window_dataset import FmriTextWindowDataset
 
 
 @torch.no_grad()

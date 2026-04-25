@@ -13,13 +13,13 @@ from sklearn.linear_model import Ridge
 
 if __package__ is None or __package__ == "":
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from datasets import flatten_bold_windows
     from evaluate_retrieval import retrieval_metrics
     from utils import ensure_dir, load_config, resolve_path, save_json, set_seed
+    from window_dataset import flatten_bold_windows
 else:
-    from .datasets import flatten_bold_windows
     from .evaluate_retrieval import retrieval_metrics
     from .utils import ensure_dir, load_config, resolve_path, save_json, set_seed
+    from .window_dataset import flatten_bold_windows
 
 
 class MLPRegressor(nn.Module):
