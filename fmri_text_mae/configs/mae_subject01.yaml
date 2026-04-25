@@ -1,0 +1,56 @@
+data:
+  train_npz: fmri_text_mae/outputs/windows/S1/train_windows.npz
+  val_npz: fmri_text_mae/outputs/windows/S1/val_windows.npz
+  test_npz: fmri_text_mae/outputs/windows/S1/test_windows.npz
+  output_dir: fmri_text_mae/outputs/mae/S1
+
+text:
+  tokenizer: gpt2
+  max_text_tokens: 64
+  embedding_model_for_contrastive: sentence-transformers/all-mpnet-base-v2
+
+model:
+  d_model: 512
+  n_layers: 6
+  n_heads: 8
+  dim_feedforward: 2048
+  dropout: 0.1
+
+masking:
+  p_fmri_mask: 0.20
+  p_text_mask: 0.20
+  p_fmri_to_text: 0.35
+  p_text_to_fmri: 0.15
+  p_both_masked: 0.10
+  text_mask_ratio: 0.40
+  fmri_mask_ratio: 0.40
+
+loss:
+  lambda_text_ce: 1.0
+  lambda_bold_mse: 0.1
+  lambda_contrastive: 0.1
+  temperature: 0.07
+
+training:
+  batch_size: 32
+  lr: 0.0001
+  weight_decay: 0.0001
+  epochs: 50
+  patience: 8
+  num_workers: 0
+  random_seed: 42
+
+evaluation:
+  metrics:
+    - text_cross_entropy
+    - perplexity
+    - token_accuracy
+    - top1_retrieval
+    - top5_retrieval
+    - median_rank
+    - mean_reciprocal_rank
+    - embedding_cosine
+  controls:
+    - shuffled_pairs
+    - wrong_lag
+    - no_fmri
