@@ -190,7 +190,9 @@ class WERMetric:
     def score(self, ref, pred):
         scores = []
         for ref_seg, pred_seg in zip(ref, pred):
-            error = 1.0 if len(ref_seg) == 0 else self.wer(ref_seg, pred_seg)
+            # jiwer treats list[str] as sentence batches, not token lists, so
+            # score each window as a single whitespace-joined utterance.
+            error = 1.0 if len(ref_seg) == 0 else self.wer(" ".join(ref_seg), " ".join(pred_seg))
             scores.append(1 - error if self.use_score else error)
         return np.array(scores)
 
