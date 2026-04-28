@@ -236,6 +236,15 @@ def parse_args():
         "--output-dir",
         default=str(THIS_DIR / "huth_style_feature_outputs"),
     )
+    parser.add_argument(
+        "--gpt1-output-dir",
+        default=str(THIS_DIR / "outputs"),
+        help=(
+            "Root containing GPT-1 comparison outputs. If "
+            "<root>/<subject>/comparison_summary.json exists, a combined "
+            "GPT-1 / alternate-feature table is printed."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -391,6 +400,68 @@ def summarize(results_by_condition):
     return summary
 
 
+def print_combined_table(subject, alt_summary, args):
+    """Print GPT-1 + alternate-feature encoding scores when both summaries exist."""
+    gpt1_summary_path = (
+        Path(args.gpt1_output_dir).expanduser().resolve()
+        / subject
+        / "comparison_summary.json"
+    )
+    if not gpt1_summary_path.exists():
+        print(
+            f"[{subject}] GPT-1 summary not found at {gpt1_summary_path}; "
+            "skipping combined table."
+        )
+        return
+
+    with open(gpt1_summary_path, encoding="utf-8") as f:
+        gpt1_summary = json.load(f)
+
+    rows = []
+    for name in ["finetuned", "pretrained"]:
+        if name not in gpt1_summary:
+            continue
+        data = gpt1_summary[name]
+        rows.append(
+            (
+                name,
+                data["mean_bootstrap_corr"],
+                data["median_bootstrap_corr"],
+                data["max_bootstrap_corr"],
+                data["n_corr_gt_0_1"],
+            )
+        )
+
+    for name, data in alt_summary.items():
+        if name == "comparisons":
+            continue
+        rows.append(
+            (
+                name,
+                data["mean_bootstrap_score"],
+                data["median_bootstrap_score"],
+                data["max_bootstrap_score"],
+                data["n_score_gt_0_1"],
+            )
+        )
+
+    if not rows:
+        return
+
+    print()
+    print(f"[{subject}] Combined Huth-style encoding score table")
+    print(f"{'model':<24s} {'mean':>10s} {'median':>10s} {'max':>10s} {'n>.1':>8s}")
+    print("-" * 68)
+    for model, mean_score, median_score, max_score, n_gt in rows:
+        print(
+            f"{model:<24s} "
+            f"{mean_score:10.6f} "
+            f"{median_score:10.6f} "
+            f"{max_score:10.6f} "
+            f"{n_gt:8d}"
+        )
+
+
 def main():
     args = parse_args()
     config.GPT_DEVICE = args.device
@@ -424,6 +495,7 @@ def main():
         with open(summary_path, "w", encoding="utf-8") as f:
             json.dump(summary, f, indent=2, sort_keys=True)
         print(f"[{subject}] wrote {summary_path}")
+        print_combined_table(subject, summary, args)
 
 
 if __name__ == "__main__":
