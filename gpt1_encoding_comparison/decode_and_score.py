@@ -42,10 +42,13 @@ from compare_gpt1_encoding import (  # noqa: E402
     HuthFinetunedGPT1Features,
 )
 from utils_stim import predict_word_rate, predict_word_times  # noqa: E402
+from utils_ridge.textgrid import TextGrid  # noqa: E402
 
 
 CONDITION_PAPER = "paper"
 DEFAULT_TASKS = ["wheretheressmoke"]
+BAD_WORDS_PERCEIVED_SPEECH = frozenset(["sentence_start", "sentence_end", "br", "lg", "ls", "ns", "sp"])
+BAD_WORDS_OTHER_TASKS = frozenset(["", "sp", "uh"])
 
 
 def parse_args():
@@ -109,6 +112,152 @@ def load_huth_lm(device, checkpoint="perceived"):
     gpt = GPT(path=str(Path(config.DATA_LM_DIR) / checkpoint / "model"), vocab=gpt_vocab, device=device)
     lm = LanguageModel(gpt, decoder_vocab, nuc_mass=config.LM_MASS, nuc_ratio=config.LM_RATIO)
     return gpt, lm
+
+
+def load_transcript(experiment, task):
+    skip_words = (
+        BAD_WORDS_PERCEIVED_SPEECH
+        if experiment in {"perceived_speech", "perceived_multispeaker"}
+        else BAD_WORDS_OTHER_TASKS
+    )
+    grid_path = Path(config.DATA_TEST_DIR) / "test_stimulus" / experiment / f"{task.split('_')[0]}.TextGrid"
+    with open(grid_path, encoding="utf-8") as f:
+        grid = TextGrid(f.read())
+    transcript = (
+        grid.tiers[1].make_simple_transcript()
+        if experiment == "perceived_speech"
+        else grid.tiers[0].make_simple_transcript()
+    )
+    transcript = [
+        (float(start), float(end), word.lower())
+        for start, end, word in transcript
+        if word.lower().strip("{}").strip() not in skip_words
+    ]
+    return {
+        "words": np.array([item[2] for item in transcript]),
+        "times": np.array([(item[0] + item[1]) / 2 for item in transcript]),
+    }
+
+
+def windows(start_time, end_time, duration, step=1):
+    start_time, end_time = int(start_time), int(end_time)
+    half = int(duration / 2)
+    return [
+        (center - half, center + half)
+        for center in range(start_time + half, end_time - half + 1)
+        if center % step == 0
+    ]
+
+
+def segment_data(data, times, cutoffs):
+    return [
+        [item for time, item in zip(times, data) if time >= start and time < end]
+        for start, end in cutoffs
+    ]
+
+
+def generate_null(pred_times, gpt_checkpoint, n, device):
+    """Generate null sequences with the same word times as the prediction."""
+    _gpt, lm = load_huth_lm(device, checkpoint=gpt_checkpoint)
+    null_words = []
+    for _count in range(n):
+        decoder = Decoder(pred_times, 2 * config.EXTENSIONS)
+        for sample_index in range(len(pred_times)):
+            ncontext = decoder.time_window(sample_index, config.LM_TIME, floor=5)
+            beam_nucs = lm.beam_propose(decoder.beam, ncontext)
+            for beam_index, (hyp, nextensions) in enumerate(decoder.get_hypotheses()):
+                nuc, logprobs = beam_nucs[beam_index]
+                if len(nuc) < 1:
+                    continue
+                likelihoods = np.random.random(len(nuc))
+                local_extensions = [
+                    Hypothesis(parent=hyp, extension=item)
+                    for item in zip(nuc, logprobs, [np.zeros(1) for _ in nuc])
+                ]
+                decoder.add_extensions(local_extensions, likelihoods, nextensions)
+            decoder.extend(verbose=False)
+        null_words.append(decoder.beam[0].words)
+    return null_words
+
+
+class WERMetric:
+    def __init__(self, use_score=True):
+        from jiwer import wer
+
+        self.wer = wer
+        self.use_score = use_score
+
+    def score(self, ref, pred):
+        scores = []
+        for ref_seg, pred_seg in zip(ref, pred):
+            error = 1.0 if len(ref_seg) == 0 else self.wer(ref_seg, pred_seg)
+            scores.append(1 - error if self.use_score else error)
+        return np.array(scores)
+
+
+def load_metric_compat(name):
+    try:
+        from evaluate import load
+
+        return load(name)
+    except ImportError:
+        from datasets import load_metric
+
+        return load_metric(name, keep_in_memory=True)
+
+
+class BLEUMetric:
+    def __init__(self, n=1):
+        self.metric = load_metric_compat("bleu")
+        self.n = n
+
+    def score(self, ref, pred):
+        results = []
+        for ref_seg, pred_seg in zip(ref, pred):
+            computed = self.metric.compute(
+                predictions=[list(pred_seg)],
+                references=[[list(ref_seg)]],
+                max_order=self.n,
+            )
+            results.append(computed["bleu"])
+        return np.array(results)
+
+
+class METEORMetric:
+    def __init__(self):
+        self.metric = load_metric_compat("meteor")
+
+    def score(self, ref, pred):
+        ref_strings = [" ".join(seg) for seg in ref]
+        pred_strings = [" ".join(seg) for seg in pred]
+        results = []
+        for ref_string, pred_string in zip(ref_strings, pred_strings):
+            computed = self.metric.compute(predictions=[pred_string], references=[ref_string])
+            results.append(computed["meteor"])
+        return np.array(results)
+
+
+class BERTScoreMetric:
+    def __init__(self, idf_sents=None, rescale=False, score="recall"):
+        from bert_score import BERTScorer
+
+        self.metric = BERTScorer(
+            lang="en",
+            rescale_with_baseline=rescale,
+            idf=idf_sents is not None,
+            idf_sents=idf_sents,
+        )
+        if score == "precision":
+            self.score_id = 0
+        elif score == "recall":
+            self.score_id = 1
+        else:
+            self.score_id = 2
+
+    def score(self, ref, pred):
+        ref_strings = [" ".join(seg) for seg in ref]
+        pred_strings = [" ".join(seg) for seg in pred]
+        return self.metric.score(cands=pred_strings, refs=ref_strings)[self.score_id].numpy()
 
 
 def make_features(condition, args):
@@ -230,25 +379,21 @@ def decode_one(condition, subject, experiment, task, args, huth_lm):
 
 
 def load_metrics(args):
-    from utils_eval import BERTSCORE, BLEU, METEOR, WER
-
     metrics = {}
     if "WER" in args.metrics:
-        metrics["WER"] = WER(use_score=True)
+        metrics["WER"] = WERMetric(use_score=True)
     if "BLEU" in args.metrics:
-        metrics["BLEU"] = BLEU(n=1)
+        metrics["BLEU"] = BLEUMetric(n=1)
     if "METEOR" in args.metrics:
-        metrics["METEOR"] = METEOR()
+        metrics["METEOR"] = METEORMetric()
     if "BERT" in args.metrics:
         idf_path = Path(config.DATA_TEST_DIR) / "idf_segments.npy"
         idf_sents = np.load(idf_path) if idf_path.exists() else None
-        metrics["BERT"] = BERTSCORE(idf_sents=idf_sents, rescale=False, score="recall")
+        metrics["BERT"] = BERTScoreMetric(idf_sents=idf_sents, rescale=False, score="recall")
     return metrics
 
 
 def score_one(pred_path, subject, experiment, task, metrics, null_word_list):
-    from utils_eval import load_transcript, segment_data, windows
-
     with open(Path(config.DATA_TEST_DIR) / "eval_segments.json", encoding="utf-8") as f:
         eval_segments = json.load(f)
     pred_data = np.load(pred_path, allow_pickle=True)
@@ -322,7 +467,6 @@ def main():
     for task in args.tasks:
         print(f"\n=== {args.subject} / {args.experiment} / {task} ===")
         print(f"Generating {args.n_null} null decodes for shared score normalization")
-        from utils_eval import generate_null
 
         # Use paper condition timing for null generation; all conditions share the same word times.
         resp = load_test_response(args.subject, args.experiment, task)
@@ -331,6 +475,7 @@ def main():
             word_times,
             gpt_checkpoint_for_experiment(args.experiment),
             args.n_null,
+            args.device,
         )
 
         for condition in args.conditions:

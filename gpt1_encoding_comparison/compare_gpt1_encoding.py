@@ -61,6 +61,9 @@ class HuthFinetunedGPT1Features:
     def make_stim(self, words):
         return self.features.make_stim(words).astype(np.float32, copy=False)
 
+    def extend(self, extensions, verbose=False):
+        return self.features.extend(extensions, verbose=verbose)
+
     def close(self):
         del self.features
         del self.gpt
@@ -160,6 +163,48 @@ class HFOpenAIGPTFeatures:
                 hidden[row_idx, col_idx].detach().cpu().numpy().astype(np.float32)
             )
 
+        return vecs
+
+    def extend(self, extensions, verbose=False):
+        """Return the current-word vector for each candidate word extension."""
+        contexts = [
+            self._encode_context([str(word) for word in extension[-(self.context_words + 1):]])
+            for extension in extensions
+        ]
+        if verbose:
+            print(contexts)
+
+        vecs = np.zeros((len(contexts), self.hidden_size), dtype=np.float32)
+        for start in range(0, len(contexts), self.batch_size):
+            batch = contexts[start:start + self.batch_size]
+            max_len = max(len(ids) for ids, _cur_start in batch)
+            input_ids = np.full(
+                (len(batch), max_len),
+                self._pad_token_id(),
+                dtype=np.int64,
+            )
+            attention_mask = np.zeros((len(batch), max_len), dtype=np.int64)
+            last_indices = []
+
+            for row, (ids, cur_start) in enumerate(batch):
+                input_ids[row, :len(ids)] = ids
+                attention_mask[row, :len(ids)] = 1
+                last_indices.append(max(cur_start, len(ids) - 1))
+
+            input_t = torch.tensor(input_ids, device=self.device)
+            mask_t = torch.tensor(attention_mask, device=self.device)
+            with torch.no_grad():
+                outputs = self.model(
+                    input_ids=input_t,
+                    attention_mask=mask_t,
+                    output_hidden_states=True,
+                )
+            hidden = outputs.hidden_states[self.layer]
+            row_idx = torch.arange(hidden.shape[0], device=self.device)
+            col_idx = torch.tensor(last_indices, device=self.device)
+            vecs[start:start + len(batch)] = (
+                hidden[row_idx, col_idx].detach().cpu().numpy().astype(np.float32)
+            )
         return vecs
 
     def close(self):
