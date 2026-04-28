@@ -216,9 +216,14 @@ class BLEUMetric:
     def score(self, ref, pred):
         results = []
         for ref_seg, pred_seg in zip(ref, pred):
+            if len(ref_seg) == 0:
+                results.append(0.0)
+                continue
+            ref_string = " ".join(ref_seg)
+            pred_string = " ".join(pred_seg)
             computed = self.metric.compute(
-                predictions=[list(pred_seg)],
-                references=[[list(ref_seg)]],
+                predictions=[pred_string],
+                references=[[ref_string]],
                 max_order=self.n,
             )
             results.append(computed["bleu"])
