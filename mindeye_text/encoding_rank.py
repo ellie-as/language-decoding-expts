@@ -113,6 +113,8 @@ def parse_args() -> argparse.Namespace:
                    help="L2-normalize raw embedding targets before z-score (matches train).")
     p.add_argument("--chunk-trs", type=int, default=5,
                    help="Width of the text chunk in TRs. Match the train-time chunk_trs.")
+    p.add_argument("--embed-batch-size", type=int, default=256,
+                   help="Batch size when building text embeddings (cache miss only).")
 
     p.add_argument("--lags", nargs="+", type=int, default=[1, 2, 3, 4],
                    help="FIR encoding lags (TRs). For predicting brain at TR t, use chunk "
