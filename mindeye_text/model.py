@@ -91,11 +91,28 @@ class MindEyeText(nn.Module):
         return self.decode(self.encode(x, subject))
 
 
-def info_nce_clip(pred: torch.Tensor, target: torch.Tensor, temperature: float) -> torch.Tensor:
-    """Symmetric InfoNCE on (B, D) batches using L2-normalized embeddings."""
+def info_nce_clip(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    temperature: float,
+    story_ids: "torch.Tensor | None" = None,
+) -> torch.Tensor:
+    """Symmetric InfoNCE on (B, D) batches using L2-normalized embeddings.
+
+    When ``story_ids`` is provided (integer tensor of shape ``(B,)``), all
+    off-diagonal positions where ``story_ids[i] == story_ids[j]`` are masked
+    to ``-inf`` before the softmax.  This prevents the model from being
+    penalised for correctly ranking a same-story negative highly — a common
+    false-negative problem with temporally overlapping 5-TR windows.
+    """
     p = F.normalize(pred, dim=-1)
     t = F.normalize(target, dim=-1)
     logits = (p @ t.t()) / max(float(temperature), 1e-6)
+    if story_ids is not None:
+        eye = torch.eye(p.shape[0], dtype=torch.bool, device=p.device)
+        same = story_ids.unsqueeze(1) == story_ids.unsqueeze(0)   # (B, B)
+        mask = same & ~eye   # same-story, off-diagonal
+        logits = logits.masked_fill(mask, float("-inf"))
     labels = torch.arange(p.shape[0], device=p.device)
     loss_p2t = F.cross_entropy(logits, labels)
     loss_t2p = F.cross_entropy(logits.t(), labels)
@@ -109,6 +126,7 @@ def compute_loss(
     cosine_weight: float = 0.5,
     clip_weight: float = 0.5,
     clip_temp: float = 0.05,
+    story_ids: "torch.Tensor | None" = None,
 ) -> torch.Tensor:
     """Multi-flavour decoding loss.
 
@@ -134,6 +152,6 @@ def compute_loss(
         return (1.0 - float(cosine_weight)) * mse + float(cosine_weight) * cos
     if kind == "mse_clip":
         mse = F.mse_loss(pred, target)
-        clip = info_nce_clip(pred, target, clip_temp)
+        clip = info_nce_clip(pred, target, clip_temp, story_ids=story_ids)
         return (1.0 - float(clip_weight)) * mse + float(clip_weight) * clip
     raise ValueError(f"Unknown loss kind: {kind!r}")

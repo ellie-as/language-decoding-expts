@@ -25,6 +25,7 @@ BRAIN_PCA=${BRAIN_PCA:-0}
 LOSS=${LOSS:-"mse_clip"}
 CLIP_WEIGHT=${CLIP_WEIGHT:-0.5}
 CLIP_TEMP=${CLIP_TEMP:-0.05}
+MASK_SAME_STORY=${MASK_SAME_STORY:-1}   # 1=on (default), 0=off
 LR=${LR:-3e-4}
 WD=${WD:-1e-2}
 BATCH=${BATCH:-256}
@@ -49,6 +50,7 @@ python -u mindeye_text/train_mindeye_text.py \
   --loss "${LOSS}" \
   --clip-weight "${CLIP_WEIGHT}" \
   --clip-temp "${CLIP_TEMP}" \
+  $([ "${MASK_SAME_STORY}" = "0" ] && echo "--no-mask-same-story" || echo "--mask-same-story") \
   --lr "${LR}" \
   --weight-decay "${WD}" \
   --batch-size "${BATCH}" \

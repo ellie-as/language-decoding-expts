@@ -115,6 +115,9 @@ def parse_args() -> argparse.Namespace:
                    help="Weight on the InfoNCE term in --loss mse_clip.")
     p.add_argument("--clip-temp", type=float, default=0.05,
                    help="Temperature for the InfoNCE term.")
+    p.add_argument("--mask-same-story", action=argparse.BooleanOptionalAction, default=True,
+                   help="Mask same-story off-diagonal entries in InfoNCE to -inf, "
+                        "preventing false-negative gradients from temporally overlapping chunks.")
 
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--weight-decay", type=float, default=1e-2)
@@ -193,7 +196,7 @@ def predict_subject(
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0)
     preds = []
     targets = []
-    for xb, yb in loader:
+    for xb, yb, _story_names in loader:
         xb = xb.to(device, non_blocking=True)
         with autocast_ctx(device, use_amp):
             pred = model(xb, subject)
@@ -240,6 +243,12 @@ def run() -> None:
         raise ValueError(f"Inconsistent text embedding dim across subjects: {embedding_dims}")
     embed_dim = int(next(iter(embedding_dims)))
     log.info("Text embedding dim: %d (%s)", embed_dim, args.feature_model)
+
+    # Build a global story → integer map so we can construct same-story masks.
+    all_train_stories = sorted({
+        s for sd in subject_data.values() for s in sd.train_stories
+    })
+    story_to_int: Dict[str, int] = {s: i for i, s in enumerate(all_train_stories)}
 
     embeddings_train_per_subject = {s: subject_data[s].embeddings_train for s in args.subjects}
     train_stories_per_subject = {s: subject_data[s].train_stories for s in args.subjects}
@@ -345,17 +354,26 @@ def run() -> None:
             opt.zero_grad(set_to_none=True)
             latents: List[torch.Tensor] = []
             targets: List[torch.Tensor] = []
+            story_int_lists: List[torch.Tensor] = []
             for subj, it in train_iters.items():
-                xb, yb = next(it)
+                xb, yb, story_names = next(it)
                 xb = xb.to(device, non_blocking=True)
                 yb = yb.to(device, non_blocking=True)
                 with autocast_ctx(device, use_amp):
                     latents.append(model.encode(xb, subj))
                 targets.append(yb)
+                story_int_lists.append(
+                    torch.tensor(
+                        [story_to_int[sn] for sn in story_names],
+                        dtype=torch.long,
+                        device=device,
+                    )
+                )
             with autocast_ctx(device, use_amp):
                 latent = torch.cat(latents, dim=0)
                 target = torch.cat(targets, dim=0)
                 pred = model.decode(latent)
+                sid = torch.cat(story_int_lists, dim=0) if args.mask_same_story else None
                 loss = compute_loss(
                     pred,
                     target,
@@ -363,6 +381,7 @@ def run() -> None:
                     cosine_weight=args.cosine_weight,
                     clip_weight=args.clip_weight,
                     clip_temp=args.clip_temp,
+                    story_ids=sid,
                 )
             loss.backward()
             opt.step()
@@ -376,7 +395,7 @@ def run() -> None:
             for subj, loader in val_loaders.items():
                 subj_total = 0.0
                 subj_count = 0
-                for xb, yb in loader:
+                for xb, yb, _story_names in loader:
                     xb = xb.to(device, non_blocking=True)
                     yb = yb.to(device, non_blocking=True)
                     with autocast_ctx(device, use_amp):
@@ -409,7 +428,7 @@ def run() -> None:
                 **{f"val_loss_{subj}": float(v) for subj, v in per_subject_val.items()},
             }
         )
-        if epoch == 1 or epoch % 5 == 0:
+        if True:
             per_subj_str = " ".join(f"{s}={v:.4f}" for s, v in per_subject_val.items())
             log.info(
                 "epoch %03d train=%.5f val=%.5f (%s) | per-subj %s | %.1fs",

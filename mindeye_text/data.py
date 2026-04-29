@@ -14,11 +14,14 @@ Each subject contributes:
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import logging
+import pickle
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Mapping, Tuple
+from typing import Dict, List, Mapping, Optional, Tuple
 
 import numpy as np
 import torch
@@ -154,11 +157,14 @@ def load_subject_data(args: argparse.Namespace, subject: str) -> SubjectData:
             pc_mean,
             pc_std,
             pca_explained_variance_ratio,
-        ) = _fit_apply_brain_pca(
-            train_z,
-            test_z,
-            train_stories,
-            test_stories,
+        ) = load_or_build_brain_pca(
+            args=args,
+            train_z=train_z,
+            test_z=test_z,
+            train_stories=train_stories,
+            test_stories=test_stories,
+            vox=vox,
+            roi_name=str(roi_name),
             n_components=brain_pca_n,
             seed=int(getattr(args, "seed", 0) or 0),
             subject=subject,
@@ -191,6 +197,102 @@ def load_subject_data(args: argparse.Namespace, subject: str) -> SubjectData:
         pc_std=pc_std,
         pca_explained_variance_ratio=pca_explained_variance_ratio,
     )
+
+
+def _brain_pca_cache_key(
+    subject: str,
+    vox: np.ndarray,
+    train_stories: List[str],
+    n_components: int,
+    seed: int,
+) -> str:
+    vox_hash = hashlib.sha1(
+        np.ascontiguousarray(np.sort(vox).astype(np.int64)).tobytes()
+    ).hexdigest()[:12]
+    payload = {
+        "subject": subject,
+        "vox_hash": vox_hash,
+        "train_stories": sorted(train_stories),
+        "n_components": int(n_components),
+        "seed": int(seed),
+    }
+    return hashlib.sha1(
+        json.dumps(payload, sort_keys=True).encode("utf-8")
+    ).hexdigest()[:12]
+
+
+def load_or_build_brain_pca(
+    args: argparse.Namespace,
+    train_z: Dict[str, np.ndarray],
+    test_z: Dict[str, np.ndarray],
+    train_stories: List[str],
+    test_stories: List[str],
+    vox: np.ndarray,
+    roi_name: str,
+    n_components: int,
+    seed: int,
+    subject: str,
+) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray], Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+    """Load brain PCA from disk if already fitted, otherwise fit and save.
+
+    Cache is keyed on (subject, voxel indices, train_stories, n_components, seed),
+    so re-runs with identical settings skip the expensive SVD (~6 min per subject).
+    Cache lives next to the text-embedding cache in
+    ``embedding_cache_dir / subject / brain_pca__<roi>__comp<n>__<key>.pkl``.
+    """
+    cache_dir = Path(getattr(args, "embedding_cache_dir", "27-04-expts/cache")) / subject
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    key = _brain_pca_cache_key(subject, vox, train_stories, n_components, seed)
+    cache_path = cache_dir / f"brain_pca__{roi_name}__comp{n_components}__{key}.pkl"
+
+    if cache_path.is_file():
+        log.info("[%s] Loading cached brain PCA: %s", subject, cache_path)
+        with open(cache_path, "rb") as f:
+            payload = pickle.load(f)
+        basis = (
+            payload["pca_components"],
+            payload["pca_mean"],
+            payload["pc_mean"],
+            payload["pc_std"],
+            payload["pca_explained_variance_ratio"],
+        )
+        # Re-apply the saved basis to the in-memory z-scored responses.
+        pca_components, pca_mean_vec, pc_mean, pc_std, evr = basis
+        def _project(arr: np.ndarray) -> np.ndarray:
+            proj = (arr - pca_mean_vec) @ pca_components.T
+            return np.nan_to_num((proj - pc_mean) / pc_std).astype(np.float32)
+        train_out = {s: _project(train_z[s]) for s in train_stories}
+        test_out = {s: _project(test_z[s]) for s in test_stories}
+        log.info(
+            "[%s]   evr=%.3f (%d components, from cache)",
+            subject, float(evr.sum()), int(pca_components.shape[0]),
+        )
+        return train_out, test_out, basis
+
+    log.info("[%s] Brain PCA cache miss — fitting from scratch", subject)
+    train_out, test_out, basis = _fit_apply_brain_pca(
+        train_z, test_z, train_stories, test_stories,
+        n_components=n_components, seed=seed, subject=subject,
+    )
+    pca_components, pca_mean_vec, pc_mean, pc_std, evr = basis
+    with open(cache_path, "wb") as f:
+        pickle.dump(
+            {
+                "pca_components": pca_components,
+                "pca_mean": pca_mean_vec,
+                "pc_mean": pc_mean,
+                "pc_std": pc_std,
+                "pca_explained_variance_ratio": evr,
+                "subject": subject,
+                "roi_name": roi_name,
+                "n_components": int(pca_components.shape[0]),
+                "train_stories": sorted(train_stories),
+                "seed": int(seed),
+            },
+            f,
+        )
+    log.info("[%s] Wrote brain PCA cache: %s", subject, cache_path)
+    return train_out, test_out, basis
 
 
 def _fit_apply_brain_pca(
@@ -357,7 +459,8 @@ class SingleTRChunkDataset(Dataset):
     def __len__(self) -> int:
         return int(self.starts.shape[0])
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, str]:
+        """Return ``(brain_features, target_embedding, story_name)``."""
         story_idx = int(self.story_ids[idx])
         i = int(self.starts[idx])
         x = self.responses[story_idx][i + self.lag_trs + self.brain_offset]
@@ -370,17 +473,14 @@ class SingleTRChunkDataset(Dataset):
         return (
             torch.from_numpy(np.ascontiguousarray(x).astype(np.float32)),
             torch.from_numpy(np.ascontiguousarray(y)),
+            self.stories[story_idx],
         )
 
     def chunk_story_groups(self) -> np.ndarray:
         """Story-name array aligned with ``__getitem__`` indices (for grouped splits)."""
-        labels = np.empty(len(self), dtype=object)
-        cursor = 0
-        for story_idx, emb in enumerate(self.embeddings):
-            n = int(emb.shape[0])
-            labels[cursor : cursor + n] = self.stories[story_idx]
-            cursor += n
-        return labels
+        return np.asarray(
+            [self.stories[int(sid)] for sid in self.story_ids], dtype=object
+        )
 
     def stack_targets_raw(self) -> np.ndarray:
         """Return the raw (un-normalized, un-zscored) targets in dataset order."""
