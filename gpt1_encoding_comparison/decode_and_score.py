@@ -301,6 +301,26 @@ def load_word_times(subject, experiment, task, resp):
     return predict_word_times(word_rate, resp, starttime=starttime)
 
 
+def as_numeric_array(value):
+    """Convert npz object-array payloads back into numeric ndarrays."""
+    arr = np.asarray(value)
+    while arr.dtype == object and arr.shape == ():
+        arr = np.asarray(arr.item())
+    if arr.dtype == object:
+        arr = np.asarray(arr.tolist())
+    return arr.astype(np.float32, copy=False)
+
+
+def load_stimulus_stats(em_data):
+    """Return numeric stats in the form expected by decoding.StimulusModel."""
+    tr_stats = em_data["tr_stats"]
+    word_stats = em_data["word_stats"]
+    return (
+        (as_numeric_array(tr_stats[0]), as_numeric_array(tr_stats[1])),
+        as_numeric_array(word_stats[0]),
+    )
+
+
 def decode_one(condition, subject, experiment, task, args, huth_lm):
     output_dir = Path(args.output_dir).expanduser().resolve()
     pred_dir = output_dir / subject / experiment / condition
@@ -329,6 +349,7 @@ def decode_one(condition, subject, experiment, task, args, huth_lm):
 
     features = make_features(condition, args)
     try:
+        tr_stats, word_mean = load_stimulus_stats(em_data)
         em = EncodingModel(
             resp,
             em_data["weights"],
@@ -339,8 +360,8 @@ def decode_one(condition, subject, experiment, task, args, huth_lm):
         em.set_shrinkage(config.NM_ALPHA)
         sm = StimulusModel(
             lanczos_mat,
-            em_data["tr_stats"],
-            em_data["word_stats"][0],
+            tr_stats,
+            word_mean,
             device=config.SM_DEVICE,
         )
 
