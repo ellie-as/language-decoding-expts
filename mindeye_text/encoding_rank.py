@@ -93,6 +93,8 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=[2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 18, 20],
     )
+    p.add_argument("--stories", nargs="+", default=None,
+                   help="Optional explicit story list. If unset, derived from --sessions.")
     p.add_argument("--holdout-stories", nargs="+", default=None)
     p.add_argument("--holdout-count", type=int, default=rse.DEFAULT_HOLDOUT_COUNT)
     p.add_argument("--no-story-holdout", action="store_true",
