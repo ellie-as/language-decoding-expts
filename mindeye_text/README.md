@@ -119,6 +119,26 @@ Override anything with the matching `--*` flag (the same names as in
 allowed to differ between subjects - the subject-specific `Linear` absorbs
 the difference.
 
+## Brain PCA (per subject)
+
+Pass `--brain-pca <n_components>` (or `BRAIN_PCA=...` in `run_train.sh`) to
+fit a per-subject PCA on training-story z-scored voxels and feed the PCs
+(post-PC z-score) to the subject-specific `Linear`. The basis is fit on the
+training stories only and is stored in `model.pt` so eval reproduces it
+exactly without re-fitting.
+
+This is the highest-leverage knob for shrinking the per-subject input
+projection: e.g. with 25k voxels and `--latent-dim 2048`, going from raw
+voxels to `--brain-pca 1024` cuts the input projection from ~50M -> ~2M
+parameters per subject, while typically retaining >85% of training variance.
+
+Sensible recipe at our data scale:
+
+```bash
+LATENT=2048 BLOCKS=2 DROPOUT=0.3 WD=5e-2 CLIP_WEIGHT=0.1 BRAIN_PCA=1024 \
+  ./mindeye_text/run_train.sh --max-epochs 100 --patience 15
+```
+
 ## Caching
 
 The 5-TR text embeddings default to `27-04-expts/cache/<subject>/` (override

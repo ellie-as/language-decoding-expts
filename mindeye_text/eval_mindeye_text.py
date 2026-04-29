@@ -87,6 +87,43 @@ def _resolve_metadata(checkpoint_path: Path, override: str | None) -> dict:
         return json.load(f)
 
 
+def _apply_saved_pca_inplace(subject_data_obj, ckpt: dict, subj: str) -> None:
+    """Replace ``subject_data_obj.responses_*`` with the checkpoint PCA projection.
+
+    Uses the **exact** PCA components / mean / per-PC z-score saved at training
+    time, so eval is bit-stable with respect to randomized SVD reruns.
+    """
+    components = ckpt["pca_components"][subj]
+    pca_mean = ckpt["pca_mean"][subj]
+    pc_mean = ckpt["pc_mean"][subj]
+    pc_std = ckpt["pc_std"][subj]
+    if components is None or pca_mean is None or pc_mean is None or pc_std is None:
+        raise ValueError(
+            f"Checkpoint says brain_pca>0 but PCA tensors are missing for subject {subj}."
+        )
+    components = np.asarray(components, dtype=np.float32)
+    pca_mean = np.asarray(pca_mean, dtype=np.float32)
+    pc_mean = np.asarray(pc_mean, dtype=np.float32)
+    pc_std = np.asarray(pc_std, dtype=np.float32)
+
+    def _project(arr: np.ndarray) -> np.ndarray:
+        proj = (arr - pca_mean) @ components.T
+        return np.nan_to_num((proj - pc_mean) / pc_std).astype(np.float32)
+
+    subject_data_obj.responses_train = {
+        s: _project(np.asarray(arr, dtype=np.float32))
+        for s, arr in subject_data_obj.responses_train.items()
+    }
+    subject_data_obj.responses_test = {
+        s: _project(np.asarray(arr, dtype=np.float32))
+        for s, arr in subject_data_obj.responses_test.items()
+    }
+    subject_data_obj.pca_components = components
+    subject_data_obj.pca_mean = pca_mean
+    subject_data_obj.pc_mean = pc_mean
+    subject_data_obj.pc_std = pc_std
+
+
 def _build_data_args(eval_args: argparse.Namespace, train_args: dict) -> argparse.Namespace:
     """Reconstruct an argparse.Namespace compatible with ``data.load_subject_data``.
 
@@ -127,7 +164,8 @@ def main() -> None:
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
     voxel_counts = {s: int(c) for s, c in ckpt["voxel_counts"].items()}
-    missing = [s for s in requested_subjects if s not in voxel_counts]
+    feat_dims = {s: int(c) for s, c in ckpt.get("feat_dims", voxel_counts).items()}
+    missing = [s for s in requested_subjects if s not in feat_dims]
     if missing:
         raise ValueError(f"Checkpoint has no projection for subjects: {missing}")
 
@@ -136,7 +174,7 @@ def main() -> None:
     log.info("Device: %s | AMP: %s", device, "bf16" if use_amp else "off")
 
     model = MindEyeText(
-        voxel_counts=voxel_counts,
+        voxel_counts=feat_dims,
         embed_dim=int(ckpt["embed_dim"]),
         latent_dim=int(ckpt["latent_dim"]),
         n_blocks=int(ckpt["n_blocks"]),
@@ -145,6 +183,12 @@ def main() -> None:
     )
     model.load_state_dict(ckpt["model_state_dict"])
     model.to(device).eval()
+
+    # Disable in-line PCA inside ``load_subject_data`` so we can apply the
+    # exact training basis below instead of refitting (which can drift in
+    # randomized SVD even with the same seed).
+    data_args.brain_pca = 0
+    ckpt_brain_pca = int(ckpt.get("brain_pca", 0) or 0)
 
     metrics_rows: List[dict] = []
     pooled_pred_emb: List[np.ndarray] = []
@@ -157,6 +201,24 @@ def main() -> None:
 
     for subj in requested_subjects:
         subject_data_obj = load_subject_data(data_args, subj)
+        if subject_data_obj.n_voxels != voxel_counts[subj]:
+            raise ValueError(
+                f"Subject {subj}: voxel count mismatch (data={subject_data_obj.n_voxels}, "
+                f"checkpoint={voxel_counts[subj]}). Re-run with the same ROI."
+            )
+
+        if ckpt_brain_pca > 0:
+            _apply_saved_pca_inplace(subject_data_obj, ckpt, subj)
+            log.info(
+                "[%s] applied saved brain PCA from checkpoint -> feat_dim=%d",
+                subj, subject_data_obj.feat_dim,
+            )
+        if subject_data_obj.feat_dim != feat_dims[subj]:
+            raise ValueError(
+                f"Subject {subj}: feat_dim mismatch (data={subject_data_obj.feat_dim}, "
+                f"checkpoint={feat_dims[subj]}). Re-train with consistent --brain-pca."
+            )
+
         ds = make_subject_dataset(
             subject_data_obj,
             chunk_trs=int(ckpt["chunk_trs"]),
@@ -168,11 +230,6 @@ def main() -> None:
             split="test",
         )
         log.info("[%s] %d test chunks, %d voxels", subj, len(ds), subject_data_obj.n_voxels)
-        if subject_data_obj.n_voxels != voxel_counts[subj]:
-            raise ValueError(
-                f"Subject {subj}: voxel count mismatch (data={subject_data_obj.n_voxels}, "
-                f"checkpoint={voxel_counts[subj]}). Re-run with the same ROI."
-            )
         pred_z, _ = predict_subject(model, ds, subj, device, args.batch_size, use_amp)
         pred_emb = denormalize(pred_z, target_means[subj], target_stds[subj])
         true_emb = ds.stack_targets_raw()

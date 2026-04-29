@@ -82,6 +82,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ba-dir", default=str(rse.LOCAL_DEFAULT_BA_DIR))
     p.add_argument("--roi", default="full_frontal",
                    help="Voxel set per subject. Same name applied to every subject.")
+    p.add_argument("--brain-pca", type=int, default=0,
+                   help="If >0, fit per-subject PCA on training z-scored voxels and feed PCs "
+                        "(post-PC z-score) to the subject-specific Linear instead of raw voxels. "
+                        "Reduces the per-subject input projection from ~25k*latent to "
+                        "n_components*latent params per subject.")
 
     p.add_argument("--feature-model", default="gtr-base", choices=list(EMBEDDING_MODELS.keys()))
     p.add_argument("--chunk-trs", type=int, default=5,
@@ -145,9 +150,10 @@ def build_default_tag(args: argparse.Namespace) -> str:
         loss_tag += f"-cw{args.clip_weight:g}-t{args.clip_temp:g}"
     elif args.loss == "mse_cosine":
         loss_tag += f"-w{args.cosine_weight:g}"
+    pca_tag = f"__brainpca{args.brain_pca}" if int(getattr(args, "brain_pca", 0) or 0) > 0 else ""
     return (
         f"mindeye_text__{args.feature_model}{norm_tag}__{subj_tag}__{args.roi}"
-        f"__latent{args.latent_dim}-blocks{args.n_blocks}__loss-{loss_tag}"
+        f"__latent{args.latent_dim}-blocks{args.n_blocks}{pca_tag}__loss-{loss_tag}"
         f"__lag{args.lag_trs}-chunk{args.chunk_trs}-off{args.brain_offset}__seed{args.seed}"
     )
 
@@ -268,11 +274,15 @@ def run() -> None:
             split="test",
         )
         log.info(
-            "[%s] train chunks=%d, test chunks=%d, voxels=%d",
+            "[%s] train chunks=%d, test chunks=%d, voxels=%d, feat_dim=%d%s",
             subj,
             len(train_datasets[subj]),
             len(test_datasets[subj]),
             sd.n_voxels,
+            sd.feat_dim,
+            f" (brain PCA, evr={sd.pca_explained_variance_ratio.sum():.3f})"
+            if sd.pca_components is not None and sd.pca_explained_variance_ratio is not None
+            else "",
         )
 
     train_loaders: Dict[str, DataLoader] = {}
@@ -298,9 +308,10 @@ def run() -> None:
         )
         val_indices_per_subject[subj] = val_idx
 
+    feat_dims = {subj: subject_data[subj].feat_dim for subj in args.subjects}
     voxel_counts = {subj: subject_data[subj].n_voxels for subj in args.subjects}
     model = MindEyeText(
-        voxel_counts=voxel_counts,
+        voxel_counts=feat_dims,
         embed_dim=embed_dim,
         latent_dim=args.latent_dim,
         n_blocks=args.n_blocks,
@@ -308,8 +319,10 @@ def run() -> None:
         head_norm=bool(args.head_norm),
     ).to(device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    log.info("Model: %.1fM trainable params (latent_dim=%d, blocks=%d)",
-             n_params / 1e6, args.latent_dim, args.n_blocks)
+    log.info(
+        "Model: %.1fM trainable params (feat_dims=%s, latent_dim=%d, blocks=%d)",
+        n_params / 1e6, feat_dims, args.latent_dim, args.n_blocks,
+    )
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
@@ -510,6 +523,12 @@ def run() -> None:
         "tag": tag,
         "embed_dim": embed_dim,
         "voxel_counts": {subj: int(sd.n_voxels) for subj, sd in subject_data.items()},
+        "feat_dims": {subj: int(sd.feat_dim) for subj, sd in subject_data.items()},
+        "brain_pca_explained_variance": {
+            subj: float(sd.pca_explained_variance_ratio.sum())
+            for subj, sd in subject_data.items()
+            if sd.pca_explained_variance_ratio is not None
+        },
         "train_stories": {subj: sd.train_stories for subj, sd in subject_data.items()},
         "test_stories": {subj: sd.test_stories for subj, sd in subject_data.items()},
         "embedding_cache": {subj: sd.embedding_cache for subj, sd in subject_data.items()},
@@ -529,6 +548,7 @@ def run() -> None:
     checkpoint = {
         "model_state_dict": {k: v for k, v in best_state.items()},
         "voxel_counts": voxel_counts,
+        "feat_dims": feat_dims,
         "embed_dim": int(embed_dim),
         "latent_dim": int(args.latent_dim),
         "n_blocks": int(args.n_blocks),
@@ -539,10 +559,18 @@ def run() -> None:
         "lag_trs": int(args.lag_trs),
         "brain_offset": int(args.brain_offset),
         "normalize_targets": bool(args.normalize_targets),
+        "brain_pca": int(getattr(args, "brain_pca", 0) or 0),
         "subjects": list(args.subjects),
         "voxels": {subj: subject_data[subj].voxels for subj in args.subjects},
         "voxel_mean": {subj: subject_data[subj].voxel_mean for subj in args.subjects},
         "voxel_std": {subj: subject_data[subj].voxel_std for subj in args.subjects},
+        "pca_components": {subj: subject_data[subj].pca_components for subj in args.subjects},
+        "pca_mean": {subj: subject_data[subj].pca_mean for subj in args.subjects},
+        "pc_mean": {subj: subject_data[subj].pc_mean for subj in args.subjects},
+        "pc_std": {subj: subject_data[subj].pc_std for subj in args.subjects},
+        "pca_explained_variance_ratio": {
+            subj: subject_data[subj].pca_explained_variance_ratio for subj in args.subjects
+        },
         "target_mean": {subj: target_means[subj] for subj in args.subjects},
         "target_std": {subj: target_stds[subj] for subj in args.subjects},
         "roi_name": {subj: subject_data[subj].roi_name for subj in args.subjects},

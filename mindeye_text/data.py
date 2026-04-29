@@ -39,7 +39,17 @@ log = logging.getLogger("mindeye_text.data")
 
 @dataclass
 class SubjectData:
-    """Everything we need to build train/val/test datasets for one subject."""
+    """Everything we need to build train/val/test datasets for one subject.
+
+    ``responses_train`` / ``responses_test`` are stored in **input-feature
+    space**: per-voxel z-scored when ``--brain-pca`` is off, otherwise PCA-
+    projected and per-PC z-scored. ``feat_dim`` is what the model's
+    subject-specific Linear sees.
+
+    The PCA basis (``pca_components``, ``pca_mean``, ``pc_mean``, ``pc_std``)
+    is kept on the dataclass and copied into the checkpoint so eval can
+    reproduce the same transform from raw voxels.
+    """
 
     subject: str
     roi_name: str
@@ -48,17 +58,28 @@ class SubjectData:
     voxel_std: np.ndarray  # (n_vox,) train z-score std
     train_stories: List[str]
     test_stories: List[str]
-    responses_train: Dict[str, np.ndarray]  # per-voxel z-scored, per story
+    responses_train: Dict[str, np.ndarray]  # per-story input features (post-PCA if enabled)
     responses_test: Dict[str, np.ndarray]
     embeddings_train: Dict[str, np.ndarray]  # raw text embeddings per chunk
     embeddings_test: Dict[str, np.ndarray]
     response_root: str
     embedding_dim: int
     embedding_cache: str
+    pca_components: np.ndarray | None = None  # (n_comp, n_vox) PCA basis
+    pca_mean: np.ndarray | None = None  # (n_vox,) per-feature mean stored by PCA
+    pc_mean: np.ndarray | None = None  # (n_comp,) post-PCA per-component mean
+    pc_std: np.ndarray | None = None  # (n_comp,) post-PCA per-component std
+    pca_explained_variance_ratio: np.ndarray | None = None
 
     @property
     def n_voxels(self) -> int:
         return int(self.voxels.shape[0])
+
+    @property
+    def feat_dim(self) -> int:
+        if self.pca_components is not None:
+            return int(self.pca_components.shape[0])
+        return self.n_voxels
 
 
 def _voxel_zscore(
@@ -123,6 +144,26 @@ def load_subject_data(args: argparse.Namespace, subject: str) -> SubjectData:
         raw_train, raw_test, train_stories, test_stories
     )
 
+    brain_pca_n = int(getattr(args, "brain_pca", 0) or 0)
+    pca_components = pca_mean = pc_mean = pc_std = None
+    pca_explained_variance_ratio = None
+    if brain_pca_n > 0:
+        train_z, test_z, (
+            pca_components,
+            pca_mean,
+            pc_mean,
+            pc_std,
+            pca_explained_variance_ratio,
+        ) = _fit_apply_brain_pca(
+            train_z,
+            test_z,
+            train_stories,
+            test_stories,
+            n_components=brain_pca_n,
+            seed=int(getattr(args, "seed", 0) or 0),
+            subject=subject,
+        )
+
     embeddings_by_story, emb_dim, cache_path = load_or_build_chunk_embeddings(
         args, stories, resp_lengths, response_root=response_root
     )
@@ -144,6 +185,71 @@ def load_subject_data(args: argparse.Namespace, subject: str) -> SubjectData:
         response_root=str(response_root),
         embedding_dim=int(emb_dim),
         embedding_cache=str(cache_path),
+        pca_components=pca_components,
+        pca_mean=pca_mean,
+        pc_mean=pc_mean,
+        pc_std=pc_std,
+        pca_explained_variance_ratio=pca_explained_variance_ratio,
+    )
+
+
+def _fit_apply_brain_pca(
+    train_z: Dict[str, np.ndarray],
+    test_z: Dict[str, np.ndarray],
+    train_stories: List[str],
+    test_stories: List[str],
+    n_components: int,
+    seed: int,
+    subject: str,
+) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray], Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+    """Fit PCA on training z-scored voxels, project + per-PC z-score everything.
+
+    Mirrors the per-subject pipeline used by ``27-04-expts/train_5tr_chunk_nn.py``
+    so cached projections / behaviour stay consistent across decoders.
+    """
+    from sklearn.decomposition import PCA
+
+    train_concat = np.vstack([train_z[s] for s in train_stories]).astype(np.float32)
+    n_comp = int(min(n_components, train_concat.shape[0] - 1, train_concat.shape[1]))
+    log.info(
+        "[%s] Brain PCA: %d voxels -> %d components",
+        subject, train_concat.shape[1], n_comp,
+    )
+    pca = PCA(n_components=n_comp, random_state=seed, svd_solver="randomized")
+    train_proj = pca.fit_transform(train_concat).astype(np.float32)
+    log.info(
+        "[%s]   explained variance ratio (sum)=%.3f",
+        subject, float(pca.explained_variance_ratio_.sum()),
+    )
+
+    pc_mean = train_proj.mean(axis=0).astype(np.float32)
+    pc_std = train_proj.std(axis=0).astype(np.float32)
+    pc_std[pc_std == 0] = 1.0
+
+    cursor = 0
+    train_out: Dict[str, np.ndarray] = {}
+    for story in train_stories:
+        n = train_z[story].shape[0]
+        block = train_proj[cursor : cursor + n]
+        train_out[story] = np.nan_to_num((block - pc_mean) / pc_std).astype(np.float32)
+        cursor += n
+    del train_proj, train_concat
+
+    test_out: Dict[str, np.ndarray] = {}
+    for story in test_stories:
+        proj = pca.transform(test_z[story]).astype(np.float32)
+        test_out[story] = np.nan_to_num((proj - pc_mean) / pc_std).astype(np.float32)
+
+    return (
+        train_out,
+        test_out,
+        (
+            pca.components_.astype(np.float32),
+            pca.mean_.astype(np.float32),
+            pc_mean,
+            pc_std,
+            pca.explained_variance_ratio_.astype(np.float32),
+        ),
     )
 
 

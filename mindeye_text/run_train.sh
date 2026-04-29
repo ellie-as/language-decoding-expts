@@ -21,6 +21,7 @@ FEATURE_MODEL=${FEATURE_MODEL:-"gtr-base"}
 LATENT=${LATENT:-4096}
 BLOCKS=${BLOCKS:-4}
 DROPOUT=${DROPOUT:-0.15}
+BRAIN_PCA=${BRAIN_PCA:-0}
 LOSS=${LOSS:-"mse_clip"}
 CLIP_WEIGHT=${CLIP_WEIGHT:-0.5}
 CLIP_TEMP=${CLIP_TEMP:-0.05}
@@ -44,6 +45,7 @@ python -u mindeye_text/train_mindeye_text.py \
   --latent-dim "${LATENT}" \
   --n-blocks "${BLOCKS}" \
   --dropout "${DROPOUT}" \
+  --brain-pca "${BRAIN_PCA}" \
   --loss "${LOSS}" \
   --clip-weight "${CLIP_WEIGHT}" \
   --clip-temp "${CLIP_TEMP}" \
