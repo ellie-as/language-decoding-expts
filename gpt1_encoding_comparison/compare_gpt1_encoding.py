@@ -244,7 +244,82 @@ def parse_args():
         "--output-dir",
         default=str(REPO_DIR / "gpt1_encoding_comparison" / "outputs"),
     )
+    parser.add_argument(
+        "--data-root",
+        default=None,
+        help=(
+            "Optional mounted project root containing data_train/, data_lm/, "
+            "data_test/, and models/. Use this when code is local but data are mounted."
+        ),
+    )
+    parser.add_argument(
+        "--local-compute-mode",
+        action="store_true",
+        help=(
+            "Read data from --mounted-project-root / --data-root but keep outputs "
+            "under this local repo."
+        ),
+    )
+    parser.add_argument(
+        "--mounted-project-root",
+        default="smb://ceph-gw02.hpc.swc.ucl.ac.uk/behrens/ellie/language-decoding-expts",
+        help=(
+            "Mounted project root used by --local-compute-mode. SMB URLs are "
+            "resolved to likely macOS /Volumes paths."
+        ),
+    )
     return parser.parse_args()
+
+
+def resolve_mounted_root(raw_root):
+    """Resolve a normal path or an SMB URL to a mounted local filesystem path."""
+    raw = str(raw_root)
+    if not raw.startswith("smb://"):
+        return Path(raw).expanduser().resolve()
+
+    without_scheme = raw[len("smb://"):]
+    parts = without_scheme.split("/")
+    if len(parts) < 2:
+        raise ValueError(f"Cannot parse SMB URL: {raw}")
+    share = parts[1]
+    tail = parts[2:]
+    candidates = [Path("/Volumes") / share / Path(*tail)]
+    if tail:
+        candidates.append(Path("/Volumes") / tail[0] / Path(*tail[1:]))
+        candidates.append(Path("/Volumes") / tail[-1])
+    candidates.append(Path(raw))
+
+    for candidate in candidates:
+        if candidate.is_dir():
+            return candidate.resolve()
+
+    formatted = "\n  ".join(str(candidate) for candidate in candidates)
+    raise FileNotFoundError(
+        "SMB URL is not mounted as a local path I can access.\n"
+        f"URL: {raw}\n"
+        "Tried:\n"
+        f"  {formatted}\n"
+        "Mount the share in Finder first, or pass --data-root with the actual "
+        "/Volumes/... path."
+    )
+
+
+def configure_data_root(data_root):
+    """Point decoding config at a mounted data mirror, if provided."""
+    if data_root is None:
+        return
+
+    root = resolve_mounted_root(data_root)
+    config.DATA_TRAIN_DIR = str(root / "data_train")
+    config.DATA_LM_DIR = str(root / "data_lm")
+    config.DATA_TEST_DIR = str(root / "data_test")
+    config.MODEL_DIR = str(root / "models")
+
+    print(f"Using mounted data root: {root}")
+    print(f"  DATA_TRAIN_DIR -> {config.DATA_TRAIN_DIR}")
+    print(f"  MODEL_DIR      -> {config.MODEL_DIR}")
+    print(f"  DATA_LM_DIR    -> {config.DATA_LM_DIR}")
+    print(f"  DATA_TEST_DIR  -> {config.DATA_TEST_DIR}")
 
 
 def load_stories(sessions):
@@ -302,6 +377,7 @@ def train_condition(subject, stories, condition, args, out_path):
     try:
         print(f"\n[{subject} / {condition}] extracting stimulus features")
         rstim, tr_stats, word_stats = get_stim(stories, features)
+        print(f"[{subject} / {condition}] loading fMRI responses")
         rresp = get_resp(subject, stories, stack=True)
         nchunks = int(np.ceil(rresp.shape[0] / 5 / config.CHUNKLEN))
 
@@ -427,6 +503,11 @@ def compare_results(results_by_condition):
 
 def main():
     args = parse_args()
+    data_root = args.data_root
+    if args.local_compute_mode and data_root is None:
+        data_root = args.mounted_project_root
+    configure_data_root(data_root)
+
     if args.pretrained_model != "openai-gpt":
         print(
             "Warning: --pretrained-model is not 'openai-gpt'. "

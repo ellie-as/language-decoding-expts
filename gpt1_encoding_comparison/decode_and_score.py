@@ -23,11 +23,13 @@ from pathlib import Path
 
 import h5py
 import numpy as np
+import torch
 
 REPO_DIR = Path(__file__).resolve().parents[1]
 THIS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(REPO_DIR / "decoding"))
 sys.path.insert(0, str(THIS_DIR))
+sys.path.insert(0, str(REPO_DIR / "mindeye_text"))
 
 import config  # noqa: E402
 from Decoder import Decoder, Hypothesis  # noqa: E402
@@ -41,11 +43,13 @@ from compare_gpt1_encoding import (  # noqa: E402
     HFOpenAIGPTFeatures,
     HuthFinetunedGPT1Features,
 )
+from model import MindEyeEncoding  # noqa: E402
 from utils_stim import predict_word_rate, predict_word_times  # noqa: E402
 from utils_ridge.textgrid import TextGrid  # noqa: E402
 
 
 CONDITION_PAPER = "paper"
+CONDITION_MINDEYE_ENCODING = "mindeye_encoding"
 DEFAULT_TASKS = ["wheretheressmoke"]
 BAD_WORDS_PERCEIVED_SPEECH = frozenset(["sentence_start", "sentence_end", "br", "lg", "ls", "ns", "sp"])
 BAD_WORDS_OTHER_TASKS = frozenset(["", "sp", "uh"])
@@ -60,7 +64,12 @@ def parse_args():
         "--conditions",
         nargs="+",
         default=[CONDITION_PAPER, CONDITION_FINETUNED, CONDITION_PRETRAINED],
-        choices=[CONDITION_PAPER, CONDITION_FINETUNED, CONDITION_PRETRAINED],
+        choices=[
+            CONDITION_PAPER,
+            CONDITION_FINETUNED,
+            CONDITION_PRETRAINED,
+            CONDITION_MINDEYE_ENCODING,
+        ],
     )
     parser.add_argument(
         "--trained-model-dir",
@@ -69,6 +78,11 @@ def parse_args():
     )
     parser.add_argument("--pretrained-model", default="openai-gpt")
     parser.add_argument("--finetuned-checkpoint", default="perceived")
+    parser.add_argument(
+        "--mindeye-encoding-checkpoint",
+        default=None,
+        help="Path to mindeye_text/train_mindeye_encoding.py model.pt.",
+    )
     parser.add_argument("--device", default=config.GPT_DEVICE)
     parser.add_argument("--beam-width", type=int, default=config.WIDTH)
     parser.add_argument("--pretrained-batch-size", type=int, default=64)
@@ -267,8 +281,53 @@ class BERTScoreMetric:
         return self.metric.score(cands=pred_strings, refs=ref_strings)[self.score_id].numpy()
 
 
+def torch_load_checkpoint(path, map_location="cpu"):
+    try:
+        return torch.load(path, map_location=map_location, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
+
+
+class NeuralEncodingModel:
+    """Decoder likelihood wrapper for MindEyeEncoding checkpoints."""
+
+    def __init__(self, checkpoint, subject, resp, device="cpu"):
+        if subject not in checkpoint["subjects"]:
+            raise KeyError(f"Subject {subject!r} not in neural checkpoint subjects={checkpoint['subjects']}")
+        self.subject = subject
+        self.device = device
+        self.voxels = np.asarray(checkpoint["voxels"][subject], dtype=np.int64)
+        self.resp = torch.from_numpy(resp[:, self.voxels]).float().to(device)
+        self.sigma = np.asarray(checkpoint["noise_model"][subject], dtype=np.float32)
+        self.model = MindEyeEncoding(
+            output_dims={str(k): int(v) for k, v in checkpoint["output_dims"].items()},
+            input_dim=int(checkpoint["input_dim"]),
+            latent_dim=int(checkpoint["latent_dim"]),
+            n_blocks=int(checkpoint["n_blocks"]),
+            dropout=float(checkpoint["dropout"]),
+            input_norm=bool(checkpoint.get("input_norm", True)),
+            head_norm=bool(checkpoint.get("head_norm", True)),
+        ).to(device)
+        self.model.load_state_dict(checkpoint["model_state_dict"])
+        self.model.eval()
+
+    def set_shrinkage(self, alpha):
+        precision = np.linalg.inv(self.sigma * (1 - alpha) + np.eye(len(self.sigma)) * alpha)
+        self.precision = torch.from_numpy(precision).float().to(self.device)
+
+    def prs(self, stim, trs):
+        with torch.no_grad():
+            stim_t = stim.float().to(self.device)
+            n_variants, n_trs, n_feats = stim_t.shape
+            flat = stim_t.reshape(n_variants * n_trs, n_feats)
+            pred = self.model(flat, self.subject).reshape(n_variants, n_trs, -1)
+            diff = pred - self.resp[trs]
+            multi = torch.matmul(torch.matmul(diff, self.precision), diff.permute(0, 2, 1))
+            return -0.5 * multi.diagonal(dim1=-2, dim2=-1).sum(dim=1).detach().cpu().numpy()
+
+
 def make_features(condition, args):
-    if condition in {CONDITION_PAPER, CONDITION_FINETUNED}:
+    if condition in {CONDITION_PAPER, CONDITION_FINETUNED, CONDITION_MINDEYE_ENCODING}:
         return HuthFinetunedGPT1Features(args.finetuned_checkpoint, args.device)
     if condition == CONDITION_PRETRAINED:
         return HFOpenAIGPTFeatures(args.pretrained_model, args.device, args.pretrained_batch_size)
@@ -279,6 +338,18 @@ def encoding_model_path(condition, subject, args):
     if condition == CONDITION_PAPER:
         return Path(config.MODEL_DIR) / subject / "encoding_model_perceived.npz"
     return Path(args.trained_model_dir).expanduser().resolve() / subject / f"encoding_model_{condition}.npz"
+
+
+def load_mindeye_encoding_checkpoint(args):
+    if not args.mindeye_encoding_checkpoint:
+        raise ValueError(
+            "--mindeye-encoding-checkpoint is required when using "
+            f"--conditions {CONDITION_MINDEYE_ENCODING}"
+        )
+    path = Path(args.mindeye_encoding_checkpoint).expanduser().resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"MindEye encoding checkpoint not found: {path}")
+    return torch_load_checkpoint(path, map_location="cpu")
 
 
 def load_test_response(subject, experiment, task):
@@ -335,28 +406,36 @@ def decode_one(condition, subject, experiment, task, args, huth_lm):
     word_times, tr_times = load_word_times(subject, experiment, task, resp)
     lanczos_mat = get_lanczos_mat(word_times, tr_times)
 
-    em_path = encoding_model_path(condition, subject, args)
-    if not em_path.exists():
-        raise FileNotFoundError(f"Encoding model not found: {em_path}")
-    em_data = np.load(em_path, allow_pickle=True)
-    if em_data["noise_model"].size == 0:
-        raise ValueError(
-            f"{em_path} has an empty noise_model. Rerun compare_gpt1_encoding.py "
-            "without --skip-noise-model before decoding."
-        )
-    if task in set(str(x) for x in em_data["stories"]):
-        raise ValueError(f"{task!r} appears in training stories for {em_path}")
+    if condition == CONDITION_MINDEYE_ENCODING:
+        em_data = load_mindeye_encoding_checkpoint(args)
+        if task in set(str(x) for x in em_data["stories"]):
+            raise ValueError(f"{task!r} appears in training stories for {args.mindeye_encoding_checkpoint}")
+    else:
+        em_path = encoding_model_path(condition, subject, args)
+        if not em_path.exists():
+            raise FileNotFoundError(f"Encoding model not found: {em_path}")
+        em_data = np.load(em_path, allow_pickle=True)
+        if em_data["noise_model"].size == 0:
+            raise ValueError(
+                f"{em_path} has an empty noise_model. Rerun compare_gpt1_encoding.py "
+                "without --skip-noise-model before decoding."
+            )
+        if task in set(str(x) for x in em_data["stories"]):
+            raise ValueError(f"{task!r} appears in training stories for {em_path}")
 
     features = make_features(condition, args)
     try:
         tr_stats, word_mean = load_stimulus_stats(em_data)
-        em = EncodingModel(
-            resp,
-            em_data["weights"],
-            em_data["voxels"],
-            em_data["noise_model"],
-            device=config.EM_DEVICE,
-        )
+        if condition == CONDITION_MINDEYE_ENCODING:
+            em = NeuralEncodingModel(em_data, subject, resp, device=config.EM_DEVICE)
+        else:
+            em = EncodingModel(
+                resp,
+                em_data["weights"],
+                em_data["voxels"],
+                em_data["noise_model"],
+                device=config.EM_DEVICE,
+            )
         em.set_shrinkage(config.NM_ALPHA)
         sm = StimulusModel(
             lanczos_mat,

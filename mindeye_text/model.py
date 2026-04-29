@@ -91,6 +91,64 @@ class MindEyeText(nn.Module):
         return self.decode(self.encode(x, subject))
 
 
+class MindEyeEncoding(nn.Module):
+    """Shared text-to-brain latent backbone plus subject-specific encoding heads.
+
+    This is the encoding-direction counterpart of :class:`MindEyeText`: text
+    features enter a shared projection/backbone, then each subject has a
+    private linear head into their selected voxel space.
+    """
+
+    def __init__(
+        self,
+        output_dims: Mapping[str, int],
+        input_dim: int,
+        latent_dim: int = 4096,
+        n_blocks: int = 4,
+        dropout: float = 0.15,
+        input_norm: bool = True,
+        head_norm: bool = True,
+    ) -> None:
+        super().__init__()
+        if not output_dims:
+            raise ValueError("output_dims must be a non-empty {subject: n_outputs} mapping.")
+        self.subjects = list(output_dims.keys())
+        self.output_dims = {str(k): int(v) for k, v in output_dims.items()}
+        self.input_dim = int(input_dim)
+        self.latent_dim = int(latent_dim)
+        self.n_blocks = int(n_blocks)
+        self.dropout = float(dropout)
+
+        input_layers: list[nn.Module] = []
+        if input_norm:
+            input_layers.append(nn.LayerNorm(self.input_dim))
+        input_layers.append(nn.Linear(self.input_dim, self.latent_dim))
+        self.text_proj = nn.Sequential(*input_layers)
+        self.backbone = nn.Sequential(
+            *[ResidualBlock(self.latent_dim, self.dropout) for _ in range(self.n_blocks)]
+        )
+        self.head_norm = nn.LayerNorm(self.latent_dim) if head_norm else nn.Identity()
+        self.subject_heads = nn.ModuleDict(
+            {
+                str(subj): nn.Linear(self.latent_dim, int(n_outputs))
+                for subj, n_outputs in output_dims.items()
+            }
+        )
+
+    def encode_text(self, x: torch.Tensor) -> torch.Tensor:
+        """Project delayed text features into the shared brain latent space."""
+        return self.backbone(self.text_proj(x))
+
+    def predict_from_latent(self, latent: torch.Tensor, subject: str) -> torch.Tensor:
+        """Run a subject-specific encoding head on shared latents."""
+        if subject not in self.subject_heads:
+            raise KeyError(f"Unknown subject {subject!r}; have {list(self.subject_heads)}")
+        return self.subject_heads[subject](self.head_norm(latent))
+
+    def forward(self, x: torch.Tensor, subject: str) -> torch.Tensor:
+        return self.predict_from_latent(self.encode_text(x), subject)
+
+
 def info_nce_clip(
     pred: torch.Tensor,
     target: torch.Tensor,

@@ -87,6 +87,19 @@ def parse_args() -> argparse.Namespace:
                         "(post-PC z-score) to the subject-specific Linear instead of raw voxels. "
                         "Reduces the per-subject input projection from ~25k*latent to "
                         "n_components*latent params per subject.")
+    p.add_argument("--voxel-select-encoding-corrs", default=None,
+                   help="Optional path template (e.g. "
+                        "'27-04-expts/results/{subject}/encoding_summary.npz') to a per-subject "
+                        "encoding-correlation file produced by run_context_encoding.py. "
+                        "Voxels in --roi are filtered to the most language-selective ones by held-out "
+                        "encoding r. Supports .npz (with 'corrs' + 'voxels' keys) or .npy "
+                        "(full-brain length, NaN outside encoding ROI).")
+    p.add_argument("--voxel-select-top-k", type=int, default=0,
+                   help="Keep top-K voxels by encoding r (after intersecting with --roi). "
+                        "Set to 0 to disable. Use with --voxel-select-encoding-corrs.")
+    p.add_argument("--voxel-select-thresh", type=float, default=float("nan"),
+                   help="Keep voxels with encoding r >= threshold (after intersecting with --roi). "
+                        "NaN to disable. Combine with --voxel-select-top-k by intersection.")
 
     p.add_argument("--feature-model", default="gtr-base", choices=list(EMBEDDING_MODELS.keys()))
     p.add_argument("--chunk-trs", type=int, default=5,
@@ -94,8 +107,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lag-trs", type=int, default=3,
                    help="HRF lag in TRs from text-window start to brain TR.")
     p.add_argument("--brain-offset", type=int, default=0,
-                   help="Index within the [i+lag, i+lag+chunk_trs) window for the input TR. "
-                        "0 = first TR (matches lag), chunk_trs//2 = middle TR.")
+                   help="Single-TR input: index within [i+lag, i+lag+chunk_trs) for the input TR. "
+                        "0 = first TR (matches lag), chunk_trs//2 = middle TR. "
+                        "Ignored if --brain-offsets is provided.")
+    p.add_argument("--brain-offsets", type=int, nargs="+", default=None,
+                   help="Multi-TR input: stack brain features at TRs [i+lag+o for o in offsets]. "
+                        "Concatenated along the feature axis BEFORE the subject-specific Linear, so "
+                        "feat_dim into the model becomes (n_voxels-or-PCA) x len(offsets). "
+                        "Single-TR (default) uses --brain-offset only. "
+                        "Common multi-TR choice for chunk_trs=5: --brain-offsets 0 1 2 3 4.")
     p.add_argument("--normalize-targets", action="store_true",
                    help="L2-normalize raw embedding targets before per-dim z-score (matches GTR usage).")
     p.add_argument("--shared-target-stats", action=argparse.BooleanOptionalAction, default=True,
@@ -154,10 +174,21 @@ def build_default_tag(args: argparse.Namespace) -> str:
     elif args.loss == "mse_cosine":
         loss_tag += f"-w{args.cosine_weight:g}"
     pca_tag = f"__brainpca{args.brain_pca}" if int(getattr(args, "brain_pca", 0) or 0) > 0 else ""
+    if args.brain_offsets is not None:
+        offs = list(args.brain_offsets)
+        off_tag = f"off{'-'.join(str(int(o)) for o in offs)}"
+    else:
+        off_tag = f"off{int(args.brain_offset)}"
+    sel_tag = ""
+    if getattr(args, "voxel_select_encoding_corrs", None):
+        if int(getattr(args, "voxel_select_top_k", 0) or 0) > 0:
+            sel_tag = f"__encselTop{int(args.voxel_select_top_k)}"
+        elif args.voxel_select_thresh == args.voxel_select_thresh:
+            sel_tag = f"__encselR{float(args.voxel_select_thresh):g}"
     return (
-        f"mindeye_text__{args.feature_model}{norm_tag}__{subj_tag}__{args.roi}"
+        f"mindeye_text__{args.feature_model}{norm_tag}__{subj_tag}__{args.roi}{sel_tag}"
         f"__latent{args.latent_dim}-blocks{args.n_blocks}{pca_tag}__loss-{loss_tag}"
-        f"__lag{args.lag_trs}-chunk{args.chunk_trs}-off{args.brain_offset}__seed{args.seed}"
+        f"__lag{args.lag_trs}-chunk{args.chunk_trs}-{off_tag}__seed{args.seed}"
     )
 
 
@@ -259,6 +290,16 @@ def run() -> None:
         shared=bool(args.shared_target_stats),
     )
 
+    if args.brain_offsets is not None:
+        brain_offsets = list(args.brain_offsets)
+    else:
+        brain_offsets = [int(args.brain_offset)]
+    n_offsets = len(brain_offsets)
+    log.info(
+        "Brain input window: %d TR(s) at offsets %s (lag=%d, chunk=%d)",
+        n_offsets, brain_offsets, args.lag_trs, args.chunk_trs,
+    )
+
     train_datasets: Dict[str, SingleTRChunkDataset] = {}
     test_datasets: Dict[str, SingleTRChunkDataset] = {}
     for subj, sd in subject_data.items():
@@ -266,7 +307,7 @@ def run() -> None:
             sd,
             chunk_trs=args.chunk_trs,
             lag_trs=args.lag_trs,
-            brain_offset=args.brain_offset,
+            brain_offsets=brain_offsets,
             target_mean=target_means[subj],
             target_std=target_stds[subj],
             normalize_targets=bool(args.normalize_targets),
@@ -276,19 +317,21 @@ def run() -> None:
             sd,
             chunk_trs=args.chunk_trs,
             lag_trs=args.lag_trs,
-            brain_offset=args.brain_offset,
+            brain_offsets=brain_offsets,
             target_mean=target_means[subj],
             target_std=target_stds[subj],
             normalize_targets=bool(args.normalize_targets),
             split="test",
         )
         log.info(
-            "[%s] train chunks=%d, test chunks=%d, voxels=%d, feat_dim=%d%s",
+            "[%s] train chunks=%d, test chunks=%d, voxels=%d, per-TR feat=%d, "
+            "stacked feat_dim=%d%s",
             subj,
             len(train_datasets[subj]),
             len(test_datasets[subj]),
             sd.n_voxels,
             sd.feat_dim,
+            sd.feat_dim * n_offsets,
             f" (brain PCA, evr={sd.pca_explained_variance_ratio.sum():.3f})"
             if sd.pca_components is not None and sd.pca_explained_variance_ratio is not None
             else "",
@@ -317,7 +360,8 @@ def run() -> None:
         )
         val_indices_per_subject[subj] = val_idx
 
-    feat_dims = {subj: subject_data[subj].feat_dim for subj in args.subjects}
+    per_tr_feat_dims = {subj: subject_data[subj].feat_dim for subj in args.subjects}
+    feat_dims = {subj: per_tr_feat_dims[subj] * n_offsets for subj in args.subjects}
     voxel_counts = {subj: subject_data[subj].n_voxels for subj in args.subjects}
     model = MindEyeText(
         voxel_counts=feat_dims,
@@ -329,8 +373,8 @@ def run() -> None:
     ).to(device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     log.info(
-        "Model: %.1fM trainable params (feat_dims=%s, latent_dim=%d, blocks=%d)",
-        n_params / 1e6, feat_dims, args.latent_dim, args.n_blocks,
+        "Model: %.1fM trainable params (feat_dims=%s, latent_dim=%d, blocks=%d, brain_offsets=%s)",
+        n_params / 1e6, feat_dims, args.latent_dim, args.n_blocks, brain_offsets,
     )
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -542,7 +586,13 @@ def run() -> None:
         "tag": tag,
         "embed_dim": embed_dim,
         "voxel_counts": {subj: int(sd.n_voxels) for subj, sd in subject_data.items()},
-        "feat_dims": {subj: int(sd.feat_dim) for subj, sd in subject_data.items()},
+        "per_tr_feat_dims": {subj: int(sd.feat_dim) for subj, sd in subject_data.items()},
+        "feat_dims": {subj: int(sd.feat_dim) * n_offsets for subj, sd in subject_data.items()},
+        "brain_offsets": [int(o) for o in brain_offsets],
+        "voxel_select_info": {
+            subj: sd.voxel_select_info for subj, sd in subject_data.items()
+            if sd.voxel_select_info is not None
+        },
         "brain_pca_explained_variance": {
             subj: float(sd.pca_explained_variance_ratio.sum())
             for subj, sd in subject_data.items()
@@ -577,6 +627,7 @@ def run() -> None:
         "chunk_trs": int(args.chunk_trs),
         "lag_trs": int(args.lag_trs),
         "brain_offset": int(args.brain_offset),
+        "brain_offsets": [int(o) for o in brain_offsets],
         "normalize_targets": bool(args.normalize_targets),
         "brain_pca": int(getattr(args, "brain_pca", 0) or 0),
         "subjects": list(args.subjects),

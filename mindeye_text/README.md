@@ -37,6 +37,10 @@ the defaults (`--lag-trs 3 --chunk-trs 5 --brain-offset 0`) that's brain TR
 - `train_mindeye_text.py` - the training entry point. Pools batches across
   every selected subject in each step so the InfoNCE term sees cross-subject
   negatives.
+- `train_mindeye_encoding.py` - the encoding-direction counterpart: Huth-style
+  delayed GPT-1 text features pass through a shared text-to-brain latent
+  backbone, then subject-specific voxel heads predict each subject's selected
+  decoding voxels.
 - `eval_mindeye_text.py` - load a saved `model.pt`, recompute per-subject and
   pooled retrieval / cosine / dim-r metrics on the held-out test stories.
 - `run_train.sh` - example launch script for an A100 cluster job.
@@ -88,6 +92,37 @@ unless `--tag` is set) contains:
   `pred_emb__<subj> / true_emb__<subj>` for downstream analyses
   (e.g. running `27-04-expts/invert_last20words_predictions.py` style
   inversion against these predictions).
+
+## MindEye-Style Encoding
+
+To train the same shared-latent idea in the encoding direction:
+
+```bash
+python -u mindeye_text/train_mindeye_encoding.py \
+  --subjects S1 S2 S3 \
+  --latent-dim 4096 --n-blocks 4 --dropout 0.15 \
+  --lr 3e-4 --weight-decay 1e-2 \
+  --batch-size 512 --max-epochs 80 --patience 12 \
+  --torch-device cuda
+```
+
+This uses the same Huth text window as the ridge encoders: finetuned GPT-1
+layer 9, current word plus `config.GPT_WORDS` previous words, then the standard
+TR interpolation and FIR delays from `utils_stim.get_stim`. The model predicts
+the paper-selected decoding voxels for each subject through subject-specific
+heads and writes `mindeye_text/encoding_results/<tag>/model.pt`.
+
+After training, evaluate decoded story similarity with the same decoding test:
+
+```bash
+python gpt1_encoding_comparison/decode_and_score.py \
+  --subject S1 \
+  --experiment perceived_speech \
+  --tasks wheretheressmoke \
+  --conditions paper finetuned pretrained mindeye_encoding \
+  --mindeye-encoding-checkpoint mindeye_text/encoding_results/<tag>/model.pt \
+  --n-null 10
+```
 
 ## Running held-out evaluation
 

@@ -22,6 +22,12 @@ LATENT=${LATENT:-4096}
 BLOCKS=${BLOCKS:-4}
 DROPOUT=${DROPOUT:-0.15}
 BRAIN_PCA=${BRAIN_PCA:-0}
+# Encoding-r-based voxel selection (Tang/Huth-style "language-selective" voxels).
+# Provide a per-subject path template (use literal '{subject}'). Empty = disabled.
+# Example: VOXEL_SELECT_CORRS="27-04-expts/results/{subject}/encoding/summary.npz"
+VOXEL_SELECT_CORRS=${VOXEL_SELECT_CORRS:-""}
+VOXEL_SELECT_TOPK=${VOXEL_SELECT_TOPK:-0}
+VOXEL_SELECT_THRESH=${VOXEL_SELECT_THRESH:-""}
 LOSS=${LOSS:-"mse_clip"}
 CLIP_WEIGHT=${CLIP_WEIGHT:-0.5}
 CLIP_TEMP=${CLIP_TEMP:-0.05}
@@ -34,6 +40,9 @@ PATIENCE=${PATIENCE:-30}
 LAG=${LAG:-3}
 CHUNK=${CHUNK:-5}
 BRAIN_OFFSET=${BRAIN_OFFSET:-0}
+# Multi-TR brain input: space-separated list of offsets (relative to lag).
+# Empty (default) -> single TR at BRAIN_OFFSET.  Example: BRAIN_OFFSETS="0 1 2 3 4"
+BRAIN_OFFSETS=${BRAIN_OFFSETS:-""}
 SEED=${SEED:-0}
 OUT=${OUT:-"mindeye_text/results"}
 
@@ -47,6 +56,9 @@ python -u mindeye_text/train_mindeye_text.py \
   --n-blocks "${BLOCKS}" \
   --dropout "${DROPOUT}" \
   --brain-pca "${BRAIN_PCA}" \
+  $([ -n "${VOXEL_SELECT_CORRS}" ] && echo "--voxel-select-encoding-corrs ${VOXEL_SELECT_CORRS}") \
+  $([ "${VOXEL_SELECT_TOPK}" -gt 0 ] 2>/dev/null && echo "--voxel-select-top-k ${VOXEL_SELECT_TOPK}") \
+  $([ -n "${VOXEL_SELECT_THRESH}" ] && echo "--voxel-select-thresh ${VOXEL_SELECT_THRESH}") \
   --loss "${LOSS}" \
   --clip-weight "${CLIP_WEIGHT}" \
   --clip-temp "${CLIP_TEMP}" \
@@ -59,6 +71,7 @@ python -u mindeye_text/train_mindeye_text.py \
   --lag-trs "${LAG}" \
   --chunk-trs "${CHUNK}" \
   --brain-offset "${BRAIN_OFFSET}" \
+  $([ -n "${BRAIN_OFFSETS}" ] && echo "--brain-offsets ${BRAIN_OFFSETS}") \
   --torch-device cuda \
   --output-dir "${OUT}" \
   --seed "${SEED}" \

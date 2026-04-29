@@ -21,7 +21,7 @@ import pickle
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Mapping, Optional, Tuple
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -73,6 +73,7 @@ class SubjectData:
     pc_mean: np.ndarray | None = None  # (n_comp,) post-PCA per-component mean
     pc_std: np.ndarray | None = None  # (n_comp,) post-PCA per-component std
     pca_explained_variance_ratio: np.ndarray | None = None
+    voxel_select_info: dict | None = None  # provenance of encoding-r-based selection
 
     @property
     def n_voxels(self) -> int:
@@ -141,6 +142,10 @@ def load_subject_data(args: argparse.Namespace, subject: str) -> SubjectData:
     roi_name, vox = resolve_roi(args, total_voxels)
     log.info("[%s] ROI %s: %d voxels", subject, roi_name, len(vox))
 
+    vox, voxel_select_info = _apply_encoding_voxel_selection(
+        args=args, subject=subject, vox=vox, total_voxels=total_voxels,
+    )
+
     raw_train = load_responses_by_story(train_stories, subject, vox, response_root)
     raw_test = load_responses_by_story(test_stories, subject, vox, response_root)
     train_z, test_z, vox_mean, vox_std = _voxel_zscore(
@@ -196,7 +201,124 @@ def load_subject_data(args: argparse.Namespace, subject: str) -> SubjectData:
         pc_mean=pc_mean,
         pc_std=pc_std,
         pca_explained_variance_ratio=pca_explained_variance_ratio,
+        voxel_select_info=voxel_select_info,
     )
+
+
+def _load_full_brain_corrs(path: Path, total_voxels: int) -> np.ndarray:
+    """Load a per-voxel encoding correlation array, broadcast to full-brain length.
+
+    Two file formats are supported:
+      * ``.npy``  : a 1-D array of length ``total_voxels`` (one correlation
+        per full-brain voxel; voxels not in the encoding ROI should be ``nan``
+        or ``-inf`` so they sort to the bottom).
+      * ``.npz``  : a dict with ``corrs`` (length ``len(voxels)``) and
+        ``voxels`` (full-brain voxel indices). This is the
+        ``run_context_encoding.py`` output format.
+    """
+    if path.suffix == ".npy":
+        arr = np.load(path).astype(np.float32)
+        if arr.shape != (total_voxels,):
+            raise ValueError(
+                f"{path}: expected shape ({total_voxels},), got {arr.shape}. "
+                f"Pad with NaN for voxels outside the encoding ROI."
+            )
+        return arr
+    if path.suffix == ".npz":
+        with np.load(path, allow_pickle=False) as z:
+            if "corrs" not in z or "voxels" not in z:
+                raise ValueError(f"{path}: expected keys 'corrs' and 'voxels' in npz")
+            corrs = np.asarray(z["corrs"], dtype=np.float32)
+            voxels = np.asarray(z["voxels"], dtype=np.int64)
+        full = np.full(total_voxels, np.nan, dtype=np.float32)
+        if corrs.shape[0] != voxels.shape[0]:
+            raise ValueError(
+                f"{path}: corrs (len {corrs.shape[0]}) and voxels "
+                f"(len {voxels.shape[0]}) must match"
+            )
+        in_range = (voxels >= 0) & (voxels < total_voxels)
+        full[voxels[in_range]] = corrs[in_range]
+        return full
+    raise ValueError(
+        f"{path}: unsupported extension '{path.suffix}' (use .npy or .npz)"
+    )
+
+
+def _apply_encoding_voxel_selection(
+    args: argparse.Namespace,
+    subject: str,
+    vox: np.ndarray,
+    total_voxels: int,
+) -> Tuple[np.ndarray, Optional[dict]]:
+    """Filter ``vox`` to the most language-selective voxels in the ROI.
+
+    Activated when ``--voxel-select-encoding-corrs`` (a per-subject path
+    template, e.g. ``"my_corrs/{subject}/encoding.npz"``) is provided. The
+    encoding correlation file gives per-voxel held-out correlation r between
+    a forward encoding model's prediction and the actual BOLD; we keep the
+    top-K (or threshold-passing) voxels that are *also* in ``vox``.
+
+    Returns ``(vox_selected, info_dict_or_None)``.
+    """
+    template = getattr(args, "voxel_select_encoding_corrs", None)
+    top_k = int(getattr(args, "voxel_select_top_k", 0) or 0)
+    thresh = float(getattr(args, "voxel_select_thresh", float("nan")) or float("nan"))
+    if not template:
+        return vox, None
+    if top_k <= 0 and (thresh != thresh):  # both unset
+        raise ValueError(
+            "--voxel-select-encoding-corrs given but neither "
+            "--voxel-select-top-k nor --voxel-select-thresh was specified."
+        )
+    path = Path(str(template).format(subject=subject)).expanduser()
+    if not path.is_file():
+        raise FileNotFoundError(f"Voxel-selection corr file not found: {path}")
+
+    full_corrs = _load_full_brain_corrs(path, total_voxels)
+    roi_corrs = full_corrs[vox]   # corrs aligned to current ROI voxel order
+    valid = np.isfinite(roi_corrs)
+    if not valid.any():
+        raise ValueError(
+            f"[{subject}] no voxels in ROI have finite encoding-r in {path}"
+        )
+
+    keep = valid.copy()
+    if thresh == thresh:   # not NaN
+        keep &= roi_corrs >= thresh
+    if top_k > 0:
+        # Rank only valid voxels; nans get -inf so they never make the cut.
+        rank_corrs = np.where(valid, roi_corrs, -np.inf)
+        order = np.argsort(-rank_corrs)
+        keep_top = np.zeros_like(keep)
+        keep_top[order[:top_k]] = True
+        keep &= keep_top
+
+    if keep.sum() == 0:
+        raise ValueError(
+            f"[{subject}] voxel selection (top_k={top_k}, thresh={thresh}) "
+            f"removed all voxels — relax the criterion."
+        )
+
+    selected_vox = vox[keep]
+    selected_corrs = roi_corrs[keep]
+    log.info(
+        "[%s] Voxel selection (encoding-r): kept %d / %d voxels "
+        "(min r=%.3f, mean r=%.3f, max r=%.3f) — %s",
+        subject, int(selected_vox.shape[0]), int(vox.shape[0]),
+        float(selected_corrs.min()), float(selected_corrs.mean()),
+        float(selected_corrs.max()), path,
+    )
+    info = {
+        "source": str(path),
+        "top_k": top_k,
+        "thresh": thresh if thresh == thresh else None,
+        "kept": int(selected_vox.shape[0]),
+        "from_roi": int(vox.shape[0]),
+        "min_r": float(selected_corrs.min()),
+        "mean_r": float(selected_corrs.mean()),
+        "max_r": float(selected_corrs.max()),
+    }
+    return selected_vox, info
 
 
 def _brain_pca_cache_key(
@@ -407,11 +529,17 @@ def compute_target_stats(
 class SingleTRChunkDataset(Dataset):
     """Maps chunk index ``i`` to a single-TR brain input and a 5-TR text target.
 
-    For each chunk:
-      ``input  = responses[i + lag_trs + brain_offset]`` (shape ``(n_vox,)``)
+    For each chunk and each offset ``o`` in ``brain_offsets``:
+      ``part_o = responses[i + lag_trs + o]`` (shape ``(n_vox,)``)
+    The brain input is the concatenation of all ``part_o`` along the feature
+    axis (shape ``(len(brain_offsets) * n_vox,)``).
+
       ``target = (embeddings[i] - target_mean) / target_std`` (shape ``(emb_dim,)``)
 
     Embeddings are L2-normalized first when ``normalize_targets`` is True.
+
+    The legacy ``brain_offset: int`` argument is still accepted for
+    back-compat and is equivalent to ``brain_offsets=[brain_offset]``.
     """
 
     def __init__(
@@ -421,35 +549,51 @@ class SingleTRChunkDataset(Dataset):
         stories: List[str],
         chunk_trs: int,
         lag_trs: int,
-        brain_offset: int,
         target_mean: np.ndarray,
         target_std: np.ndarray,
         normalize_targets: bool,
+        brain_offset: Optional[int] = None,
+        brain_offsets: Optional[Sequence[int]] = None,
     ) -> None:
         self.stories = list(stories)
         self.responses = [responses_by_story[s] for s in self.stories]
         self.embeddings = [embeddings_by_story[s] for s in self.stories]
         self.chunk_trs = int(chunk_trs)
         self.lag_trs = int(lag_trs)
-        self.brain_offset = int(brain_offset)
-        if not (0 <= self.brain_offset < self.chunk_trs):
+
+        if brain_offsets is None:
+            if brain_offset is None:
+                raise ValueError("Provide either brain_offset (int) or brain_offsets (list)")
+            offsets = [int(brain_offset)]
+        else:
+            offsets = [int(o) for o in brain_offsets]
+            if not offsets:
+                raise ValueError("brain_offsets must be non-empty")
+        self.brain_offsets = np.asarray(offsets, dtype=np.int64)
+        # Keep ``self.brain_offset`` as a friendly handle to the first offset.
+        self.brain_offset = int(self.brain_offsets[0])
+        # Permit offsets outside [0, chunk_trs) so users can extend the brain
+        # window beyond a single chunk. We only require non-negative offsets.
+        if int(self.brain_offsets.min()) < 0:
             raise ValueError(
-                f"brain_offset {self.brain_offset} must lie in [0, chunk_trs={self.chunk_trs})"
+                f"brain_offsets must be non-negative, got {self.brain_offsets.tolist()}"
             )
+
         self.target_mean = target_mean.astype(np.float32)
         self.target_std = target_std.astype(np.float32)
         self.normalize_targets = bool(normalize_targets)
 
         story_ids: List[int] = []
         starts: List[int] = []
+        max_offset = int(self.brain_offsets.max())
         for story_idx, (y_story, resp) in enumerate(zip(self.embeddings, self.responses)):
             n_chunks = int(y_story.shape[0])
-            need_rows = n_chunks + self.lag_trs + self.chunk_trs - 1
+            need_rows = n_chunks + self.lag_trs + max(self.chunk_trs - 1, max_offset)
             if resp.shape[0] < need_rows:
                 raise ValueError(
                     f"{self.stories[story_idx]}: response has {resp.shape[0]} TRs, "
                     f"need at least {need_rows} for chunk_trs={self.chunk_trs}, "
-                    f"lag_trs={self.lag_trs}"
+                    f"lag_trs={self.lag_trs}, max(brain_offsets)={max_offset}"
                 )
             story_ids.extend([story_idx] * n_chunks)
             starts.extend(range(n_chunks))
@@ -463,7 +607,14 @@ class SingleTRChunkDataset(Dataset):
         """Return ``(brain_features, target_embedding, story_name)``."""
         story_idx = int(self.story_ids[idx])
         i = int(self.starts[idx])
-        x = self.responses[story_idx][i + self.lag_trs + self.brain_offset]
+        resp = self.responses[story_idx]
+        if self.brain_offsets.shape[0] == 1:
+            x = resp[i + self.lag_trs + int(self.brain_offsets[0])]
+        else:
+            x = np.concatenate(
+                [resp[i + self.lag_trs + int(o)] for o in self.brain_offsets],
+                axis=-1,
+            )
         y = self.embeddings[story_idx][i].astype(np.float32)
         if self.normalize_targets:
             n = float(np.linalg.norm(y))
@@ -491,11 +642,12 @@ def make_subject_dataset(
     subject_data: SubjectData,
     chunk_trs: int,
     lag_trs: int,
-    brain_offset: int,
     target_mean: np.ndarray,
     target_std: np.ndarray,
     normalize_targets: bool,
     split: str,
+    brain_offset: Optional[int] = None,
+    brain_offsets: Optional[Sequence[int]] = None,
 ) -> SingleTRChunkDataset:
     """Build a :class:`SingleTRChunkDataset` for a subject's train or test split."""
     if split == "train":
@@ -515,6 +667,7 @@ def make_subject_dataset(
         chunk_trs=chunk_trs,
         lag_trs=lag_trs,
         brain_offset=brain_offset,
+        brain_offsets=brain_offsets,
         target_mean=target_mean,
         target_std=target_std,
         normalize_targets=normalize_targets,

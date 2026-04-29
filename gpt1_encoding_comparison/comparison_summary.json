@@ -1,0 +1,29 @@
+{
+  "comparison": {
+    "max_corr_delta_pretrained_minus_finetuned": 0.000770635066362213,
+    "mean_corr_delta_pretrained_minus_finetuned": -0.00023436542526755928,
+    "per_voxel_bootstrap_corr_map_correlation": 0.9988162472917032,
+    "selected_voxel_overlap": 9727,
+    "selected_voxel_overlap_fraction_of_finetuned": 0.9727
+  },
+  "finetuned": {
+    "condition": "finetuned",
+    "hidden_size": 768,
+    "max_bootstrap_corr": 0.20411783088158234,
+    "mean_bootstrap_corr": 0.005507909101662582,
+    "median_bootstrap_corr": 0.0011422778447901427,
+    "model_name": "perceived",
+    "n_corr_gt_0_1": 139,
+    "path": "/ceph/behrens/ellie/language-decoding-expts/gpt1_encoding_comparison/outputs/S1/encoding_model_finetuned.npz"
+  },
+  "pretrained": {
+    "condition": "pretrained",
+    "hidden_size": 768,
+    "max_bootstrap_corr": 0.20488846594794455,
+    "mean_bootstrap_corr": 0.005273543676395023,
+    "median_bootstrap_corr": 0.0010165865895562808,
+    "model_name": "openai-gpt",
+    "n_corr_gt_0_1": 127,
+    "path": "/ceph/behrens/ellie/language-decoding-expts/gpt1_encoding_comparison/outputs/S1/encoding_model_pretrained.npz"
+  }
+}

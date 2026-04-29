@@ -169,6 +169,13 @@ def main() -> None:
     if missing:
         raise ValueError(f"Checkpoint has no projection for subjects: {missing}")
 
+    brain_offsets = ckpt.get("brain_offsets")
+    if brain_offsets is None:
+        brain_offsets = [int(ckpt.get("brain_offset", 0))]
+    brain_offsets = [int(o) for o in brain_offsets]
+    n_offsets = len(brain_offsets)
+    log.info("Brain offsets (from checkpoint): %s", brain_offsets)
+
     device = resolve_torch_device(args.torch_device)
     use_amp = bool(args.amp) and device.type == "cuda"
     log.info("Device: %s | AMP: %s", device, "bf16" if use_amp else "off")
@@ -204,26 +211,39 @@ def main() -> None:
         if subject_data_obj.n_voxels != voxel_counts[subj]:
             raise ValueError(
                 f"Subject {subj}: voxel count mismatch (data={subject_data_obj.n_voxels}, "
-                f"checkpoint={voxel_counts[subj]}). Re-run with the same ROI."
+                f"checkpoint={voxel_counts[subj]}). Re-run with the same ROI / "
+                f"--voxel-select-* settings."
             )
+        ckpt_vox = ckpt.get("voxels", {}).get(subj)
+        if ckpt_vox is not None:
+            saved = np.asarray(ckpt_vox, dtype=np.int64)
+            current = np.asarray(subject_data_obj.voxels, dtype=np.int64)
+            if not np.array_equal(saved, current):
+                raise ValueError(
+                    f"Subject {subj}: voxel indices differ from checkpoint. "
+                    f"This usually means the encoding-r selection file moved "
+                    f"or changed. Re-train, or pass the original file path."
+                )
 
         if ckpt_brain_pca > 0:
             _apply_saved_pca_inplace(subject_data_obj, ckpt, subj)
             log.info(
-                "[%s] applied saved brain PCA from checkpoint -> feat_dim=%d",
+                "[%s] applied saved brain PCA from checkpoint -> per-TR feat=%d",
                 subj, subject_data_obj.feat_dim,
             )
-        if subject_data_obj.feat_dim != feat_dims[subj]:
+        expected_per_tr = feat_dims[subj] // n_offsets
+        if subject_data_obj.feat_dim != expected_per_tr:
             raise ValueError(
-                f"Subject {subj}: feat_dim mismatch (data={subject_data_obj.feat_dim}, "
-                f"checkpoint={feat_dims[subj]}). Re-train with consistent --brain-pca."
+                f"Subject {subj}: per-TR feat_dim mismatch (data={subject_data_obj.feat_dim}, "
+                f"expected per-TR={expected_per_tr}, checkpoint stacked={feat_dims[subj]}, "
+                f"n_offsets={n_offsets}). Re-train with consistent --brain-pca / --brain-offsets."
             )
 
         ds = make_subject_dataset(
             subject_data_obj,
             chunk_trs=int(ckpt["chunk_trs"]),
             lag_trs=int(ckpt["lag_trs"]),
-            brain_offset=int(ckpt["brain_offset"]),
+            brain_offsets=brain_offsets,
             target_mean=target_means[subj],
             target_std=target_stds[subj],
             normalize_targets=bool(ckpt.get("normalize_targets", False)),
