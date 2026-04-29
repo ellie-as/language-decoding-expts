@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import argparse
 import logging
-import sys
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,20 +24,13 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-REPO_DIR = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(REPO_DIR))
-sys.path.insert(0, str(REPO_DIR / "decoding"))
-sys.path.insert(0, str(REPO_DIR / "27-04-expts"))
-
-import run_summaries_encoding as rse  # noqa: E402
-from train_5tr_chunk_nn import (  # noqa: E402
+from _shared import (  # noqa: E402
     load_or_build_chunk_embeddings,
     load_responses_by_story,
-)
-from train_lagged_text_pca_mlp import (  # noqa: E402
     load_stories,
     resolve_response_root,
     resolve_roi,
+    rse,
 )
 
 

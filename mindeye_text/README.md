@@ -26,9 +26,14 @@ the defaults (`--lag-trs 3 --chunk-trs 5 --brain-offset 0`) that's brain TR
 
 - `model.py` - `MindEyeText` (subject Linear + 4 residual blocks + head) and
   the `mse / cosine / mse_cosine / mse_clip` losses.
+- `_shared.py` - inlined helpers (path / story / ROI resolution, response
+  loading, 5-TR chunk text-embedding cache). Self-contained: depends only on
+  top-level `run_summaries_encoding`, `run_summary_decoding`, and `decoding/`.
+  The on-disk chunk embedding cache layout is identical to the legacy
+  `27-04-expts/train_5tr_chunk_nn.py` cache, so existing
+  `chunk5tr_text_embeddings__*.pkl` files are reused without rebuilding.
 - `data.py` - per-subject voxel z-scoring, the single-TR chunk dataset, and
-  the shared/per-subject target z-score utilities. Reuses the on-disk text
-  embedding cache produced by `27-04-expts/train_5tr_chunk_nn.py`.
+  the shared/per-subject target z-score utilities.
 - `train_mindeye_text.py` - the training entry point. Pools batches across
   every selected subject in each step so the InfoNCE term sees cross-subject
   negatives.
@@ -116,9 +121,10 @@ the difference.
 
 ## Caching
 
-The 5-TR text embeddings live under `27-04-expts/cache/<subject>/` and are
-shared with the existing `27-04-expts/train_5tr_chunk_nn.py` runs. If the
-cache for a subject/feature-model/lag/chunk doesn't exist yet, the first run
-on that combination will build it from the `train_stimulus/*.TextGrid` files;
-that needs the full `data_train` directory to be reachable, not just
-`train_response`.
+The 5-TR text embeddings default to `27-04-expts/cache/<subject>/` (override
+with `--embedding-cache-dir`). The cache file naming matches the legacy
+`27-04-expts/train_5tr_chunk_nn.py` layout, so existing cache files are
+picked up without rebuilding. If a cache file for a given
+subject/feature-model/lag/chunk combination doesn't exist yet, the first run
+will build it from the `train_stimulus/*.TextGrid` files — that needs the
+full `data_train` directory to be reachable, not just `train_response`.

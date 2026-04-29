@@ -33,20 +33,16 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Subset
 
-REPO_DIR = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(REPO_DIR))
-sys.path.insert(0, str(REPO_DIR / "decoding"))
-sys.path.insert(0, str(REPO_DIR / "27-04-expts"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import run_summaries_encoding as rse  # noqa: E402
-from run_summary_decoding import EMBEDDING_MODELS, retrieval_metrics  # noqa: E402
-from train_lagged_text_pca_mlp import (  # noqa: E402
+from _shared import (  # noqa: E402
+    EMBEDDING_MODELS,
     grouped_train_val_split,
     mean_cosine,
     resolve_torch_device,
+    retrieval_metrics,
+    rse,
 )
-
 from data import (  # noqa: E402
     SingleTRChunkDataset,
     SubjectData,

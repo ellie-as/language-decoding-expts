@@ -21,19 +21,14 @@ from typing import Dict, List
 import numpy as np
 import torch
 
-REPO_DIR = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(REPO_DIR))
-sys.path.insert(0, str(REPO_DIR / "decoding"))
-sys.path.insert(0, str(REPO_DIR / "27-04-expts"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import run_summaries_encoding as rse  # noqa: E402
-from run_summary_decoding import retrieval_metrics  # noqa: E402
-from train_lagged_text_pca_mlp import (  # noqa: E402
+from _shared import (  # noqa: E402
     mean_cosine,
     resolve_torch_device,
+    retrieval_metrics,
+    rse,
 )
-
 from data import load_subject_data, make_subject_dataset  # noqa: E402
 from model import MindEyeText  # noqa: E402
 from train_mindeye_text import (  # noqa: E402
