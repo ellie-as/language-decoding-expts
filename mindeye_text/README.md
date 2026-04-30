@@ -124,6 +124,26 @@ python gpt1_encoding_comparison/decode_and_score.py \
   --n-null 10
 ```
 
+To try several neural encoder variants on the cluster and rank them by
+held-out-story encoding `r`, run:
+
+```bash
+python -u mindeye_text/sweep_mindeye_encoding.py \
+  --subjects S1 S2 S3 \
+  --torch-device cuda \
+  --max-epochs 80 \
+  --patience 10 \
+  --batch-size 512 \
+  --skip-existing
+```
+
+The sweep writes `mindeye_text/encoding_results_sweep/<tag>/` for each variant
+and a combined `sweep__summary.csv`. The ridge reference printed by the sweep is
+the selected-voxel bootstrap-CV mean `r` from
+`gpt1_encoding_comparison/outputs/<subject>/encoding_model_finetuned.npz`, so it
+is a useful but not perfectly matched comparator to the neural held-out-story
+validation score.
+
 ## Running held-out evaluation
 
 ```bash

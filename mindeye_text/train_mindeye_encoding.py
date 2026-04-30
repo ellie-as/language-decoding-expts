@@ -42,6 +42,7 @@ from compare_gpt1_encoding import (  # noqa: E402
 )
 from model import MindEyeEncoding  # noqa: E402
 from utils_resp import get_resp  # noqa: E402
+from utils_ridge.ridge import ridge  # noqa: E402
 from utils_stim import get_stim  # noqa: E402
 
 
@@ -82,6 +83,35 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-epochs", type=int, default=80)
     p.add_argument("--patience", type=int, default=12)
     p.add_argument("--val-frac", type=float, default=0.12)
+    p.add_argument(
+        "--val-mode",
+        default="story",
+        choices=["story", "row"],
+        help="Use held-out stories for validation, or random rows for quick debugging.",
+    )
+    p.add_argument(
+        "--val-stories",
+        nargs="+",
+        default=None,
+        help="Explicit held-out training stories for validation when --val-mode story.",
+    )
+    p.add_argument(
+        "--val-story-count",
+        type=int,
+        default=8,
+        help="Number of stories to hold out for validation when --val-stories is not set.",
+    )
+    p.add_argument(
+        "--selection-metric",
+        default="val_mean_r",
+        choices=["val_mean_r", "val_loss"],
+        help="Checkpoint/early-stop on heldout mean r or validation MSE.",
+    )
+    p.add_argument(
+        "--skip-ridge-like-for-like",
+        action="store_true",
+        help="Skip the ridge baseline trained/scored on the same validation split.",
+    )
     p.add_argument("--torch-device", default="auto", choices=["auto", "cuda", "mps", "cpu"])
     p.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--seed", type=int, default=0)
@@ -127,11 +157,55 @@ def load_paper_voxels(subject: str) -> np.ndarray:
     return np.asarray(data["voxels"], dtype=np.int64)
 
 
+def load_paper_alphas(subject: str, voxels: np.ndarray) -> np.ndarray:
+    path = Path(config.MODEL_DIR) / subject / "encoding_model_perceived.npz"
+    if not path.exists():
+        raise FileNotFoundError(f"Paper encoding model not found: {path}")
+    data = np.load(path, allow_pickle=True)
+    alphas = np.asarray(data["alphas"], dtype=np.float32)
+    return alphas[np.asarray(voxels, dtype=np.int64)]
+
+
 def split_indices(n: int, val_frac: float, seed: int) -> tuple[np.ndarray, np.ndarray]:
     rng = np.random.default_rng(seed)
     idx = rng.permutation(n)
     n_val = max(1, int(round(n * float(val_frac))))
     return idx[n_val:], idx[:n_val]
+
+
+def split_stories(stories: List[str], args: argparse.Namespace) -> tuple[List[str], List[str]]:
+    if args.val_mode == "row":
+        return list(stories), []
+    if args.val_stories:
+        val = [story for story in args.val_stories if story in stories]
+        missing = sorted(set(args.val_stories) - set(val))
+        if missing:
+            raise ValueError(f"--val-stories not found in training story list: {missing}")
+    else:
+        rng = np.random.default_rng(args.seed)
+        shuffled = list(stories)
+        rng.shuffle(shuffled)
+        val = sorted(shuffled[:max(1, int(args.val_story_count))])
+    val_set = set(val)
+    train = [story for story in stories if story not in val_set]
+    if not train:
+        raise ValueError("Story validation split left no training stories.")
+    return train, val
+
+
+def story_slices(stories: List[str], responses_by_story: Dict[str, np.ndarray]) -> Dict[str, slice]:
+    cursor = 0
+    out = {}
+    for story in stories:
+        n = int(responses_by_story[story].shape[0])
+        out[story] = slice(cursor, cursor + n)
+        cursor += n
+    return out
+
+
+def indices_for_stories(stories: List[str], slices: Dict[str, slice]) -> np.ndarray:
+    parts = [np.arange(slices[story].start, slices[story].stop, dtype=np.int64) for story in stories]
+    return np.concatenate(parts) if parts else np.array([], dtype=np.int64)
 
 
 def corr_per_voxel(pred: np.ndarray, true: np.ndarray) -> np.ndarray:
@@ -183,6 +257,38 @@ def residual_noise_model(
     return out
 
 
+def ridge_like_for_like(
+    rstim: np.ndarray,
+    responses: Dict[str, np.ndarray],
+    voxels: Dict[str, np.ndarray],
+    subjects: List[str],
+    train_idx: np.ndarray,
+    val_idx: np.ndarray,
+) -> Dict[str, dict]:
+    """Train ridge on the neural train split and evaluate on the same val split."""
+    out = {}
+    vals = []
+    x_train = rstim[train_idx]
+    x_val = rstim[val_idx]
+    for subject in subjects:
+        alphas = load_paper_alphas(subject, voxels[subject])
+        weights = ridge(x_train, responses[subject][train_idx], alphas)
+        pred = x_val.dot(weights).astype(np.float32)
+        corrs = corr_per_voxel(pred, responses[subject][val_idx])
+        mean_r = float(corrs.mean())
+        out[subject] = {
+            "ridge_like_for_like_mean_r": mean_r,
+            "ridge_like_for_like_median_r": float(np.median(corrs)),
+            "ridge_like_for_like_max_r": float(corrs.max()),
+        }
+        vals.append(mean_r)
+        del weights, pred, corrs
+    out["ALL"] = {
+        "ridge_like_for_like_mean_r": float(np.mean(vals)) if vals else float("nan"),
+    }
+    return out
+
+
 def build_tag(args: argparse.Namespace) -> str:
     subj = "-".join(args.subjects)
     return (
@@ -227,7 +333,44 @@ def main() -> None:
     for subject in args.subjects:
         log.info("[%s] selected voxels=%d response=%s", subject, len(voxels[subject]), responses[subject].shape)
 
-    train_idx, val_idx = split_indices(rstim.shape[0], args.val_frac, args.seed)
+    first_subject = args.subjects[0]
+    first_responses_by_story = get_resp(
+        first_subject,
+        stories,
+        stack=False,
+        vox=voxels[first_subject],
+    )
+    slices = story_slices(stories, first_responses_by_story)
+    train_stories, val_stories = split_stories(stories, args)
+    if args.val_mode == "story":
+        train_idx = indices_for_stories(train_stories, slices)
+        val_idx = indices_for_stories(val_stories, slices)
+        log.info("Validation stories (%d): %s", len(val_stories), ", ".join(val_stories))
+    else:
+        train_idx, val_idx = split_indices(rstim.shape[0], args.val_frac, args.seed)
+        train_stories = list(stories)
+        val_stories = []
+        log.info("Validation mode: random rows (%d train, %d val)", len(train_idx), len(val_idx))
+    if max(train_idx.max(initial=0), val_idx.max(initial=0)) >= rstim.shape[0]:
+        raise RuntimeError(
+            "Story-derived response row indices exceed stimulus rows. "
+            f"max index={max(train_idx.max(initial=0), val_idx.max(initial=0))}, "
+            f"stim rows={rstim.shape[0]}"
+        )
+    if args.skip_ridge_like_for_like:
+        ridge_lfl = {}
+        log.info("Skipping like-for-like ridge validation baseline.")
+    else:
+        log.info("Fitting like-for-like ridge baseline on the same validation split ...")
+        ridge_lfl = ridge_like_for_like(rstim, responses, voxels, args.subjects, train_idx, val_idx)
+        log.info(
+            "Like-for-like ridge heldout mean r: %s",
+            " ".join(
+                f"{subject}={ridge_lfl[subject]['ridge_like_for_like_mean_r']:.4f}"
+                for subject in args.subjects
+            ),
+        )
+
     train_loaders = {}
     val_tensors = {}
     for subject in args.subjects:
@@ -263,7 +406,7 @@ def main() -> None:
         raise RuntimeError("At least one train loader is empty; lower --batch-size.")
 
     best_state = {k: v.detach().to("cpu").clone() for k, v in model.state_dict().items()}
-    best_val = float("inf")
+    best_val = -float("inf") if args.selection_metric == "val_mean_r" else float("inf")
     bad_epochs = 0
     history = []
     start_time = time.time()
@@ -304,6 +447,8 @@ def main() -> None:
             "epoch": epoch,
             "train_loss": train_loss,
             "val_loss": val_loss,
+            "val_mean_r_all": float(np.mean([val_corrs[s].mean() for s in args.subjects])),
+            "val_max_r_all": float(np.mean([val_corrs[s].max() for s in args.subjects])),
             **{f"val_loss_{s}": v for s, v in val_losses.items()},
             **{f"val_mean_r_{s}": float(val_corrs[s].mean()) for s in args.subjects},
             **{f"val_selected_mean_r_{s}": float(val_corrs[s].mean()) for s in args.subjects},
@@ -317,14 +462,25 @@ def main() -> None:
             val_loss,
             " ".join(f"{s}:r={val_corrs[s].mean():.4f}/max={val_corrs[s].max():.3f}" for s in args.subjects),
         )
-        if val_loss < best_val - 1e-6:
-            best_val = val_loss
+        selection_value = row["val_mean_r_all"] if args.selection_metric == "val_mean_r" else val_loss
+        improved = (
+            selection_value > best_val + 1e-6
+            if args.selection_metric == "val_mean_r"
+            else selection_value < best_val - 1e-6
+        )
+        if improved:
+            best_val = selection_value
             best_state = {k: v.detach().to("cpu").clone() for k, v in model.state_dict().items()}
             bad_epochs = 0
         else:
             bad_epochs += 1
             if bad_epochs >= args.patience:
-                log.info("Early stopping at epoch %d (best val=%.5f)", epoch, best_val)
+                log.info(
+                    "Early stopping at epoch %d (best %s=%.5f)",
+                    epoch,
+                    args.selection_metric,
+                    best_val,
+                )
                 break
 
     model.load_state_dict({k: v.to(device) for k, v in best_state.items()})
@@ -342,14 +498,44 @@ def main() -> None:
         writer.writeheader()
         writer.writerows(history)
 
+    best_loss_row = min(history, key=lambda row: row["val_loss"])
+    best_r_row = max(history, key=lambda row: row["val_mean_r_all"])
     summary = {
         subject: {
-            "best_val_loss": float(best_val),
+            "best_selection_value": float(best_val),
             "n_voxels": int(len(voxels[subject])),
+            **ridge_lfl.get(subject, {}),
+            "best_loss_epoch_val_mean_r": float(best_loss_row[f"val_mean_r_{subject}"]),
+            "best_r_epoch_val_mean_r": float(best_r_row[f"val_mean_r_{subject}"]),
+            "delta_best_r_minus_ridge_like_for_like": (
+                float(best_r_row[f"val_mean_r_{subject}"])
+                - float(ridge_lfl[subject]["ridge_like_for_like_mean_r"])
+                if subject in ridge_lfl
+                else ""
+            ),
+            "best_r_epoch_val_max_r": float(best_r_row[f"val_max_r_{subject}"]),
             "last_val_mean_r": float(history[-1][f"val_mean_r_{subject}"]),
-            "last_val_max_r": float(history[-1][f"val_max_r_{subject}"]),
         }
         for subject in args.subjects
+    }
+    summary["ALL"] = {
+        "best_selection_value": float(best_val),
+        "selection_metric": str(args.selection_metric),
+        "best_loss_epoch": int(best_loss_row["epoch"]),
+        "best_loss_epoch_val_mean_r": float(best_loss_row["val_mean_r_all"]),
+        "best_r_epoch": int(best_r_row["epoch"]),
+        "best_r_epoch_val_mean_r": float(best_r_row["val_mean_r_all"]),
+        "best_r_epoch_val_max_r": float(best_r_row["val_max_r_all"]),
+        "last_val_mean_r": float(history[-1]["val_mean_r_all"]),
+        "val_mode": str(args.val_mode),
+        "val_stories": list(val_stories),
+        **ridge_lfl.get("ALL", {}),
+        "delta_best_r_minus_ridge_like_for_like": (
+            float(best_r_row["val_mean_r_all"])
+            - float(ridge_lfl["ALL"]["ridge_like_for_like_mean_r"])
+            if "ALL" in ridge_lfl
+            else ""
+        ),
     }
     with open(out_dir / "summary.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2, sort_keys=True)
@@ -370,11 +556,15 @@ def main() -> None:
         "stim_delays": list(config.STIM_DELAYS),
         "sessions": list(args.sessions),
         "stories": np.array(stories),
+        "train_stories": np.array(train_stories),
+        "val_stories": np.array(val_stories),
+        "val_mode": str(args.val_mode),
         "voxels": voxels,
         "noise_model": noise_model,
         "tr_stats": np.array(tr_stats, dtype=object),
         "word_stats": np.array(word_stats, dtype=object),
-        "best_val_loss": float(best_val),
+        "selection_metric": str(args.selection_metric),
+        "best_selection_value": float(best_val),
         "args": vars(args),
         "total_train_seconds": float(time.time() - start_time),
     }

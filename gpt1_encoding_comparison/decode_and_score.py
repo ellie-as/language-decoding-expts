@@ -50,6 +50,7 @@ from utils_ridge.textgrid import TextGrid  # noqa: E402
 
 CONDITION_PAPER = "paper"
 CONDITION_MINDEYE_ENCODING = "mindeye_encoding"
+CONDITION_LM_ONLY = "lm_only"
 DEFAULT_TASKS = ["wheretheressmoke"]
 BAD_WORDS_PERCEIVED_SPEECH = frozenset(["sentence_start", "sentence_end", "br", "lg", "ls", "ns", "sp"])
 BAD_WORDS_OTHER_TASKS = frozenset(["", "sp", "uh"])
@@ -69,6 +70,7 @@ def parse_args():
             CONDITION_FINETUNED,
             CONDITION_PRETRAINED,
             CONDITION_MINDEYE_ENCODING,
+            CONDITION_LM_ONLY,
         ],
     )
     parser.add_argument(
@@ -392,6 +394,41 @@ def load_stimulus_stats(em_data):
     )
 
 
+def decode_lm_only(pred_path, word_times, huth_lm, args, task):
+    """Decode using only the GPT proposal model, without brain likelihoods."""
+    _huth_gpt, lm = huth_lm
+    decoder = Decoder(word_times, args.beam_width)
+    t0 = time.time()
+    for sample_index in range(len(word_times)):
+        if sample_index % 25 == 0 or sample_index == len(word_times) - 1:
+            elapsed = time.time() - t0
+            print(
+                f"\r[{CONDITION_LM_ONLY}] {task}: word {sample_index + 1}/{len(word_times)} "
+                f"elapsed={elapsed:.0f}s",
+                end="",
+                flush=True,
+            )
+
+        ncontext = decoder.time_window(sample_index, config.LM_TIME, floor=5)
+        beam_nucs = lm.beam_propose(decoder.beam, ncontext)
+        for beam_index, (hyp, nextensions) in enumerate(decoder.get_hypotheses()):
+            nuc, logprobs = beam_nucs[beam_index]
+            if len(nuc) < 1:
+                continue
+            # Decoder ranks extensions by "likelihoods"; here that is just the
+            # language model log-probability, with dummy embeddings unused later.
+            local_extensions = [
+                Hypothesis(parent=hyp, extension=item)
+                for item in zip(nuc, logprobs, [np.zeros(1, dtype=np.float32) for _ in nuc])
+            ]
+            decoder.add_extensions(local_extensions, np.asarray(logprobs), nextensions)
+        decoder.extend(verbose=False)
+
+    decoder.save(str(pred_path.with_suffix("")))
+    print(f"\n[{CONDITION_LM_ONLY}] saved {pred_path}")
+    return pred_path
+
+
 def decode_one(condition, subject, experiment, task, args, huth_lm):
     output_dir = Path(args.output_dir).expanduser().resolve()
     pred_dir = output_dir / subject / experiment / condition
@@ -405,6 +442,9 @@ def decode_one(condition, subject, experiment, task, args, huth_lm):
     resp = load_test_response(subject, experiment, task)
     word_times, tr_times = load_word_times(subject, experiment, task, resp)
     lanczos_mat = get_lanczos_mat(word_times, tr_times)
+
+    if condition == CONDITION_LM_ONLY:
+        return decode_lm_only(pred_path, word_times, huth_lm, args, task)
 
     if condition == CONDITION_MINDEYE_ENCODING:
         em_data = load_mindeye_encoding_checkpoint(args)
