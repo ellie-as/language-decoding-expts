@@ -57,6 +57,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--chunk-trs", type=int, default=5)
     p.add_argument("--lag-trs", type=int, default=3)
     p.add_argument("--brain-offsets", type=int, nargs="+", default=[0])
+    p.add_argument(
+        "--brain-pca",
+        type=int,
+        default=0,
+        help="If >0, PCA-reduce z-scored brain features before LightGBM.",
+    )
+    p.add_argument(
+        "--max-features",
+        type=int,
+        default=0,
+        help="If >0 and --brain-pca is 0, randomly keep this many brain features.",
+    )
     p.add_argument("--pca-dim", type=int, default=10)
     p.add_argument("--val-story-count", type=int, default=8)
     p.add_argument("--val-stories", nargs="+", default=None)
@@ -168,6 +180,40 @@ def pca_targets(y_train_raw: np.ndarray, y_val_raw: np.ndarray, pca_dim: int, se
     )
 
 
+def reduce_brain_features(
+    x_train: np.ndarray,
+    x_val: np.ndarray,
+    args: argparse.Namespace,
+) -> tuple[np.ndarray, np.ndarray, dict]:
+    if int(args.brain_pca) > 0:
+        from sklearn.decomposition import PCA
+
+        n_comp = min(int(args.brain_pca), x_train.shape[0] - 1, x_train.shape[1])
+        log.info("Brain PCA: %d features -> %d components", x_train.shape[1], n_comp)
+        pca = PCA(n_components=n_comp, random_state=args.seed, svd_solver="randomized")
+        x_train_pca = pca.fit_transform(x_train).astype(np.float32)
+        x_val_pca = pca.transform(x_val).astype(np.float32)
+        return (
+            x_train_pca,
+            x_val_pca,
+            {
+                "kind": "pca",
+                "pca": pca,
+                "explained_variance": float(np.sum(pca.explained_variance_ratio_)),
+            },
+        )
+    if int(args.max_features) > 0 and int(args.max_features) < x_train.shape[1]:
+        rng = np.random.default_rng(args.seed)
+        cols = np.sort(rng.choice(x_train.shape[1], size=int(args.max_features), replace=False))
+        log.info("Feature subsampling: %d features -> %d columns", x_train.shape[1], len(cols))
+        return (
+            x_train[:, cols].astype(np.float32, copy=False),
+            x_val[:, cols].astype(np.float32, copy=False),
+            {"kind": "subsample", "columns": cols},
+        )
+    return x_train, x_val, {"kind": "none"}
+
+
 def fit_models(args: argparse.Namespace, x_train: np.ndarray, y_train: np.ndarray):
     models = []
     if args.backend == "lightgbm":
@@ -176,6 +222,12 @@ def fit_models(args: argparse.Namespace, x_train: np.ndarray, y_train: np.ndarra
         except ImportError as err:
             raise ImportError("Install lightgbm or use --backend sklearn_hist") from err
         for dim in range(y_train.shape[1]):
+            log.info(
+                "Fitting LightGBM target dim %d/%d on X=%s",
+                dim + 1,
+                y_train.shape[1],
+                x_train.shape,
+            )
             model = LGBMRegressor(
                 n_estimators=args.n_estimators,
                 learning_rate=args.learning_rate,
@@ -197,6 +249,12 @@ def fit_models(args: argparse.Namespace, x_train: np.ndarray, y_train: np.ndarra
     from sklearn.ensemble import HistGradientBoostingRegressor
 
     for dim in range(y_train.shape[1]):
+        log.info(
+            "Fitting sklearn HistGradientBoosting target dim %d/%d on X=%s",
+            dim + 1,
+            y_train.shape[1],
+            x_train.shape,
+        )
         model = HistGradientBoostingRegressor(
             max_iter=args.n_estimators,
             learning_rate=args.learning_rate,
@@ -285,12 +343,22 @@ def run_subject(args: argparse.Namespace, subject: str, stories: List[str]) -> d
         raise RuntimeError("Brain chunk rows and embedding target rows are misaligned.")
 
     x_train_z, x_val_z, x_mean, x_std = zscore_train_apply(x_train, x_val)
+    x_train_model, x_val_model, reducer = reduce_brain_features(x_train_z, x_val_z, args)
     y_train, y_val, pca, y_mean, y_std = pca_targets(y_train_raw, y_val_raw, args.pca_dim, args.seed)
 
-    log.info("[%s] Train X=%s Y=%s | Val X=%s Y=%s", subject, x_train_z.shape, y_train.shape, x_val_z.shape, y_val.shape)
+    log.info(
+        "[%s] Train X=%s -> %s Y=%s | Val X=%s -> %s Y=%s",
+        subject,
+        x_train_z.shape,
+        x_train_model.shape,
+        y_train.shape,
+        x_val_z.shape,
+        x_val_model.shape,
+        y_val.shape,
+    )
     start = time.time()
-    models = fit_models(args, x_train_z, y_train)
-    pred_val = predict_models(models, x_val_z)
+    models = fit_models(args, x_train_model, y_train)
+    pred_val = predict_models(models, x_val_model)
     elapsed = time.time() - start
 
     dim_corrs = per_dim_corr(pred_val, y_val)
@@ -303,6 +371,10 @@ def run_subject(args: argparse.Namespace, subject: str, stories: List[str]) -> d
         "brain_offsets": " ".join(str(int(o)) for o in args.brain_offsets),
         "n_train": int(x_train_z.shape[0]),
         "n_val": int(x_val_z.shape[0]),
+        "brain_feature_dim_raw": int(x_train_z.shape[1]),
+        "brain_feature_dim_model": int(x_train_model.shape[1]),
+        "brain_reducer": reducer["kind"],
+        "brain_pca_explained_variance": reducer.get("explained_variance", ""),
         "val_stories": " ".join(val_stories),
         "pca_explained_variance": float(np.sum(pca.explained_variance_ratio_)),
         "mean_dim_r": float(np.nan_to_num(dim_corrs).mean()),
@@ -336,6 +408,7 @@ def run_subject(args: argparse.Namespace, subject: str, stories: List[str]) -> d
                     "pca": pca,
                     "x_mean": x_mean,
                     "x_std": x_std,
+                    "brain_reducer": reducer,
                     "y_mean": y_mean,
                     "y_std": y_std,
                     "args": vars(args),
