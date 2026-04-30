@@ -32,7 +32,8 @@ construction):
 | --- | --- | --- |
 | `half_life` | First lag where ACF crosses 0.5, linear-interpolated. | slower |
 | `exp_tau`   | Time-constant from a log-linear fit on lags 1..K (`--exp-fit-max-lag`). | slower |
-| `integrated_ac` | Sum of ACF for lags 1..max_lag. | slower |
+| `integrated_ac` | Signed sum of ACF for lags 1..max_lag. | slower when positive |
+| `positive_integrated_ac` | Sum of `max(ACF, 0)` for lags 1..max_lag. | slower |
 
 All three are saved both in TR units (`*_trs`) and seconds (`*_seconds`,
 default TR = 2 s, set via `--tr-seconds`). Voxels whose ACF never crosses 0.5
@@ -64,7 +65,7 @@ python voxel_timescale/plot_voxel_timescale_flatmaps.py \
 - `--max-lag-trs 30` — ACF max lag (default 30 TRs ~ 60 s).
 - `--exp-fit-max-lag 10` — lags 1..K used in the exponential fit.
 - `--tr-seconds 2.0` — TR length, used to convert TR units → seconds.
-- `--metrics half_life_seconds exp_tau_seconds integrated_ac_seconds` — pick
+- `--metrics half_life_seconds exp_tau_seconds positive_integrated_ac_seconds` — pick
   which flatmaps to render (default: those three).
 - `--clip-quantiles 0.05 0.95` — auto-vmin/vmax from these quantiles of finite
   values (or pass `--vmin/--vmax` to override).
@@ -94,8 +95,8 @@ results/<tag>/
     decay).
   - `exp_tau` is most directly comparable to the Honey/Hasson "intrinsic
     timescale" measure but assumes a roughly exponential decay.
-  - `integrated_ac` is a smooth scalar useful for percentile-mapping but is
-    inflated by long, weak tails.
+  - `positive_integrated_ac` is a smooth scalar useful for percentile-mapping
+    when the ACF undershoots below zero.
 
 If you see runaway / very large `exp_tau_seconds` values in a few voxels, that
 usually means the early ACF is roughly flat (`slope ≈ 0`); falling back to

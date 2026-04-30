@@ -19,7 +19,9 @@ Per-voxel metrics derived from the averaged ACF:
   - ``half_life``         smallest lag where ACF crosses 0.5 (linear-interpolated).
   - ``exp_tau``           time-constant of a log-linear fit on lags 1..K
                           (``--exp-fit-max-lag``); positive lags only.
-  - ``integrated_ac``     area under ACF for lags 1..max_lag (TR or s).
+  - ``integrated_ac``     signed area under ACF for lags 1..max_lag (TR or s).
+  - ``positive_integrated_ac`` area under max(ACF, 0), which is often more
+                          interpretable when BOLD ACF undershoots below zero.
 
 All metrics are saved both in TR units and seconds (using ``--tr-seconds``).
 Use ``plot_voxel_timescale_flatmaps.py`` to project them onto cortex.
@@ -289,6 +291,7 @@ def compute_metrics(
 
     # --- Integrated ACF (lags 1..max_lag, TR units). -------------------------
     integrated_ac_trs = acf_avg[1:].sum(axis=0).astype(np.float32)
+    positive_integrated_ac_trs = np.clip(acf_avg[1:], 0.0, None).sum(axis=0).astype(np.float32)
 
     return {
         "half_life_trs": half_life_trs,
@@ -297,6 +300,8 @@ def compute_metrics(
         "exp_tau_seconds": (exp_tau_trs * tr_seconds).astype(np.float32),
         "integrated_ac_trs": integrated_ac_trs,
         "integrated_ac_seconds": (integrated_ac_trs * tr_seconds).astype(np.float32),
+        "positive_integrated_ac_trs": positive_integrated_ac_trs,
+        "positive_integrated_ac_seconds": (positive_integrated_ac_trs * tr_seconds).astype(np.float32),
     }
 
 
