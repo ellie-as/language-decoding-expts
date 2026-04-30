@@ -51,6 +51,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--pycortex-subject", default=None, help="Override pycortex db subject (UTS01/UTS02/UTS03).")
     p.add_argument("--pycortex-filestore", default=None,
                    help="Pycortex filestore directory (default: <repo>/pycortex-db when present).")
+    p.add_argument("--xfm-name", default=None,
+                   help="Pycortex transform/xfm name (default: auto-detect by mask size).")
     p.add_argument("--n-total-voxels", type=int, default=None,
                    help="Total voxels in the subject volume (auto-detected from response file otherwise).")
     p.add_argument("--mask-r-threshold", type=float, default=0.05,
@@ -99,44 +101,92 @@ def detect_n_total_voxels(subject: str) -> int:
 
 
 def configure_pycortex_filestore(explicit_path: str | None) -> str | None:
-    """Make pycortex use the repo-local pycortex-db before any cortex import.
+    """Force pycortex to read subjects from a specific filestore.
 
-    Returns the resolved filestore directory or None if no override is applied.
+    Pycortex caches the filestore at first import (from defaults.cfg + the
+    user's ``~/.config/pycortex/options.cfg``). We reset every layer we know
+    about: the in-memory ConfigParser, ``cortex.database.default_filestore``,
+    the live ``cortex.db.filestore`` attribute, and the cached
+    ``cortex.db._subjects``/``cortex.db.subjects`` collection. Then we recreate
+    ``cortex.db`` to be safe.
+
+    Returns the resolved filestore directory or ``None`` if no candidate exists.
     """
-    candidates = []
+    candidates: list[Path] = []
     if explicit_path:
         candidates.append(Path(explicit_path).expanduser().resolve())
     candidates.append(REPO_DIR / "pycortex-db")
     candidates.append(Path.cwd() / "pycortex-db")
 
+    chosen: Path | None = None
     for candidate in candidates:
         if candidate.is_dir():
-            store = str(candidate)
-            os.environ["PYCORTEX_FILESTORE"] = store
-            try:
-                import cortex  # noqa: F401
-                from cortex.options import config as cortex_config
-                cortex_config.set("basic", "filestore", store)
-                if hasattr(cortex, "database"):
-                    try:
-                        cortex.database.default_filestore = store
-                    except Exception:  # pragma: no cover - older pycortex
-                        pass
-                    if hasattr(cortex, "db") and hasattr(cortex.db, "reload_subjects"):
-                        cortex.db.reload_subjects()
-                    elif hasattr(cortex, "db"):
-                        cortex.db = cortex.database.Database()
-                log.info("Pycortex filestore -> %s", store)
-                return store
-            except ImportError:
-                log.error("pycortex is not installed. Run `pip install pycortex` first.")
-                raise
-    log.warning(
-        "No pycortex-db directory found (looked at: %s). "
-        "Falling back to pycortex's default config.",
-        ", ".join(str(c) for c in candidates),
-    )
-    return None
+            chosen = candidate
+            break
+    if chosen is None:
+        log.warning(
+            "No pycortex-db directory found (looked at: %s). Falling back to pycortex's default.",
+            ", ".join(str(c) for c in candidates),
+        )
+        return None
+
+    store = str(chosen)
+    os.environ["PYCORTEX_FILESTORE"] = store
+
+    try:
+        import cortex  # noqa: F401
+    except ImportError:
+        log.error("pycortex is not installed. Run `pip install pycortex` first.")
+        raise
+
+    try:
+        from cortex.options import config as cortex_config
+        if not cortex_config.has_section("basic"):
+            cortex_config.add_section("basic")
+        cortex_config.set("basic", "filestore", store)
+    except Exception as err:
+        log.warning("Could not update cortex.options.config: %s", err)
+
+    if hasattr(cortex, "database"):
+        try:
+            cortex.database.default_filestore = store
+        except Exception:
+            pass
+
+    try:
+        cortex.db.filestore = store
+        for attr in ("_subjects", "subjects_cache"):
+            if hasattr(cortex.db, attr):
+                try:
+                    setattr(cortex.db, attr, None)
+                except Exception:
+                    pass
+    except Exception as err:
+        log.warning("Could not patch cortex.db filestore directly: %s", err)
+
+    try:
+        cortex.db = cortex.database.Database()
+        cortex.db.filestore = store
+    except Exception as err:
+        log.warning("Could not recreate cortex.db: %s", err)
+
+    actual_store = getattr(cortex.db, "filestore", "<unknown>")
+    actual_subjects = sorted(cortex.db.subjects.keys())
+    log.info("Pycortex filestore (requested) -> %s", store)
+    log.info("Pycortex filestore (db.filestore) -> %s", actual_store)
+    log.info("Pycortex subjects after reset    -> %s", actual_subjects)
+
+    if actual_store != store or not actual_subjects:
+        log.warning(
+            "pycortex did not pick up the requested filestore. "
+            "If the mismatch persists, edit %s with:\n"
+            "[basic]\nfilestore = %s\n"
+            "or pass --pycortex-filestore explicitly and ensure pycortex "
+            "is the version installed in this environment.",
+            Path("~/.config/pycortex/options.cfg").expanduser(),
+            store,
+        )
+    return store
 
 
 def lag_center_of_mass(corrs: np.ndarray, lags: np.ndarray) -> np.ndarray:
@@ -154,6 +204,73 @@ def lag_center_of_mass(corrs: np.ndarray, lags: np.ndarray) -> np.ndarray:
     return com
 
 
+def list_subject_transforms(filestore: str | None, subject: str) -> list[str]:
+    if not filestore:
+        return []
+    base = Path(filestore) / subject / "transforms"
+    if not base.is_dir():
+        return []
+    return sorted(p.name for p in base.iterdir() if p.is_dir())
+
+
+def find_matching_xfm(
+    cortex_module,
+    filestore: str | None,
+    subject: str,
+    n_total: int,
+    preferred: str | None,
+) -> tuple[str, int]:
+    """Return ``(xfmname, mask_size)`` whose 'thick' mask has ``n_total`` voxels.
+
+    Tries the user-preferred name first, then 'fullhead', then any other
+    transform discovered on disk. Picks the first whose thick-mask size
+    equals ``n_total``; otherwise returns the closest match and logs a warning.
+    """
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    def add(name: str | None) -> None:
+        if name and name not in seen:
+            candidates.append(name)
+            seen.add(name)
+
+    add(preferred)
+    add("fullhead")
+    for name in list_subject_transforms(filestore, subject):
+        add(name)
+
+    if not candidates:
+        raise RuntimeError(
+            f"No transforms found for pycortex subject {subject!r}. "
+            f"Inspect {Path(filestore or '~/.pycortex/db') / subject / 'transforms'}."
+        )
+
+    matches: list[tuple[str, int]] = []
+    for name in candidates:
+        try:
+            mask = cortex_module.db.get_mask(subject, name, "thick")
+            n_mask = int(np.asarray(mask).sum())
+        except Exception as err:
+            log.debug("xfm %s/%s: could not load thick mask (%s)", subject, name, err)
+            continue
+        log.info("Transform candidate %s/%s -> thick mask voxels=%d", subject, name, n_mask)
+        matches.append((name, n_mask))
+        if n_mask == int(n_total):
+            return name, n_mask
+    if matches:
+        name, n_mask = matches[0]
+        log.warning(
+            "No transform exactly matched n_total=%d. Using %s (mask voxels=%d). "
+            "Pass --n-total-voxels to override.",
+            n_total, name, n_mask,
+        )
+        return name, n_mask
+    raise RuntimeError(
+        f"None of {candidates!r} returned a usable thick mask for subject {subject!r}. "
+        "Try --xfm-name with a transform name printed above."
+    )
+
+
 def project_to_full_brain(values: np.ndarray, voxels: np.ndarray, n_total: int) -> np.ndarray:
     full = np.full(int(n_total), np.nan, dtype=np.float32)
     full[voxels] = values
@@ -166,6 +283,7 @@ def make_flatmap(
     full_volume: np.ndarray,
     *,
     pycortex_subject: str,
+    xfm_name: str,
     vmin: float,
     vmax: float,
     cmap: str,
@@ -173,7 +291,7 @@ def make_flatmap(
     out_path: Path,
 ) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    vol = cortex_module.Volume(full_volume, pycortex_subject, "fullhead", vmin=vmin, vmax=vmax, cmap=cmap)
+    vol = cortex_module.Volume(full_volume, pycortex_subject, xfm_name, vmin=vmin, vmax=vmax, cmap=cmap)
     fig = cortex_module.quickflat.make_figure(vol, with_curvature=True, with_colorbar=True)
     fig.suptitle(title, fontsize=13)
     fig.savefig(str(out_path), dpi=150, bbox_inches="tight")
@@ -231,6 +349,18 @@ def main() -> None:
         )
     log.info("Using pycortex subject %s (from %s)", pycortex_subject, available)
 
+    filestore = os.environ.get("PYCORTEX_FILESTORE") or args.pycortex_filestore
+    xfm_name, mask_voxels = find_matching_xfm(
+        cortex, filestore, pycortex_subject, int(n_total), args.xfm_name
+    )
+    if mask_voxels != int(n_total):
+        log.warning(
+            "Mask size %d != n_total_voxels %d. Re-running with --n-total-voxels %d.",
+            mask_voxels, int(n_total), mask_voxels,
+        )
+        n_total = mask_voxels
+    log.info("Using pycortex transform %s for subject %s", xfm_name, pycortex_subject)
+
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -269,7 +399,7 @@ def main() -> None:
     make_flatmap(
         cortex, plt,
         project_to_full_brain(masked_pref, voxels, n_total),
-        pycortex_subject=pycortex_subject,
+        pycortex_subject=pycortex_subject, xfm_name=xfm_name,
         vmin=pref_vmin, vmax=pref_vmax, cmap=args.cmap_pref,
         title=f"Preferred lag (TR), masked r >= {args.mask_r_threshold:g}",
         out_path=out_dir / "preferred_lag_masked.png",
@@ -277,7 +407,7 @@ def main() -> None:
     make_flatmap(
         cortex, plt,
         project_to_full_brain(preferred_lag, voxels, n_total),
-        pycortex_subject=pycortex_subject,
+        pycortex_subject=pycortex_subject, xfm_name=xfm_name,
         vmin=pref_vmin, vmax=pref_vmax, cmap=args.cmap_pref,
         title="Preferred lag (TR), all full_frontal voxels",
         out_path=out_dir / "preferred_lag.png",
@@ -285,7 +415,7 @@ def main() -> None:
     make_flatmap(
         cortex, plt,
         project_to_full_brain(masked_com, voxels, n_total),
-        pycortex_subject=pycortex_subject,
+        pycortex_subject=pycortex_subject, xfm_name=xfm_name,
         vmin=pref_vmin, vmax=pref_vmax, cmap=args.cmap_pref,
         title=f"r-weighted center-of-mass lag, masked r >= {args.mask_r_threshold:g}",
         out_path=out_dir / "com_lag_masked.png",
@@ -293,7 +423,7 @@ def main() -> None:
     make_flatmap(
         cortex, plt,
         project_to_full_brain(com, voxels, n_total),
-        pycortex_subject=pycortex_subject,
+        pycortex_subject=pycortex_subject, xfm_name=xfm_name,
         vmin=pref_vmin, vmax=pref_vmax, cmap=args.cmap_pref,
         title="r-weighted center-of-mass lag",
         out_path=out_dir / "com_lag.png",
@@ -301,7 +431,7 @@ def main() -> None:
     make_flatmap(
         cortex, plt,
         project_to_full_brain(best_r, voxels, n_total),
-        pycortex_subject=pycortex_subject,
+        pycortex_subject=pycortex_subject, xfm_name=xfm_name,
         vmin=0.0, vmax=r_top, cmap=args.cmap_r,
         title=f"Best-lag encoding r per voxel (vmax={r_top:.2f})",
         out_path=out_dir / "best_lag_r.png",
@@ -315,7 +445,7 @@ def main() -> None:
             make_flatmap(
                 cortex, plt,
                 project_to_full_brain(corrs[li], voxels, n_total),
-                pycortex_subject=pycortex_subject,
+                pycortex_subject=pycortex_subject, xfm_name=xfm_name,
                 vmin=-diverging_top, vmax=diverging_top, cmap="RdBu_r",
                 title=f"Encoding r at lag={int(lag)} TR",
                 out_path=per_lag_dir / f"lag{int(lag):02d}.png",
