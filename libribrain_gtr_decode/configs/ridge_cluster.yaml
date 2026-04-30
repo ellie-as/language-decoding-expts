@@ -1,11 +1,11 @@
 project:
   seed: 0
-  output_dir: /path/to/outputs/libribrain_gtr_decode
-  cache_dir: /path/to/outputs/libribrain_gtr_decode/cache
+  output_dir: /ceph/behrens/ellie/language-decoding-expts/libribrain_gtr_decode/outputs/ridge_cluster
+  cache_dir: /ceph/behrens/ellie/language-decoding-expts/libribrain_gtr_decode/outputs/ridge_cluster/cache
 
 data:
-  pnpl_root: /path/to/pnpl_or_checkout
-  libribrain_root: /path/to/libribrain
+  pnpl_root: null
+  libribrain_root: /ceph/behrens/ellie/language-decoding-expts/libribrain_gtr_decode/data/LibriBrain
   subject: null
   sessions: null
   runs: null

@@ -16,6 +16,12 @@ def project_root() -> Path:
 def resolve_path(path: str | Path | None, base: Path | None = None) -> Path | None:
     if path is None:
         return None
+    if str(path).startswith("/path/to"):
+        raise ValueError(
+            f"Config still contains placeholder path {path!r}. "
+            "Set it to a real writable path, e.g. under "
+            "/ceph/behrens/ellie/language-decoding-expts/libribrain_gtr_decode."
+        )
     p = Path(path).expanduser()
     if p.is_absolute():
         return p
