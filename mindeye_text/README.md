@@ -138,11 +138,12 @@ python -u mindeye_text/sweep_mindeye_encoding.py \
 ```
 
 The sweep writes `mindeye_text/encoding_results_sweep/<tag>/` for each variant
-and a combined `sweep__summary.csv`. The ridge reference printed by the sweep is
-the selected-voxel bootstrap-CV mean `r` from
-`gpt1_encoding_comparison/outputs/<subject>/encoding_model_finetuned.npz`, so it
-is a useful but not perfectly matched comparator to the neural held-out-story
-validation score.
+and a combined `sweep__summary.csv`. The default sweep now trains
+`--target-mode ridge_residual`: a ridge model is fit on the same train stories,
+the neural model predicts held-out residuals, and the validation score is
+computed on `ridge + neural residual`. The key comparison columns are
+`best_val_mean_r_all`, `ridge_like_for_like_mean_r_all`, and
+`delta_vs_like_for_like_ridge`.
 
 ## Running held-out evaluation
 

@@ -27,28 +27,28 @@ TRAIN_SCRIPT = REPO_DIR / "mindeye_text" / "train_mindeye_encoding.py"
 
 VARIANTS = [
     {
-        "name": "latent4096_blocks4_drop015_wd001",
-        "args": ["--latent-dim", "4096", "--n-blocks", "4", "--dropout", "0.15", "--weight-decay", "1e-2", "--lr", "3e-4"],
+        "name": "resid_latent4096_blocks4_drop015_wd001",
+        "args": ["--target-mode", "ridge_residual", "--latent-dim", "4096", "--n-blocks", "4", "--dropout", "0.15", "--weight-decay", "1e-2", "--lr", "3e-4"],
     },
     {
-        "name": "latent2048_blocks2_drop030_wd005",
-        "args": ["--latent-dim", "2048", "--n-blocks", "2", "--dropout", "0.30", "--weight-decay", "5e-2", "--lr", "3e-4"],
+        "name": "resid_latent2048_blocks2_drop030_wd005",
+        "args": ["--target-mode", "ridge_residual", "--latent-dim", "2048", "--n-blocks", "2", "--dropout", "0.30", "--weight-decay", "5e-2", "--lr", "3e-4"],
     },
     {
-        "name": "latent2048_blocks4_drop020_wd002",
-        "args": ["--latent-dim", "2048", "--n-blocks", "4", "--dropout", "0.20", "--weight-decay", "2e-2", "--lr", "2e-4"],
+        "name": "resid_latent2048_blocks4_drop020_wd002",
+        "args": ["--target-mode", "ridge_residual", "--latent-dim", "2048", "--n-blocks", "4", "--dropout", "0.20", "--weight-decay", "2e-2", "--lr", "2e-4"],
     },
     {
-        "name": "latent4096_blocks2_drop030_wd005",
-        "args": ["--latent-dim", "4096", "--n-blocks", "2", "--dropout", "0.30", "--weight-decay", "5e-2", "--lr", "2e-4"],
+        "name": "resid_latent4096_blocks2_drop030_wd005",
+        "args": ["--target-mode", "ridge_residual", "--latent-dim", "4096", "--n-blocks", "2", "--dropout", "0.30", "--weight-decay", "5e-2", "--lr", "2e-4"],
     },
     {
-        "name": "latent1024_blocks2_drop040_wd010",
-        "args": ["--latent-dim", "1024", "--n-blocks", "2", "--dropout", "0.40", "--weight-decay", "1e-1", "--lr", "5e-4"],
+        "name": "resid_latent1024_blocks2_drop040_wd010",
+        "args": ["--target-mode", "ridge_residual", "--latent-dim", "1024", "--n-blocks", "2", "--dropout", "0.40", "--weight-decay", "1e-1", "--lr", "5e-4"],
     },
     {
-        "name": "latent3072_blocks3_drop025_wd003",
-        "args": ["--latent-dim", "3072", "--n-blocks", "3", "--dropout", "0.25", "--weight-decay", "3e-2", "--lr", "2e-4"],
+        "name": "resid_latent3072_blocks3_drop025_wd003",
+        "args": ["--target-mode", "ridge_residual", "--latent-dim", "3072", "--n-blocks", "3", "--dropout", "0.25", "--weight-decay", "3e-2", "--lr", "2e-4"],
     },
 ]
 

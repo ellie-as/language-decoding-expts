@@ -71,6 +71,15 @@ def parse_args() -> argparse.Namespace:
         choices=["paper"],
         help="Use Huth paper selected decoding voxels from models/<subject>/encoding_model_perceived.npz.",
     )
+    p.add_argument(
+        "--target-mode",
+        default="response",
+        choices=["response", "ridge_residual"],
+        help=(
+            "Predict responses directly, or predict residuals on top of a ridge "
+            "baseline trained on the same split."
+        ),
+    )
     p.add_argument("--latent-dim", type=int, default=4096)
     p.add_argument("--n-blocks", type=int, default=4)
     p.add_argument("--dropout", type=float, default=0.15)
@@ -166,6 +175,14 @@ def load_paper_alphas(subject: str, voxels: np.ndarray) -> np.ndarray:
     return alphas[np.asarray(voxels, dtype=np.int64)]
 
 
+def load_paper_weights(subject: str, voxels: np.ndarray) -> np.ndarray:
+    path = Path(config.MODEL_DIR) / subject / "encoding_model_perceived.npz"
+    if not path.exists():
+        raise FileNotFoundError(f"Paper encoding model not found: {path}")
+    data = np.load(path, allow_pickle=True)
+    return np.asarray(data["weights"][:, np.asarray(voxels, dtype=np.int64)], dtype=np.float32)
+
+
 def split_indices(n: int, val_frac: float, seed: int) -> tuple[np.ndarray, np.ndarray]:
     rng = np.random.default_rng(seed)
     idx = rng.permutation(n)
@@ -237,6 +254,21 @@ def predict_array(
     return np.vstack(outs).astype(np.float32)
 
 
+def predict_encoding_array(
+    model: MindEyeEncoding,
+    x: np.ndarray,
+    subject: str,
+    device: torch.device,
+    batch_size: int,
+    use_amp: bool,
+    base_weights: Dict[str, np.ndarray] | None = None,
+) -> np.ndarray:
+    pred = predict_array(model, x, subject, device, batch_size, use_amp)
+    if base_weights is not None:
+        pred = pred + x.dot(base_weights[subject]).astype(np.float32)
+    return pred.astype(np.float32, copy=False)
+
+
 def residual_noise_model(
     model: MindEyeEncoding,
     rstim: np.ndarray,
@@ -244,10 +276,19 @@ def residual_noise_model(
     device: torch.device,
     batch_size: int,
     use_amp: bool,
+    base_weights: Dict[str, np.ndarray] | None = None,
 ) -> Dict[str, np.ndarray]:
     out = {}
     for subject, resp in responses_by_subject.items():
-        pred = predict_array(model, rstim, subject, device, batch_size, use_amp)
+        pred = predict_encoding_array(
+            model,
+            rstim,
+            subject,
+            device,
+            batch_size,
+            use_amp,
+            base_weights=base_weights,
+        )
         residual = (resp - pred).astype(np.float32)
         cov = residual.T @ residual
         diag_mean = float(np.diag(cov).mean())
@@ -264,6 +305,7 @@ def ridge_like_for_like(
     subjects: List[str],
     train_idx: np.ndarray,
     val_idx: np.ndarray,
+    weights_by_subject: Dict[str, np.ndarray] | None = None,
 ) -> Dict[str, dict]:
     """Train ridge on the neural train split and evaluate on the same val split."""
     out = {}
@@ -271,8 +313,11 @@ def ridge_like_for_like(
     x_train = rstim[train_idx]
     x_val = rstim[val_idx]
     for subject in subjects:
-        alphas = load_paper_alphas(subject, voxels[subject])
-        weights = ridge(x_train, responses[subject][train_idx], alphas)
+        if weights_by_subject is None:
+            alphas = load_paper_alphas(subject, voxels[subject])
+            weights = ridge(x_train, responses[subject][train_idx], alphas)
+        else:
+            weights = weights_by_subject[subject]
         pred = x_val.dot(weights).astype(np.float32)
         corrs = corr_per_voxel(pred, responses[subject][val_idx])
         mean_r = float(corrs.mean())
@@ -282,10 +327,25 @@ def ridge_like_for_like(
             "ridge_like_for_like_max_r": float(corrs.max()),
         }
         vals.append(mean_r)
-        del weights, pred, corrs
+        del pred, corrs
     out["ALL"] = {
         "ridge_like_for_like_mean_r": float(np.mean(vals)) if vals else float("nan"),
     }
+    return out
+
+
+def fit_split_ridge_weights(
+    rstim: np.ndarray,
+    responses: Dict[str, np.ndarray],
+    voxels: Dict[str, np.ndarray],
+    subjects: List[str],
+    train_idx: np.ndarray,
+) -> Dict[str, np.ndarray]:
+    x_train = rstim[train_idx]
+    out = {}
+    for subject in subjects:
+        alphas = load_paper_alphas(subject, voxels[subject])
+        out[subject] = ridge(x_train, responses[subject][train_idx], alphas).astype(np.float32)
     return out
 
 
@@ -359,10 +419,26 @@ def main() -> None:
         )
     if args.skip_ridge_like_for_like:
         ridge_lfl = {}
+        split_ridge_weights = {}
         log.info("Skipping like-for-like ridge validation baseline.")
     else:
         log.info("Fitting like-for-like ridge baseline on the same validation split ...")
-        ridge_lfl = ridge_like_for_like(rstim, responses, voxels, args.subjects, train_idx, val_idx)
+        split_ridge_weights = fit_split_ridge_weights(
+            rstim,
+            responses,
+            voxels,
+            args.subjects,
+            train_idx,
+        )
+        ridge_lfl = ridge_like_for_like(
+            rstim,
+            responses,
+            voxels,
+            args.subjects,
+            train_idx,
+            val_idx,
+            weights_by_subject=split_ridge_weights,
+        )
         log.info(
             "Like-for-like ridge heldout mean r: %s",
             " ".join(
@@ -370,13 +446,36 @@ def main() -> None:
                 for subject in args.subjects
             ),
         )
+    full_paper_weights = {
+        subject: load_paper_weights(subject, voxels[subject])
+        for subject in args.subjects
+    }
+    if args.target_mode == "ridge_residual" and not split_ridge_weights:
+        raise ValueError("--target-mode ridge_residual requires the like-for-like ridge baseline.")
+    train_targets = {}
+    val_targets = {}
+    val_base_weights = None
+    if args.target_mode == "ridge_residual":
+        val_base_weights = split_ridge_weights
+        for subject in args.subjects:
+            base_pred = rstim.dot(split_ridge_weights[subject]).astype(np.float32)
+            residual_target = (responses[subject] - base_pred).astype(np.float32)
+            train_targets[subject] = residual_target
+            val_targets[subject] = residual_target
+            del base_pred, residual_target
+        log.info("Training neural model to predict ridge residuals.")
+    else:
+        for subject in args.subjects:
+            train_targets[subject] = responses[subject]
+            val_targets[subject] = responses[subject]
+        log.info("Training neural model to predict responses directly.")
 
     train_loaders = {}
     val_tensors = {}
     for subject in args.subjects:
         ds = TensorDataset(
             torch.from_numpy(rstim[train_idx]),
-            torch.from_numpy(responses[subject][train_idx]),
+            torch.from_numpy(train_targets[subject][train_idx]),
         )
         train_loaders[subject] = DataLoader(
             ds,
@@ -386,7 +485,11 @@ def main() -> None:
             pin_memory=device.type == "cuda",
             drop_last=True,
         )
-        val_tensors[subject] = (rstim[val_idx], responses[subject][val_idx])
+        val_tensors[subject] = (
+            rstim[val_idx],
+            val_targets[subject][val_idx],
+            responses[subject][val_idx],
+        )
 
     model = MindEyeEncoding(
         output_dims=output_dims,
@@ -435,10 +538,14 @@ def main() -> None:
         val_losses = {}
         val_corrs = {}
         with torch.no_grad():
-            for subject, (xv, yv) in val_tensors.items():
-                pred = predict_array(model, xv, subject, device, args.batch_size, use_amp)
-                mse = float(np.mean((pred - yv) ** 2))
-                corrs = corr_per_voxel(pred, yv)
+            for subject, (xv, yv_target, yv_response) in val_tensors.items():
+                pred_target = predict_array(model, xv, subject, device, args.batch_size, use_amp)
+                mse = float(np.mean((pred_target - yv_target) ** 2))
+                if args.target_mode == "ridge_residual":
+                    pred_response = pred_target + xv.dot(val_base_weights[subject]).astype(np.float32)
+                else:
+                    pred_response = pred_target
+                corrs = corr_per_voxel(pred_response, yv_response)
                 val_losses[subject] = mse
                 val_corrs[subject] = corrs
         val_loss = float(np.mean(list(val_losses.values())))
@@ -485,7 +592,16 @@ def main() -> None:
 
     model.load_state_dict({k: v.to(device) for k, v in best_state.items()})
     log.info("Estimating residual noise models from training residuals ...")
-    noise_model = residual_noise_model(model, rstim, responses, device, args.batch_size, use_amp)
+    decode_base_weights = full_paper_weights if args.target_mode == "ridge_residual" else None
+    noise_model = residual_noise_model(
+        model,
+        rstim,
+        responses,
+        device,
+        args.batch_size,
+        use_amp,
+        base_weights=decode_base_weights,
+    )
 
     tag = args.tag or build_tag(args)
     out_dir = Path(args.output_dir).expanduser().resolve() / tag
@@ -529,6 +645,7 @@ def main() -> None:
         "last_val_mean_r": float(history[-1]["val_mean_r_all"]),
         "val_mode": str(args.val_mode),
         "val_stories": list(val_stories),
+        "target_mode": str(args.target_mode),
         **ridge_lfl.get("ALL", {}),
         "delta_best_r_minus_ridge_like_for_like": (
             float(best_r_row["val_mean_r_all"])
@@ -550,6 +667,7 @@ def main() -> None:
         "dropout": float(args.dropout),
         "input_norm": bool(args.input_norm),
         "head_norm": bool(args.head_norm),
+        "target_mode": str(args.target_mode),
         "feature_checkpoint": str(args.finetuned_checkpoint),
         "feature_layer": int(config.GPT_LAYER),
         "context_words": int(config.GPT_WORDS),
@@ -560,6 +678,7 @@ def main() -> None:
         "val_stories": np.array(val_stories),
         "val_mode": str(args.val_mode),
         "voxels": voxels,
+        "base_weights": full_paper_weights if args.target_mode == "ridge_residual" else {},
         "noise_model": noise_model,
         "tr_stats": np.array(tr_stats, dtype=object),
         "word_stats": np.array(word_stats, dtype=object),
