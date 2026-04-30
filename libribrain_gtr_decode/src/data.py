@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -56,9 +57,17 @@ def discover_runs(config: dict[str, Any]) -> list[RunSpec]:
     missing_transcripts = sorted(set(meg_files) - set(transcript_files))
     missing_meg = sorted(set(transcript_files) - set(meg_files))
     if missing_transcripts:
-        LOGGER.warning("Skipping %d MEG files without matched transcript/events files", len(missing_transcripts))
+        LOGGER.warning(
+            "Skipping %d MEG files without matched transcript/events files: %s",
+            len(missing_transcripts),
+            [(key, str(meg_files[key])) for key in missing_transcripts[:5]],
+        )
     if missing_meg:
-        LOGGER.warning("Skipping %d transcript/events files without matched MEG files", len(missing_meg))
+        LOGGER.warning(
+            "Skipping %d transcript/events files without matched MEG files: %s",
+            len(missing_meg),
+            [(key, str(transcript_files[key])) for key in missing_meg[:5]],
+        )
     for key in keys:
         subject, session, run = key
         if subjects and subject not in subjects:
@@ -91,20 +100,19 @@ def _indexed_files(root: Path, patterns: list[str]) -> dict[tuple[str, str, str]
 
 
 def _infer_key(path: Path) -> tuple[str, str, str]:
-    tokens = path.stem.replace(".", "_").split("_")
-    parts = list(path.parts) + tokens
-    subject = _token_value(parts, "sub-", default="sub-unknown")
-    session = _token_value(parts, "ses-", default="ses-unknown")
-    task = _token_value(parts, "task-", default=None)
-    run = _token_value(parts, "run-", default=path.stem)
+    text = str(path)
+    subject = _regex_token(text, r"sub-([^_/]+)", prefix="sub-", default="sub-unknown")
+    session = _regex_token(text, r"ses-([^_/]+)", prefix="ses-", default="ses-unknown")
+    task = _regex_token(text, r"task-([^_/]+)", prefix="task-", default=None)
+    run = _regex_token(text, r"run-([^_/\.]+)", prefix="run-", default=path.stem)
     run_id = f"{task}_{run}" if task else run
     return subject, session, run_id
 
 
-def _token_value(parts: list[str], prefix: str, default: str | None) -> str:
-    for part in parts:
-        if part.startswith(prefix):
-            return part
+def _regex_token(text: str, pattern: str, prefix: str, default: str | None) -> str:
+    match = re.search(pattern, text)
+    if match:
+        return f"{prefix}{match.group(1)}"
     return str(default)
 
 
