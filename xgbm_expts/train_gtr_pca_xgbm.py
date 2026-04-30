@@ -35,6 +35,9 @@ from _shared import load_or_build_chunk_embeddings  # noqa: E402
 from utils_resp import get_resp  # noqa: E402
 
 
+SUBJECT_TO_UTS = {"S1": "UTS01", "S2": "UTS02", "S3": "UTS03"}
+
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -54,6 +57,13 @@ def parse_args() -> argparse.Namespace:
         default="smb://ceph-gw02.hpc.swc.ucl.ac.uk/behrens/ellie/language-decoding-expts",
     )
     p.add_argument("--feature-model", default="gtr-base", choices=["gtr-base", "embedding"])
+    p.add_argument(
+        "--voxel-source",
+        default="huth10k",
+        choices=["huth10k", "full_frontal", "all"],
+        help="Brain voxel set used as input features.",
+    )
+    p.add_argument("--ba-dir", default=str(REPO_DIR / "ba_indices"))
     p.add_argument("--chunk-trs", type=int, default=5)
     p.add_argument("--lag-trs", type=int, default=3)
     p.add_argument("--brain-offsets", type=int, nargs="+", default=[0])
@@ -131,6 +141,30 @@ def load_huth_voxels(subject: str) -> np.ndarray:
         raise FileNotFoundError(f"Huth encoding model not found: {path}")
     data = np.load(path, allow_pickle=True)
     return np.asarray(data["voxels"], dtype=np.int64)
+
+
+def load_voxels(subject: str, voxel_source: str, total_voxels: int, ba_dir: str) -> np.ndarray:
+    if voxel_source == "huth10k":
+        vox = load_huth_voxels(subject)
+    elif voxel_source == "all":
+        vox = np.arange(total_voxels, dtype=np.int64)
+    elif voxel_source == "full_frontal":
+        uts_id = SUBJECT_TO_UTS.get(subject)
+        if not uts_id:
+            raise ValueError(f"No UTS id mapping for subject {subject!r}")
+        path = Path(ba_dir).expanduser().resolve() / uts_id / "BA_full_frontal.json"
+        if not path.exists():
+            raise FileNotFoundError(f"Full-frontal ROI file not found: {path}")
+        with open(path, encoding="utf-8") as f:
+            payload = json.load(f)
+        vox = np.asarray(next(iter(payload.values())), dtype=np.int64)
+    else:
+        raise ValueError(f"Unknown voxel source: {voxel_source}")
+    vox = np.sort(np.asarray(vox, dtype=np.int64))
+    vox = vox[(vox >= 0) & (vox < int(total_voxels))]
+    if vox.size == 0:
+        raise ValueError(f"Voxel source {voxel_source!r} produced no valid voxels for {subject}")
+    return vox
 
 
 def stack_embeddings(embeddings: Dict[str, np.ndarray], stories: List[str]) -> np.ndarray:
@@ -338,7 +372,7 @@ def prediction_metrics(pred: np.ndarray, true: np.ndarray, prefix: str = "") -> 
 def build_tag(args: argparse.Namespace, subject: str) -> str:
     offsets = "-".join(str(int(o)) for o in args.brain_offsets)
     return args.tag or (
-        f"{subject}__{args.feature_model}__pca{args.pca_dim}__{args.backend}"
+        f"{subject}__{args.feature_model}__{args.voxel_source}__pca{args.pca_dim}__{args.backend}"
         f"__depth{args.max_depth}-est{args.n_estimators}-lr{args.learning_rate:g}"
         f"__offs{offsets}__seed{args.seed}"
     )
@@ -346,9 +380,12 @@ def build_tag(args: argparse.Namespace, subject: str) -> str:
 
 def run_subject(args: argparse.Namespace, subject: str, stories: List[str]) -> dict:
     train_stories, val_stories = split_stories(stories, args)
-    voxels = load_huth_voxels(subject)
-    log.info("[%s] Huth voxels: %d", subject, len(voxels))
     log.info("[%s] Validation stories: %s", subject, ", ".join(val_stories))
+
+    sample_resp = get_resp(subject, [stories[0]], stack=True, vox=None)
+    total_voxels = int(sample_resp.shape[1])
+    voxels = load_voxels(subject, args.voxel_source, total_voxels, args.ba_dir)
+    log.info("[%s] Voxel source %s: %d/%d voxels", subject, args.voxel_source, len(voxels), total_voxels)
 
     responses = get_resp(subject, stories, stack=False, vox=voxels)
     responses = {story: arr.astype(np.float32) for story, arr in responses.items()}
@@ -399,6 +436,7 @@ def run_subject(args: argparse.Namespace, subject: str, stories: List[str]) -> d
         "subject": subject,
         "backend": args.backend,
         "feature_model": args.feature_model,
+        "voxel_source": args.voxel_source,
         "pca_dim": int(args.pca_dim),
         "n_voxels": int(len(voxels)),
         "brain_offsets": " ".join(str(int(o)) for o in args.brain_offsets),

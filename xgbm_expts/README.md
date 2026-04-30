@@ -19,6 +19,7 @@ From the repo root on the cluster:
 ```bash
 python -u xgbm_expts/train_gtr_pca_xgbm.py \
   --subjects S1 S2 S3 \
+  --voxel-source huth10k \
   --backend lightgbm \
   --pca-dim 10 \
   --brain-offsets 0 1 2 3 4 \
@@ -34,6 +35,7 @@ For local use with the Ceph share mounted:
 python -u xgbm_expts/train_gtr_pca_xgbm.py \
   --subjects S1 \
   --local-compute-mode \
+  --voxel-source huth10k \
   --backend lightgbm \
   --pca-dim 10 \
   --brain-offsets 0
@@ -44,6 +46,16 @@ If `lightgbm` is unavailable, use:
 ```bash
 --backend sklearn_hist
 ```
+
+To use the full-frontal ROI instead of Huth's selected 10k decoding voxels:
+
+```bash
+--voxel-source full_frontal
+```
+
+This reads `ba_indices/<UTS subject>/BA_full_frontal.json`. You can also pass
+`--voxel-source all` for all voxels, though this is usually too large unless
+combined with `--brain-pca` or `--max-features`.
 
 ## Outputs
 
