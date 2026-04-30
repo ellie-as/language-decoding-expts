@@ -8,7 +8,7 @@ import pandas as pd
 from scipy.signal import resample
 from tqdm import tqdm
 
-from .data import RunSpec, load_meg_array
+from .data import RunSpec, close_meg_array, load_meg_array
 
 
 def expected_n_times(config: dict[str, Any]) -> int:
@@ -49,41 +49,52 @@ def build_meg_feature_memmap(
 
     first_run = run_lookup[windows["run_group"].iloc[0]]
     first_meg = load_meg_array(first_run, config)
-    n_channels = int(first_meg["data"].shape[0])
+    try:
+        n_channels = int(first_meg["data"].shape[0])
+        raw_sfreq = float(first_meg["sfreq"])
+    finally:
+        close_meg_array(first_meg)
+
     n_times = expected_n_times(config)
     valid_rows = []
     windows_by_run = list(windows.groupby("run_group", sort=False))
     for run_group, sub in windows_by_run:
-        meg = first_meg if run_group == first_run.group_id else load_meg_array(run_lookup[run_group], config)
-        if int(meg["data"].shape[0]) != n_channels:
-            raise ValueError(
-                f"Run {run_group} has {meg['data'].shape[0]} channels, expected {n_channels}. "
-                "Check that events and MEG files were paired correctly and that all runs use the same channel set."
-            )
-        for _, row in sub.iterrows():
-            if extract_meg_window(meg, float(row["t"]), config) is not None:
-                valid_rows.append(row)
+        meg = load_meg_array(run_lookup[run_group], config)
+        try:
+            if int(meg["data"].shape[0]) != n_channels:
+                raise ValueError(
+                    f"Run {run_group} has {meg['data'].shape[0]} channels, expected {n_channels}. "
+                    "Check that events and MEG files were paired correctly and that all runs use the same channel set."
+                )
+            for _, row in sub.iterrows():
+                if extract_meg_window(meg, float(row["t"]), config) is not None:
+                    valid_rows.append(row)
+        finally:
+            close_meg_array(meg)
     metadata = pd.DataFrame(valid_rows).reset_index(drop=True)
     arr = np.memmap(out_path, mode="w+", dtype="float32", shape=(len(metadata), n_channels, n_times))
 
     row_offset = 0
     for run_group, sub in tqdm(list(metadata.groupby("run_group", sort=False)), desc="MEG windows"):
-        meg = first_meg if run_group == first_run.group_id else load_meg_array(run_lookup[run_group], config)
-        for _, row in sub.iterrows():
-            window = extract_meg_window(meg, float(row["t"]), config)
-            if window is None:
-                raise RuntimeError("Internal error: window became invalid during second pass")
-            if window.shape != (n_channels, n_times):
-                raise ValueError(f"Run {run_group} produced window shape {window.shape}, expected {(n_channels, n_times)}")
-            arr[row_offset] = window
-            row_offset += 1
+        meg = load_meg_array(run_lookup[run_group], config)
+        try:
+            for _, row in sub.iterrows():
+                window = extract_meg_window(meg, float(row["t"]), config)
+                if window is None:
+                    raise RuntimeError("Internal error: window became invalid during second pass")
+                if window.shape != (n_channels, n_times):
+                    raise ValueError(f"Run {run_group} produced window shape {window.shape}, expected {(n_channels, n_times)}")
+                arr[row_offset] = window
+                row_offset += 1
+        finally:
+            close_meg_array(meg)
     arr.flush()
     info = {
         "path": str(out_path),
         "n_examples": int(len(metadata)),
         "n_channels": n_channels,
         "n_timepoints": n_times,
-        "raw_sampling_hz": float(first_meg["sfreq"]),
+        "raw_sampling_hz": raw_sfreq,
         "downsample_hz": float(config["features"]["meg_downsample_hz"]),
         "tmin_sec": float(config["windows"]["meg_tmin_sec"]),
         "tmax_sec": float(config["windows"]["meg_tmax_sec"]),

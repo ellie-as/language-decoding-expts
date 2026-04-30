@@ -29,6 +29,24 @@ class RunSpec:
         return f"{self.subject}/{self.session}/{self.run}"
 
 
+class H5BackedArray:
+    """Small wrapper that keeps an HDF5 file open for slice-only MEG access."""
+
+    def __init__(self, path: Path):
+        import h5py
+
+        self.path = path
+        self.file = h5py.File(path, "r")
+        self.dataset = self.file["data"]
+        self.shape = self.dataset.shape
+
+    def __getitem__(self, item):
+        return self.dataset[item]
+
+    def close(self) -> None:
+        self.file.close()
+
+
 def discover_runs(config: dict[str, Any]) -> list[RunSpec]:
     data_cfg = config.get("data", {})
     debug_cfg = config.get("debug", {})
@@ -187,14 +205,22 @@ def load_meg_array(run: RunSpec, config: dict[str, Any], preload_seconds: float 
         import h5py
 
         with h5py.File(path, "r") as f:
-            data = f["data"][:]
-            sfreq = float(f.attrs.get("sample_frequency", f["data"].attrs.get("sample_frequency", features_cfg.get("raw_sampling_hz", 250))))
-        if data.shape[0] > data.shape[1]:
-            LOGGER.warning("Loaded H5 MEG array looks time x channels; transposing to channels x time")
-            data = data.T
+            sfreq = float(
+                f.attrs.get(
+                    "sample_frequency",
+                    f["data"].attrs.get("sample_frequency", features_cfg.get("raw_sampling_hz", 250)),
+                )
+            )
+            shape = tuple(f["data"].shape)
+        if shape[0] > shape[1]:
+            raise ValueError(f"H5 MEG file appears to be time x channels, expected channels x time: {path} {shape}")
         if preload_seconds is not None:
-            data = data[:, : int(round(preload_seconds * sfreq))]
-        return {"data": data.astype(np.float32), "sfreq": sfreq, "times": np.arange(data.shape[1]) / sfreq, "ch_names": None}
+            with h5py.File(path, "r") as f:
+                n = min(shape[1], int(round(preload_seconds * sfreq)))
+                data = f["data"][:, :n].astype(np.float32)
+            return {"data": data, "sfreq": sfreq, "times": np.arange(data.shape[1]) / sfreq, "ch_names": None}
+        data = H5BackedArray(path)
+        return {"data": data, "sfreq": sfreq, "times": None, "ch_names": None}
 
     if path.suffix in {".npy", ".npz"}:
         arr = np.load(path)
@@ -216,6 +242,14 @@ def load_meg_array(run: RunSpec, config: dict[str, Any], preload_seconds: float 
         return {"data": data, "sfreq": float(raw.info["sfreq"]), "times": raw.times, "ch_names": [raw.ch_names[i] for i in picks]}
     except Exception as exc:
         raise RuntimeError(f"Could not load MEG file {path}. Add a loader for this format.") from exc
+
+
+def close_meg_array(meg: dict[str, Any] | None) -> None:
+    if not meg:
+        return
+    close = getattr(meg.get("data"), "close", None)
+    if close is not None:
+        close()
 
 
 def save_summary_text(summary: dict[str, Any], path: Path) -> None:
