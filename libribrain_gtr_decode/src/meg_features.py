@@ -55,6 +55,11 @@ def build_meg_feature_memmap(
     windows_by_run = list(windows.groupby("run_group", sort=False))
     for run_group, sub in windows_by_run:
         meg = first_meg if run_group == first_run.group_id else load_meg_array(run_lookup[run_group], config)
+        if int(meg["data"].shape[0]) != n_channels:
+            raise ValueError(
+                f"Run {run_group} has {meg['data'].shape[0]} channels, expected {n_channels}. "
+                "Check that events and MEG files were paired correctly and that all runs use the same channel set."
+            )
         for _, row in sub.iterrows():
             if extract_meg_window(meg, float(row["t"]), config) is not None:
                 valid_rows.append(row)
@@ -68,6 +73,8 @@ def build_meg_feature_memmap(
             window = extract_meg_window(meg, float(row["t"]), config)
             if window is None:
                 raise RuntimeError("Internal error: window became invalid during second pass")
+            if window.shape != (n_channels, n_times):
+                raise ValueError(f"Run {run_group} produced window shape {window.shape}, expected {(n_channels, n_times)}")
             arr[row_offset] = window
             row_offset += 1
     arr.flush()

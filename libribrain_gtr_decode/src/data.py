@@ -52,7 +52,13 @@ def discover_runs(config: dict[str, Any]) -> list[RunSpec]:
     meg_files = _indexed_files(root, ["*.fif", "*.fif.gz", "*.npy", "*.npz", "*.h5"])
 
     specs: list[RunSpec] = []
-    keys = sorted(set(transcript_files) | set(meg_files))
+    keys = sorted(set(transcript_files) & set(meg_files))
+    missing_transcripts = sorted(set(meg_files) - set(transcript_files))
+    missing_meg = sorted(set(transcript_files) - set(meg_files))
+    if missing_transcripts:
+        LOGGER.warning("Skipping %d MEG files without matched transcript/events files", len(missing_transcripts))
+    if missing_meg:
+        LOGGER.warning("Skipping %d transcript/events files without matched MEG files", len(missing_meg))
     for key in keys:
         subject, session, run = key
         if subjects and subject not in subjects:
@@ -85,12 +91,21 @@ def _indexed_files(root: Path, patterns: list[str]) -> dict[tuple[str, str, str]
 
 
 def _infer_key(path: Path) -> tuple[str, str, str]:
-    parts = path.parts
-    subject = next((p for p in parts if p.startswith("sub-")), "sub-unknown")
-    session = next((p for p in parts if p.startswith("ses-")), "ses-unknown")
-    stem = path.name
-    run = next((token for token in stem.replace(".", "_").split("_") if token.startswith("run-")), path.stem)
-    return subject, session, run
+    tokens = path.stem.replace(".", "_").split("_")
+    parts = list(path.parts) + tokens
+    subject = _token_value(parts, "sub-", default="sub-unknown")
+    session = _token_value(parts, "ses-", default="ses-unknown")
+    task = _token_value(parts, "task-", default=None)
+    run = _token_value(parts, "run-", default=path.stem)
+    run_id = f"{task}_{run}" if task else run
+    return subject, session, run_id
+
+
+def _token_value(parts: list[str], prefix: str, default: str | None) -> str:
+    for part in parts:
+        if part.startswith(prefix):
+            return part
+    return str(default)
 
 
 def inspect_libribrain(config: dict[str, Any]) -> dict[str, Any]:
@@ -123,7 +138,7 @@ def inspect_libribrain(config: dict[str, Any]) -> dict[str, Any]:
 
 def load_transcript_like(run: RunSpec) -> pd.DataFrame:
     if run.transcript_path is None:
-        return mock_transcript(run, duration_sec=240)
+        raise FileNotFoundError(f"No transcript/events file matched run {run.group_id}")
     path = Path(run.transcript_path)
     if path.suffix == ".csv":
         return pd.read_csv(path)
