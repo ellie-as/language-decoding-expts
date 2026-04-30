@@ -1,0 +1,26 @@
+name: libribrain-gtr
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - numpy
+  - scipy
+  - pandas
+  - pyarrow
+  - scikit-learn
+  - pytorch
+  - pytorch-cuda=12.1
+  - h5py
+  - mne
+  - tqdm
+  - pyyaml
+  - joblib
+  - matplotlib
+  - pip
+  - pip:
+      - sentence-transformers
+      - transformers
+      - pnpl @ git+https://github.com/neural-processing-lab/pnpl.git

@@ -1,0 +1,66 @@
+project:
+  seed: 0
+  output_dir: outputs/debug
+  cache_dir: outputs/debug/cache
+
+data:
+  pnpl_root: null
+  libribrain_root: null
+  subject: debug_subject
+  sessions: [debug_session]
+  runs: [debug_run]
+  mock_data: true
+
+windows:
+  text_window_sec: 10.0
+  sample_interval_sec: 1.0
+  min_words: 3
+  meg_tmin_sec: -10.0
+  meg_tmax_sec: 1.0
+
+features:
+  meg_downsample_hz: 50
+  standardize_channels: true
+  use_all_channels: true
+  pca_components: 64
+  pca_batch_size: 128
+  meg_batch_size: 256
+  mock_sampling_hz: 200
+  mock_channels: 32
+  mock_duration_sec: 240
+
+embeddings:
+  model_name: sentence-transformers/gtr-t5-base
+  batch_size: 8
+  normalize: true
+  mock: true
+  mock_dim: 768
+
+split:
+  method: by_run
+  train_fraction: 0.8
+  val_fraction: 0.1
+  test_fraction: 0.1
+  seed: 0
+
+ridge:
+  alphas: [0.1, 1, 10, 100, 1000]
+  selection_metric: val_mrr_same_run_or_batch
+  normalize_predictions: true
+  controls: [time_shift, shuffled_labels]
+  time_shift_sec: 60.0
+
+evaluation:
+  n_random_distractors: 99
+  relaxed_tolerance_sec: 10.0
+  relaxed_tolerances_sec: [5.0, 10.0]
+  evaluate_global_random: true
+  evaluate_same_run: true
+  evaluate_nearby: true
+  nearby_min_sec: 30
+  nearby_max_sec: 120
+
+debug:
+  enabled: true
+  max_runs: 1
+  max_examples: 2000

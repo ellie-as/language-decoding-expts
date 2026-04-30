@@ -1,0 +1,15 @@
+numpy
+scipy
+pandas
+pyarrow
+scikit-learn
+torch
+sentence-transformers
+transformers
+h5py
+mne
+tqdm
+pyyaml
+joblib
+matplotlib
+pnpl @ git+https://github.com/neural-processing-lab/pnpl.git
