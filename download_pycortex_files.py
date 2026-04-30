@@ -18,21 +18,25 @@ FILES_BY_SUBJECT = {
         "cache/flatmask_1024.npz",
         "surfaces/pia_lh.gii",
         "surfaces/pia_rh.gii",
+        "surfaces/wm_lh.gii",                       # needed for fiducial -> flatmap rendering
+        "surfaces/wm_rh.gii",
         "surfaces/flat_lh.gii",
         "surfaces/flat_rh.gii",
-        "surfaces/inflated_lh.gii",                 
-        "surfaces/inflated_rh.gii", 
+        "surfaces/inflated_lh.gii",
+        "surfaces/inflated_rh.gii",
         "transforms/UTS01_auto/matrices.xfm",
         "transforms/UTS01_auto/mask_cortical.nii.gz",
         "transforms/UTS01_auto/mask_thick.nii.gz",
         "transforms/UTS01_auto/reference.nii.gz"
     ],
     "UTS02": [
-        "cache/identity_pointnn.npz",          
+        "cache/identity_pointnn.npz",
         "cache/flatverts_1024.npz",
         "cache/flatmask_1024.npz",
-        "surfaces/pia_lh.npz",                 # different format!
+        "surfaces/pia_lh.npz",                       # different format!
         "surfaces/pia_rh.npz",
+        "surfaces/wm_lh.npz",                        # needed for fiducial -> flatmap rendering
+        "surfaces/wm_rh.npz",
         "surfaces/flat_lh.npz",
         "surfaces/flat_rh.npz",
         "surfaces/inflated_lh.npz",
@@ -40,17 +44,19 @@ FILES_BY_SUBJECT = {
         "transforms/UTS02_auto/matrices.xfm",
         "transforms/UTS02_auto/mask_cortical.nii.gz",
         "transforms/UTS02_auto/mask_thick.nii.gz",
-        "transforms/UTS02_auto/reference.nii.gz"  # needed for surface→MNI transform
+        "transforms/UTS02_auto/reference.nii.gz"      # needed for surface→MNI transform
     ],
     "UTS03": [
-        "cache/flatverts_1024.npz",           
+        "cache/flatverts_1024.npz",
         "cache/flatmask_1024.npz",
         "surfaces/pia_lh.gii",
         "surfaces/pia_rh.gii",
+        "surfaces/wm_lh.gii",                         # needed for fiducial -> flatmap rendering
+        "surfaces/wm_rh.gii",
         "surfaces/flat_lh.gii",
         "surfaces/flat_rh.gii",
-        "surfaces/inflated_lh.gii",                 
-        "surfaces/inflated_rh.gii",                 
+        "surfaces/inflated_lh.gii",
+        "surfaces/inflated_rh.gii",
         "transforms/UTS03_auto/matrices.xfm",
         "transforms/UTS03_auto/mask_cortical.nii.gz",
         "transforms/UTS03_auto/mask_thick.nii.gz",
