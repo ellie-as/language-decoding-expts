@@ -196,11 +196,10 @@ def main() -> None:
     voxels = np.asarray(data["voxels"], dtype=int)
 
     subject = resolve_subject(args, results_dir, data)
-    pycortex_subject = args.pycortex_subject or SUBJECT_TO_UTS[subject]
     n_total = args.n_total_voxels or detect_n_total_voxels(subject)
     log.info(
-        "Subject=%s pycortex=%s n_total_voxels=%d corrs=%s lags=%s",
-        subject, pycortex_subject, n_total, corrs.shape, lags.tolist(),
+        "Subject=%s n_total_voxels=%d corrs=%s lags=%s",
+        subject, n_total, corrs.shape, lags.tolist(),
     )
 
     out_dir = Path(args.out_dir) if args.out_dir else (results_dir / "flatmaps")
@@ -212,13 +211,25 @@ def main() -> None:
     except ImportError:
         sys.exit(1)
 
-    if pycortex_subject not in cortex.db.subjects:
+    available = sorted(cortex.db.subjects.keys())
+    if args.pycortex_subject:
+        candidates = [args.pycortex_subject]
+    else:
+        candidates = [
+            SUBJECT_TO_UTS.get(subject, ""),
+            subject,
+            f"sub-{SUBJECT_TO_UTS.get(subject, '')}",
+            f"sub-{subject}",
+        ]
+    pycortex_subject = next((name for name in candidates if name and name in available), None)
+    if pycortex_subject is None:
         raise SystemExit(
-            f"pycortex does not know about subject {pycortex_subject!r} after pointing it at the "
-            "filestore. Subjects available: "
-            f"{sorted(cortex.db.subjects.keys())}. Either pass --pycortex-filestore explicitly "
+            f"pycortex does not know about any of {candidates!r} for subject {subject!r}. "
+            f"Subjects available in the filestore: {available}. Either pass "
+            "--pycortex-subject explicitly, --pycortex-filestore to point at a different db, "
             f"or run download_pycortex_files.py to populate {REPO_DIR / 'pycortex-db'}."
         )
+    log.info("Using pycortex subject %s (from %s)", pycortex_subject, available)
 
     import matplotlib
     matplotlib.use("Agg")
