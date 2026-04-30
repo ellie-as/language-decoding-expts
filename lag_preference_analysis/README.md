@@ -21,6 +21,7 @@ that lag preference is organised anatomically.
 | --- | --- |
 | `train_lag_encoding.py` | Train one ridge encoder per lag, save per-voxel r per lag. |
 | `analyze_lag_preference.py` | Read the saved r matrix, break down by Brodmann sub-ROI. |
+| `plot_lag_flatmaps.py` | Render pycortex flatmaps of preferred lag, best-lag r, etc. |
 
 ## Outputs (per run)
 
@@ -107,3 +108,40 @@ python lag_preference_analysis/train_lag_encoding.py \
 
 The CSV (`lag_preference_breakdown.csv`) is long-form (`metric, roi, lag, value`)
 so it is easy to plot from a notebook.
+
+## Cortical-surface flatmaps
+
+`plot_lag_flatmaps.py` projects the saved per-voxel results back onto the
+subject's surface using pycortex. Run it after `train_lag_encoding.py`:
+
+```
+python lag_preference_analysis/plot_lag_flatmaps.py \
+    --results-dir lag_preference_analysis/results/S1__embedding__lags1-10__chunk1tr__seed0
+```
+
+It writes:
+
+```
+results/<tag>/flatmaps/
+├── preferred_lag.png             # argmax_lag corrs per full_frontal voxel
+├── preferred_lag_masked.png      # same, but voxels with best-lag r < threshold are NaN
+├── com_lag.png                   # r-weighted centre-of-mass lag (smoother gradient)
+├── com_lag_masked.png            # com_lag with the same mask applied
+├── best_lag_r.png                # intensity map: r at each voxel's preferred lag
+├── per_lag/lag<lag>.png          # (optional, --per-lag) per-lag r flatmaps
+└── lag_preference_maps.npz       # arrays projected onto full-brain indices
+```
+
+Useful flags:
+
+- `--mask-r-threshold 0.05` — voxels with best-lag r below this are masked
+  (NaN ⇒ background curvature) in the `*_masked` figures.
+- `--cmap-pref viridis` — colormap for lag preference.
+- `--per-lag` — also dump one flatmap per individual lag (red/blue diverging).
+- `--pycortex-filestore /path/to/pycortex-db` — point pycortex at a specific
+  filestore (otherwise it uses your `~/.config/pycortex/options.cfg`).
+- `--n-total-voxels 81126` — full-volume voxel count; auto-detected from a
+  response file when possible.
+
+Voxels outside `BA_full_frontal` are NaN, so the rest of the cortex shows
+curvature only and the gradient is easy to read.
