@@ -1,0 +1,66 @@
+project:
+  seed: 0
+  output_dir: /ceph/behrens/ellie/language-decoding-expts/libribrain_gtr_decode/outputs/ridge_cluster_random_projection
+  cache_dir: /ceph/behrens/ellie/language-decoding-expts/libribrain_gtr_decode/outputs/ridge_cluster_random_projection/cache
+
+data:
+  pnpl_root: null
+  libribrain_root: /ceph/behrens/ellie/language-decoding-expts/libribrain_gtr_decode/data/LibriBrain
+  subject: null
+  sessions: null
+  runs: null
+  mock_data: false
+
+windows:
+  text_window_sec: 10.0
+  sample_interval_sec: 1.0
+  min_words: 3
+  meg_tmin_sec: -10.0
+  meg_tmax_sec: 1.0
+
+features:
+  meg_downsample_hz: 50
+  standardize_channels: true
+  use_all_channels: true
+  reducer: random_projection
+  projection_components: 4096
+  projection_batch_size: 2048
+  pca_components: 0
+  pca_batch_size: 2048
+  meg_batch_size: 512
+
+embeddings:
+  model_name: sentence-transformers/gtr-t5-base
+  batch_size: 64
+  normalize: true
+  mock: false
+  mock_dim: 768
+
+split:
+  method: by_run
+  train_fraction: 0.8
+  val_fraction: 0.1
+  test_fraction: 0.1
+  seed: 0
+
+ridge:
+  alphas: [0.1, 1, 10, 100, 1000]
+  selection_metric: val_mrr_same_run_or_batch
+  normalize_predictions: true
+  controls: []
+  time_shift_sec: 60.0
+
+evaluation:
+  n_random_distractors: 999
+  relaxed_tolerance_sec: 10.0
+  relaxed_tolerances_sec: [5.0, 10.0]
+  evaluate_global_random: true
+  evaluate_same_run: true
+  evaluate_nearby: true
+  nearby_min_sec: 30
+  nearby_max_sec: 300
+
+debug:
+  enabled: false
+  max_runs: 1
+  max_examples: 2000

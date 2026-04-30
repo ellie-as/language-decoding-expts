@@ -118,6 +118,15 @@ python scripts/run_ridge_pipeline.py \
 
 The full raw LibriBrain cache is around tens of GB, and derived MEG windows can also become large. Keep `project.output_dir`, `project.cache_dir`, and `data.libribrain_root` on a filesystem with enough space.
 
+For a faster full-dataset ridge baseline, use random projection instead of PCA:
+
+```bash
+python scripts/run_ridge_pipeline.py \
+  --config configs/ridge_cluster_random_projection.yaml
+```
+
+Random projection avoids the expensive IncrementalPCA fit and reduces flattened MEG windows to `projection_components` dimensions before ridge regression. If you already built `outputs/ridge_cluster/meg_features`, you can reuse it by copying the `text_windows`, `embeddings`, `splits`, and `meg_features` subdirectories into `outputs/ridge_cluster_random_projection/`, then running `scripts/train_ridge_baseline.py` with the random-projection config.
+
 ## Pipeline Steps
 
 Every step is command-line runnable and cacheable:

@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 from sklearn.decomposition import IncrementalPCA
 from sklearn.linear_model import Ridge
+from sklearn.random_projection import GaussianRandomProjection
 
 from .evaluation import evaluate_all, make_plots
 from .io_utils import ensure_dir, save_json
@@ -55,16 +56,34 @@ def train_ridge_baseline(
     if len(split_indices["test"]) == 0:
         split_indices["test"] = split_indices["val"]
 
-    batch_size = int(config["features"].get("pca_batch_size", 2048))
+    features_cfg = config["features"]
+    batch_size = int(features_cfg.get("pca_batch_size", features_cfg.get("projection_batch_size", 2048)))
     scaler = BatchStandardizer().fit(x, split_indices["train"], batch_size=batch_size)
     n_train = len(split_indices["train"])
     n_features = int(np.prod(x.shape[1:]))
-    n_components = min(int(config["features"]["pca_components"]), max(1, n_train - 1), n_features)
-    ipca = IncrementalPCA(n_components=n_components, batch_size=max(batch_size, n_components))
-    for batch in scaler.transform_indices(x, split_indices["train"], batch_size=max(batch_size, n_components)):
-        if batch.shape[0] >= n_components:
-            ipca.partial_fit(batch)
-    z = {split: _transform_split(x, idx, scaler, ipca, batch_size) for split, idx in split_indices.items()}
+    reducer_name = str(features_cfg.get("reducer", "pca")).lower()
+    if reducer_name in {"random_projection", "rp", "gaussian_random_projection"}:
+        n_components = min(int(features_cfg.get("projection_components", features_cfg.get("pca_components", 4096))), n_features)
+        reducer = GaussianRandomProjection(
+            n_components=n_components,
+            random_state=int(config["project"].get("seed", 0)),
+        )
+        # Fit establishes the random matrix shape; it does not inspect data values.
+        reducer.fit(np.zeros((1, n_features), dtype=np.float32))
+        z = {split: _transform_split(x, idx, scaler, reducer, batch_size) for split, idx in split_indices.items()}
+    elif reducer_name in {"none", "identity", "raw"} or int(features_cfg.get("pca_components", 0)) == 0:
+        n_components = n_features
+        reducer = None
+        z = {split: _transform_split(x, idx, scaler, reducer, batch_size) for split, idx in split_indices.items()}
+    elif reducer_name == "pca":
+        n_components = min(int(features_cfg["pca_components"]), max(1, n_train - 1), n_features)
+        reducer = IncrementalPCA(n_components=n_components, batch_size=max(batch_size, n_components))
+        for batch in scaler.transform_indices(x, split_indices["train"], batch_size=max(batch_size, n_components)):
+            if batch.shape[0] >= n_components:
+                reducer.partial_fit(batch)
+        z = {split: _transform_split(x, idx, scaler, reducer, batch_size) for split, idx in split_indices.items()}
+    else:
+        raise ValueError(f"Unknown features.reducer={reducer_name!r}")
 
     best_alpha = None
     best_score = -np.inf
@@ -97,7 +116,7 @@ def train_ridge_baseline(
     np.save(out / "predictions" / f"ridge_val_predictions{suffix}.npy", val_pred)
     np.save(out / "predictions" / f"ridge_test_predictions{suffix}.npy", test_pred)
     joblib.dump(best_model, out / "models" / f"ridge_gtr_base_10s{suffix}.joblib")
-    joblib.dump(ipca, out / "models" / f"pca_gtr_base_10s{suffix}.joblib")
+    joblib.dump(reducer, out / "models" / f"reducer_gtr_base_10s{suffix}.joblib")
     joblib.dump(scaler, out / "models" / f"scaler_gtr_base_10s{suffix}.joblib")
 
     val_metrics, val_by_type, val_ranks = evaluate_all(val_pred, y[split_indices["val"]], meg_metadata.iloc[split_indices["val"]].reset_index(drop=True), config)
@@ -106,6 +125,7 @@ def train_ridge_baseline(
         "control": control or "aligned",
         "best_alpha": best_alpha,
         "best_val_selection_score": best_score,
+        "reducer": reducer_name,
         "n_components": n_components,
         "n_train": int(len(split_indices["train"])),
         "n_val": int(len(split_indices["val"])),
@@ -126,9 +146,15 @@ def train_ridge_baseline(
     return result
 
 
-def _transform_split(x, indices, scaler: BatchStandardizer, ipca: IncrementalPCA, batch_size: int) -> np.ndarray:
-    chunks = [ipca.transform(batch).astype(np.float32) for batch in scaler.transform_indices(x, indices, batch_size=batch_size)]
-    return np.vstack(chunks) if chunks else np.empty((0, ipca.n_components_), dtype=np.float32)
+def _transform_split(x, indices, scaler: BatchStandardizer, reducer, batch_size: int) -> np.ndarray:
+    chunks = []
+    for batch in scaler.transform_indices(x, indices, batch_size=batch_size):
+        transformed = batch if reducer is None else reducer.transform(batch)
+        chunks.append(transformed.astype(np.float32))
+    if chunks:
+        return np.vstack(chunks)
+    n_components = x.shape[1] if reducer is None else reducer.n_components
+    return np.empty((0, n_components), dtype=np.float32)
 
 
 def _apply_control(y: np.ndarray, metadata: pd.DataFrame, control: str | None, config: dict[str, Any]) -> np.ndarray:
