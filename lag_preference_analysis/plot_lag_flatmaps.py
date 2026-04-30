@@ -50,7 +50,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--subject", default=None, help="Subject S1/S2/S3 (defaults to value saved in npz/config).")
     p.add_argument("--pycortex-subject", default=None, help="Override pycortex db subject (UTS01/UTS02/UTS03).")
     p.add_argument("--pycortex-filestore", default=None,
-                   help="Override pycortex filestore (e.g. <repo>/pycortex-db).")
+                   help="Pycortex filestore directory (default: <repo>/pycortex-db when present).")
     p.add_argument("--n-total-voxels", type=int, default=None,
                    help="Total voxels in the subject volume (auto-detected from response file otherwise).")
     p.add_argument("--mask-r-threshold", type=float, default=0.05,
@@ -96,6 +96,47 @@ def detect_n_total_voxels(subject: str) -> int:
     except Exception as err:
         log.warning("Could not auto-detect n_total_voxels (%s); using fallback.", err)
         return int(N_TOTAL_VOXELS_DEFAULT[subject])
+
+
+def configure_pycortex_filestore(explicit_path: str | None) -> str | None:
+    """Make pycortex use the repo-local pycortex-db before any cortex import.
+
+    Returns the resolved filestore directory or None if no override is applied.
+    """
+    candidates = []
+    if explicit_path:
+        candidates.append(Path(explicit_path).expanduser().resolve())
+    candidates.append(REPO_DIR / "pycortex-db")
+    candidates.append(Path.cwd() / "pycortex-db")
+
+    for candidate in candidates:
+        if candidate.is_dir():
+            store = str(candidate)
+            os.environ["PYCORTEX_FILESTORE"] = store
+            try:
+                import cortex  # noqa: F401
+                from cortex.options import config as cortex_config
+                cortex_config.set("basic", "filestore", store)
+                if hasattr(cortex, "database"):
+                    try:
+                        cortex.database.default_filestore = store
+                    except Exception:  # pragma: no cover - older pycortex
+                        pass
+                    if hasattr(cortex, "db") and hasattr(cortex.db, "reload_subjects"):
+                        cortex.db.reload_subjects()
+                    elif hasattr(cortex, "db"):
+                        cortex.db = cortex.database.Database()
+                log.info("Pycortex filestore -> %s", store)
+                return store
+            except ImportError:
+                log.error("pycortex is not installed. Run `pip install pycortex` first.")
+                raise
+    log.warning(
+        "No pycortex-db directory found (looked at: %s). "
+        "Falling back to pycortex's default config.",
+        ", ".join(str(c) for c in candidates),
+    )
+    return None
 
 
 def lag_center_of_mass(corrs: np.ndarray, lags: np.ndarray) -> np.ndarray:
@@ -165,19 +206,19 @@ def main() -> None:
     out_dir = Path(args.out_dir) if args.out_dir else (results_dir / "flatmaps")
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    if args.pycortex_filestore:
-        os.environ.setdefault("PYCORTEX_FILESTORE", args.pycortex_filestore)
     try:
+        configure_pycortex_filestore(args.pycortex_filestore)
         import cortex  # noqa: F401
     except ImportError:
-        log.error("pycortex is not installed. `pip install pycortex` first.")
         sys.exit(1)
-    if args.pycortex_filestore:
-        try:
-            cortex.database.default_filestore = args.pycortex_filestore
-            log.info("Set pycortex filestore -> %s", args.pycortex_filestore)
-        except Exception as err:
-            log.warning("Could not override pycortex filestore: %s", err)
+
+    if pycortex_subject not in cortex.db.subjects:
+        raise SystemExit(
+            f"pycortex does not know about subject {pycortex_subject!r} after pointing it at the "
+            "filestore. Subjects available: "
+            f"{sorted(cortex.db.subjects.keys())}. Either pass --pycortex-filestore explicitly "
+            f"or run download_pycortex_files.py to populate {REPO_DIR / 'pycortex-db'}."
+        )
 
     import matplotlib
     matplotlib.use("Agg")
