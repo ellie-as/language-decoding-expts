@@ -63,3 +63,13 @@ Useful metrics:
   the matching held-out text window among all held-out windows
 - `pca_explained_variance`: fraction of GTR embedding variance retained by the
   PCA target
+
+The script also fits a RidgeCV baseline on the exact same brain features and
+PCA-GTR targets. Compare:
+
+- `mean_dim_r` vs `ridge_mean_dim_r`
+- `mean_cosine` vs `ridge_mean_cosine`
+- `retrieval_top10` vs `ridge_retrieval_top10`
+- `delta_mean_dim_r_vs_ridge`
+
+Pass `--skip-ridge-baseline` to disable this baseline.

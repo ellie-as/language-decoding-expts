@@ -78,6 +78,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output-dir", default="xgbm_expts/results")
     p.add_argument("--tag", default=None)
     p.add_argument("--backend", default="lightgbm", choices=["lightgbm", "sklearn_hist"])
+    p.add_argument("--skip-ridge-baseline", action="store_true")
+    p.add_argument(
+        "--ridge-alphas",
+        type=float,
+        nargs="+",
+        default=[1.0, 10.0, 100.0, 1000.0, 10000.0],
+        help="Alphas for RidgeCV baseline on the same PCA-GTR target.",
+    )
     p.add_argument("--n-estimators", type=int, default=600)
     p.add_argument("--learning-rate", type=float, default=0.03)
     p.add_argument("--max-depth", type=int, default=3)
@@ -271,6 +279,19 @@ def predict_models(models, x: np.ndarray) -> np.ndarray:
     return np.column_stack([model.predict(x) for model in models]).astype(np.float32)
 
 
+def fit_predict_ridge_baseline(args: argparse.Namespace, x_train: np.ndarray, y_train: np.ndarray, x_val: np.ndarray):
+    from sklearn.linear_model import RidgeCV
+
+    log.info("Fitting RidgeCV baseline on X=%s Y=%s", x_train.shape, y_train.shape)
+    try:
+        model = RidgeCV(alphas=args.ridge_alphas, alpha_per_target=True)
+    except TypeError:
+        model = RidgeCV(alphas=args.ridge_alphas)
+    model.fit(x_train, y_train)
+    pred = model.predict(x_val).astype(np.float32)
+    return model, pred
+
+
 def per_dim_corr(pred: np.ndarray, true: np.ndarray) -> np.ndarray:
     pred = pred.astype(np.float64) - pred.mean(axis=0, keepdims=True)
     true = true.astype(np.float64) - true.mean(axis=0, keepdims=True)
@@ -299,6 +320,19 @@ def retrieval_metrics(pred: np.ndarray, true: np.ndarray) -> dict:
         "retrieval_mrr": float(np.mean(1.0 / ranks)),
         "retrieval_mean_rank": float(ranks.mean()),
     }
+
+
+def prediction_metrics(pred: np.ndarray, true: np.ndarray, prefix: str = "") -> dict:
+    dim_corrs = per_dim_corr(pred, true)
+    out = {
+        f"{prefix}mean_dim_r": float(np.nan_to_num(dim_corrs).mean()),
+        f"{prefix}median_dim_r": float(np.median(np.nan_to_num(dim_corrs))),
+        f"{prefix}min_dim_r": float(np.nan_to_num(dim_corrs).min()),
+        f"{prefix}max_dim_r": float(np.nan_to_num(dim_corrs).max()),
+        f"{prefix}mean_cosine": mean_cosine(pred, true),
+    }
+    out.update({f"{prefix}{key}": value for key, value in retrieval_metrics(pred, true).items()})
+    return out
 
 
 def build_tag(args: argparse.Namespace, subject: str) -> str:
@@ -361,7 +395,6 @@ def run_subject(args: argparse.Namespace, subject: str, stories: List[str]) -> d
     pred_val = predict_models(models, x_val_model)
     elapsed = time.time() - start
 
-    dim_corrs = per_dim_corr(pred_val, y_val)
     metrics = {
         "subject": subject,
         "backend": args.backend,
@@ -377,15 +410,24 @@ def run_subject(args: argparse.Namespace, subject: str, stories: List[str]) -> d
         "brain_pca_explained_variance": reducer.get("explained_variance", ""),
         "val_stories": " ".join(val_stories),
         "pca_explained_variance": float(np.sum(pca.explained_variance_ratio_)),
-        "mean_dim_r": float(np.nan_to_num(dim_corrs).mean()),
-        "median_dim_r": float(np.median(np.nan_to_num(dim_corrs))),
-        "min_dim_r": float(np.nan_to_num(dim_corrs).min()),
-        "max_dim_r": float(np.nan_to_num(dim_corrs).max()),
-        "mean_cosine": mean_cosine(pred_val, y_val),
         "elapsed_sec": float(elapsed),
         "embedding_cache": str(cache_path),
     }
-    metrics.update(retrieval_metrics(pred_val, y_val))
+    metrics.update(prediction_metrics(pred_val, y_val))
+
+    ridge_model = None
+    ridge_pred_val = None
+    ridge_dim_corrs = np.array([], dtype=np.float32)
+    if args.skip_ridge_baseline:
+        log.info("[%s] Skipping ridge baseline.", subject)
+    else:
+        ridge_model, ridge_pred_val = fit_predict_ridge_baseline(args, x_train_model, y_train, x_val_model)
+        ridge_dim_corrs = per_dim_corr(ridge_pred_val, y_val).astype(np.float32)
+        metrics.update(prediction_metrics(ridge_pred_val, y_val, prefix="ridge_"))
+        metrics["delta_mean_dim_r_vs_ridge"] = metrics["mean_dim_r"] - metrics["ridge_mean_dim_r"]
+        metrics["delta_mean_cosine_vs_ridge"] = metrics["mean_cosine"] - metrics["ridge_mean_cosine"]
+        metrics["delta_retrieval_top1_vs_ridge"] = metrics["retrieval_top1"] - metrics["ridge_retrieval_top1"]
+        metrics["delta_retrieval_top10_vs_ridge"] = metrics["retrieval_top10"] - metrics["ridge_retrieval_top10"]
 
     out_dir = Path(args.output_dir).expanduser().resolve() / build_tag(args, subject)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -393,9 +435,11 @@ def run_subject(args: argparse.Namespace, subject: str, stories: List[str]) -> d
         out_dir / "predictions.npz",
         pred_val=pred_val,
         true_val=y_val,
+        ridge_pred_val=ridge_pred_val if ridge_pred_val is not None else np.array([], dtype=np.float32),
         pred_val_raw_pca=(pred_val * y_std + y_mean),
         true_val_raw_pca=(y_val * y_std + y_mean),
-        dim_corrs=dim_corrs,
+        dim_corrs=per_dim_corr(pred_val, y_val).astype(np.float32),
+        ridge_dim_corrs=ridge_dim_corrs,
         voxels=voxels,
     )
     with open(out_dir / "metrics.json", "w", encoding="utf-8") as f:
@@ -405,6 +449,7 @@ def run_subject(args: argparse.Namespace, subject: str, stories: List[str]) -> d
             pickle.dump(
                 {
                     "models": models,
+                    "ridge_model": ridge_model,
                     "pca": pca,
                     "x_mean": x_mean,
                     "x_std": x_std,
