@@ -99,6 +99,25 @@ python scripts/smoketest_tiny_libribrain.py \
 
 This asks PNPL to download/load one run, copies only the first few minutes into a small local H5, builds 10-second transcript windows from PNPL `events.tsv` word rows, uses mock embeddings by default for speed, builds MEG memmap features, trains PCA + ridge, and writes `outputs/tiny_libribrain_smoketest/inspection/tiny_libribrain_smoketest_summary.json`. Add `--real-gtr` if you also want to smoke-test `sentence-transformers/gtr-t5-base`.
 
+To download all PNPL run files before a full run:
+
+```bash
+python scripts/download_libribrain_runs.py \
+  --config configs/ridge_cluster.yaml \
+  --data-path /ceph/behrens/ellie/language-decoding-expts/libribrain_gtr_decode/data/LibriBrain \
+  --partition all
+```
+
+For a staged download, add `--max-runs 5` first. After the download finishes, run:
+
+```bash
+python scripts/run_ridge_pipeline.py \
+  --config configs/ridge_cluster.yaml \
+  --force
+```
+
+The full raw LibriBrain cache is around tens of GB, and derived MEG windows can also become large. Keep `project.output_dir`, `project.cache_dir`, and `data.libribrain_root` on a filesystem with enough space.
+
 ## Pipeline Steps
 
 Every step is command-line runnable and cacheable:
