@@ -10,7 +10,7 @@ Feature vector at response-aligned TR/chunk ``i``:
 
 The target and scoring match ``train_lag_encoding.py``:
 
-    Y = full_frontal brain response at TR (i + lag)
+    Y = selected brain response voxels at TR (i + lag)
 
 for every lag in ``--lags`` (default 1..10), using story-grouped validation
 and per-voxel RidgeCV. Outputs use the same ``lag_corrs.npz`` layout so
@@ -106,6 +106,12 @@ def parse_args() -> argparse.Namespace:
         default=[1.0, 10.0, 100.0, 1_000.0, 10_000.0, 100_000.0],
     )
     p.add_argument("--voxel-chunk-size", type=int, default=5_000)
+    p.add_argument(
+        "--voxel-set",
+        choices=["full_frontal", "all"],
+        default="full_frontal",
+        help="Response voxel set to predict. Default preserves the original full_frontal analysis.",
+    )
     p.add_argument("--val-story-count", type=int, default=8)
     p.add_argument("--val-stories", nargs="+", default=None)
     p.add_argument("--seed", type=int, default=0)
@@ -140,9 +146,11 @@ def make_tag(args: argparse.Namespace) -> str:
     if args.tag:
         return args.tag
     htag = "-".join(str(h) for h in args.summary_horizons)
+    voxel_suffix = "" if args.voxel_set == "full_frontal" else "__allvoxels"
     return (
         f"{args.subject}__embedding-summary-combo-h{htag}"
         f"__lags{min(args.lags)}-{max(args.lags)}__chunk{args.chunk_trs}tr__seed{args.seed}"
+        f"{voxel_suffix}"
     )
 
 
@@ -257,8 +265,12 @@ def main() -> None:
 
     sample_resp = get_resp(args.subject, [stories[0]], stack=True, vox=None, response_root=response_root)
     total_voxels = int(sample_resp.shape[1])
-    voxels = load_full_frontal_voxels(args.subject, total_voxels, args.ba_dir)
-    log.info("Full-frontal voxels: %d / %d", len(voxels), total_voxels)
+    if args.voxel_set == "full_frontal":
+        voxels = load_full_frontal_voxels(args.subject, total_voxels, args.ba_dir)
+        log.info("Full-frontal voxels: %d / %d", len(voxels), total_voxels)
+    else:
+        voxels = np.arange(total_voxels, dtype=int)
+        log.info("All voxels: %d", len(voxels))
 
     responses_by_story = get_resp(args.subject, stories, stack=False, vox=voxels, response_root=response_root)
     responses_by_story = {s: arr.astype(np.float32) for s, arr in responses_by_story.items()}
@@ -335,6 +347,7 @@ def main() -> None:
             train_stories=np.array(train_stories),
             val_stories=np.array(val_stories),
             feature_model="embedding-summary-combo",
+            voxel_set=args.voxel_set,
             summary_model=summary_model,
             summary_horizons=np.array(args.summary_horizons, dtype=int),
             chunk_trs=int(args.chunk_trs),
@@ -349,6 +362,7 @@ def main() -> None:
         voxels=voxels,
         lags=np.array(args.lags, dtype=int),
         feature_model="embedding-summary-combo",
+        voxel_set=args.voxel_set,
         embedding_model=args.embedding_model,
         summary_model=summary_model,
         summary_horizons=np.array(args.summary_horizons, dtype=int),
@@ -373,6 +387,7 @@ def main() -> None:
                 "train_stories": train_stories,
                 "val_stories": val_stories,
                 "n_voxels": n_voxels,
+                "voxel_set": args.voxel_set,
                 "one_tr_cache": one_cache,
                 "summary_cache": summary_cache,
                 "data_train_dir": config.DATA_TRAIN_DIR,
