@@ -84,6 +84,12 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--latent-dims", nargs="+", type=int, default=[128])
     p.add_argument("--hidden-dim", type=int, default=512)
+    p.add_argument(
+        "--hidden-layers",
+        type=int,
+        default=1,
+        help="Number of hidden layers on each side of the latent bottleneck.",
+    )
     p.add_argument("--dropout", type=float, default=0.10)
     p.add_argument(
         "--input-noise-std",
@@ -203,20 +209,34 @@ def reconstruction_metrics(pred: np.ndarray, true: np.ndarray, voxel_chunk_size:
 
 
 class NonlinearAutoencoder(nn.Module):
-    def __init__(self, n_voxels: int, latent_dim: int, hidden_dim: int, dropout: float) -> None:
+    def __init__(
+        self,
+        n_voxels: int,
+        latent_dim: int,
+        hidden_dim: int,
+        hidden_layers: int,
+        dropout: float,
+    ) -> None:
         super().__init__()
-        self.encoder = nn.Sequential(
-            nn.Linear(n_voxels, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, latent_dim),
-        )
-        self.decoder = nn.Sequential(
-            nn.Linear(latent_dim, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, n_voxels),
-        )
+        if hidden_layers < 1:
+            raise ValueError("--hidden-layers must be >= 1")
+
+        encoder_layers: list[nn.Module] = []
+        in_dim = n_voxels
+        for _ in range(hidden_layers):
+            encoder_layers.extend([nn.Linear(in_dim, hidden_dim), nn.GELU(), nn.Dropout(dropout)])
+            in_dim = hidden_dim
+        encoder_layers.append(nn.Linear(hidden_dim, latent_dim))
+
+        decoder_layers: list[nn.Module] = []
+        in_dim = latent_dim
+        for _ in range(hidden_layers):
+            decoder_layers.extend([nn.Linear(in_dim, hidden_dim), nn.GELU(), nn.Dropout(dropout)])
+            in_dim = hidden_dim
+        decoder_layers.append(nn.Linear(hidden_dim, n_voxels))
+
+        self.encoder = nn.Sequential(*encoder_layers)
+        self.decoder = nn.Sequential(*decoder_layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.decoder(self.encoder(x))
@@ -255,6 +275,7 @@ def train_autoencoder(
         n_voxels=x_train.shape[1],
         latent_dim=latent_dim,
         hidden_dim=int(args.hidden_dim),
+        hidden_layers=int(args.hidden_layers),
         dropout=float(args.dropout),
     ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(args.lr), weight_decay=float(args.weight_decay))
@@ -320,6 +341,7 @@ def train_autoencoder(
                 "state_dict": best_state,
                 "latent_dim": latent_dim,
                 "hidden_dim": int(args.hidden_dim),
+                "hidden_layers": int(args.hidden_layers),
                 "dropout": float(args.dropout),
                 "input_noise_std": float(args.input_noise_std),
                 "input_mask_prob": float(args.input_mask_prob),
@@ -457,6 +479,7 @@ def main() -> None:
                 "ba_dir": str(Path(args.ba_dir).expanduser().resolve()),
                 "latent_dims": [int(x) for x in args.latent_dims],
                 "hidden_dim": int(args.hidden_dim),
+                "hidden_layers": int(args.hidden_layers),
                 "dropout": float(args.dropout),
                 "input_noise_std": float(args.input_noise_std),
                 "input_mask_prob": float(args.input_mask_prob),

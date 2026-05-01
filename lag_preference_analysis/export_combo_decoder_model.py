@@ -45,6 +45,9 @@ def parse_args():
     p.add_argument("--voxel-count", type=int, default=2000)
     p.add_argument("--sessions", nargs="+", type=int, default=[2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 18, 20])
     p.add_argument("--stories", nargs="+", default=None)
+    p.add_argument("--val-story-count", type=int, default=8)
+    p.add_argument("--val-stories", nargs="+", default=None)
+    p.add_argument("--seed", type=int, default=0)
     p.add_argument("--summary-horizons", nargs="+", type=int, default=None)
     p.add_argument("--summary-model", default=None)
     p.add_argument("--summaries-dir", default=str(rse.LOCAL_DEFAULT_SUMMARIES_DIR))
@@ -71,6 +74,11 @@ def zscore_apply(x, mean, std):
     return ((x - mean) / std).astype(np.float32)
 
 
+def scalar(value):
+    arr = np.asarray(value)
+    return arr.item() if arr.shape == () else value
+
+
 def main():
     args = parse_args()
     combo_dir = Path(args.combo_results_dir).expanduser().resolve()
@@ -78,13 +86,13 @@ def main():
     run_cfg = json.load(open(combo_dir / "config.json", encoding="utf-8"))
 
     args.summary_horizons = args.summary_horizons or [int(x) for x in saved["summary_horizons"]]
-    args.summary_model = args.summary_model or str(saved["summary_model"])
+    args.summary_model = args.summary_model or str(scalar(saved["summary_model"]))
     args.embedding_model = run_cfg.get("embedding_model", args.embedding_model)
     args.lags = [int(x) for x in saved["lags"]]
     args.chunk_trs = 1
     args.tag = None
-    args.voxel_set = str(saved["voxel_set"]) if "voxel_set" in saved.files else "full_frontal"
-    args.seed = int(run_cfg.get("seed", 0))
+    args.voxel_set = str(scalar(saved["voxel_set"])) if "voxel_set" in saved.files else "full_frontal"
+    args.seed = int(run_cfg.get("seed", args.seed))
 
     mounted_root = configure_data_root(args)
     stories = load_stories(args)
