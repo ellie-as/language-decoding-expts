@@ -277,7 +277,15 @@ def main() -> None:
             vmax = float(vmin + max(1e-3, abs(vmin) * 0.1))
 
         vol = cortex.Volume(full, pycortex_subject, xfm_name, vmin=vmin, vmax=vmax, cmap=args.cmap)
-        fig = cortex.quickflat.make_figure(vol, with_curvature=True, with_colorbar=True)
+        fig = cortex.quickflat.make_figure(
+            vol,
+            with_curvature=True,
+            with_colorbar=True,
+            with_rois=False,
+            with_labels=False,
+            with_sulci=False,
+            with_borders=False,
+        )
         title = f"{name}    vmin={vmin:.2g}, vmax={vmax:.2g}"
         fig.suptitle(title, fontsize=13)
         out_path = out_dir / f"{name}.png"
