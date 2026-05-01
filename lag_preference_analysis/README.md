@@ -139,7 +139,8 @@ Useful flags:
 - `--cmap-pref viridis` — colormap for lag preference.
 - `--per-lag` — also dump one flatmap per individual lag (red/blue diverging).
 - `--pycortex-filestore /path/to/pycortex-db` — point pycortex at a specific
-  filestore (otherwise it uses your `~/.config/pycortex/options.cfg`).
+  filestore. By default the script auto-uses `<repo>/pycortex-db` when present
+  (run `python download_pycortex_files.py` if it's empty).
 - `--n-total-voxels 81126` — full-volume voxel count; auto-detected from a
   response file when possible.
 

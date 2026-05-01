@@ -63,6 +63,8 @@ def parse_args() -> argparse.Namespace:
                    help="Colormap for best-lag-r intensity map.")
     p.add_argument("--per-lag", action="store_true",
                    help="Also write per-lag r flatmaps under per_lag/.")
+    p.add_argument("--with-rois", action="store_true",
+                   help="Render pycortex ROI/label SVG overlays. Requires Inkscape; off by default.")
     p.add_argument("--out-dir", default=None,
                    help="Output directory (default: <results-dir>/flatmaps).")
     return p.parse_args()
@@ -289,10 +291,19 @@ def make_flatmap(
     cmap: str,
     title: str,
     out_path: Path,
+    with_rois: bool = False,
 ) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     vol = cortex_module.Volume(full_volume, pycortex_subject, xfm_name, vmin=vmin, vmax=vmax, cmap=cmap)
-    fig = cortex_module.quickflat.make_figure(vol, with_curvature=True, with_colorbar=True)
+    fig = cortex_module.quickflat.make_figure(
+        vol,
+        with_curvature=True,
+        with_colorbar=True,
+        with_rois=with_rois,
+        with_labels=with_rois,
+        with_sulci=False,
+        with_borders=False,
+    )
     fig.suptitle(title, fontsize=13)
     fig.savefig(str(out_path), dpi=150, bbox_inches="tight")
     plt_module.close(fig)
@@ -403,6 +414,7 @@ def main() -> None:
         vmin=pref_vmin, vmax=pref_vmax, cmap=args.cmap_pref,
         title=f"Preferred lag (TR), masked r >= {args.mask_r_threshold:g}",
         out_path=out_dir / "preferred_lag_masked.png",
+        with_rois=args.with_rois,
     )
     make_flatmap(
         cortex, plt,
@@ -411,6 +423,7 @@ def main() -> None:
         vmin=pref_vmin, vmax=pref_vmax, cmap=args.cmap_pref,
         title="Preferred lag (TR), all full_frontal voxels",
         out_path=out_dir / "preferred_lag.png",
+        with_rois=args.with_rois,
     )
     make_flatmap(
         cortex, plt,
@@ -419,6 +432,7 @@ def main() -> None:
         vmin=pref_vmin, vmax=pref_vmax, cmap=args.cmap_pref,
         title=f"r-weighted center-of-mass lag, masked r >= {args.mask_r_threshold:g}",
         out_path=out_dir / "com_lag_masked.png",
+        with_rois=args.with_rois,
     )
     make_flatmap(
         cortex, plt,
@@ -427,6 +441,7 @@ def main() -> None:
         vmin=pref_vmin, vmax=pref_vmax, cmap=args.cmap_pref,
         title="r-weighted center-of-mass lag",
         out_path=out_dir / "com_lag.png",
+        with_rois=args.with_rois,
     )
     make_flatmap(
         cortex, plt,
@@ -435,6 +450,7 @@ def main() -> None:
         vmin=0.0, vmax=r_top, cmap=args.cmap_r,
         title=f"Best-lag encoding r per voxel (vmax={r_top:.2f})",
         out_path=out_dir / "best_lag_r.png",
+        with_rois=args.with_rois,
     )
 
     if args.per_lag:
@@ -449,6 +465,7 @@ def main() -> None:
                 vmin=-diverging_top, vmax=diverging_top, cmap="RdBu_r",
                 title=f"Encoding r at lag={int(lag)} TR",
                 out_path=per_lag_dir / f"lag{int(lag):02d}.png",
+                with_rois=args.with_rois,
             )
 
     log.info("All maps written to %s", out_dir)

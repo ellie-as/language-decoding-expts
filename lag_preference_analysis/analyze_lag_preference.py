@@ -51,7 +51,107 @@ def parse_args() -> argparse.Namespace:
                    help="Output CSV path (default: <results-dir>/lag_preference_breakdown.csv).")
     p.add_argument("--top-k", type=int, default=2000,
                    help="Top-k voxels by best-lag r to include in the 'top_k_*' breakdowns.")
+    p.add_argument("--pycortex-filestore", default=str(REPO_DIR / "pycortex-db"),
+                   help="Pycortex filestore (only used to load mask_thick+reference for the "
+                        "within-ROI spatial-gradient analysis).")
+    p.add_argument("--xfm-name", default=None,
+                   help="Pycortex transform name (default: <UTS>_auto when present).")
+    p.add_argument("--gradient-r-threshold", type=float, default=0.05,
+                   help="Restrict spatial gradient analysis to voxels with best-lag r >= this.")
+    p.add_argument("--no-spatial-gradient", action="store_true",
+                   help="Skip the within-ROI spatial-gradient table.")
     return p.parse_args()
+
+
+def load_voxel_xyz(filestore: Path, uts_id: str, xfm_name: str | None) -> np.ndarray | None:
+    """Return MNI mm coordinates for every voxel in the response volume (HDF5 column order).
+
+    Returns ``None`` if the required pycortex files are not present.
+    """
+    try:
+        import nibabel as nib
+    except ImportError:
+        log.warning("nibabel not installed; skipping spatial gradient analysis.")
+        return None
+
+    xfm_dir = filestore / uts_id / "transforms"
+    if not xfm_dir.is_dir():
+        log.warning("No transforms dir under %s; skipping spatial gradient analysis.", xfm_dir)
+        return None
+    xfm = xfm_name
+    if xfm is None:
+        candidates = [p.name for p in xfm_dir.iterdir() if p.is_dir()]
+        preferred = f"{uts_id}_auto"
+        xfm = preferred if preferred in candidates else (candidates[0] if candidates else None)
+    if xfm is None:
+        log.warning("No transform under %s; skipping spatial gradient analysis.", xfm_dir)
+        return None
+    base = xfm_dir / xfm
+    mask_path = base / "mask_thick.nii.gz"
+    ref_path = base / "reference.nii.gz"
+    if not (mask_path.is_file() and ref_path.is_file()):
+        log.warning("Missing %s or %s; skipping spatial gradient analysis.", mask_path, ref_path)
+        return None
+    mask = nib.load(str(mask_path)).get_fdata() > 0
+    ref_affine = nib.load(str(ref_path)).affine
+    ijk = np.array(np.where(mask)).T
+    return nib.affines.apply_affine(ref_affine, ijk).astype(np.float64)
+
+
+def fit_axis(coord: np.ndarray, target: np.ndarray) -> tuple[float, float]:
+    """Return (slope_per_mm, pearson_r) for target ~= a + b*coord."""
+    if coord.std() < 1e-9 or target.std() < 1e-9:
+        return float("nan"), float("nan")
+    slope = float(np.polyfit(coord, target, 1)[0])
+    r = float(np.corrcoef(coord, target)[0, 1])
+    return slope, r
+
+
+def spatial_gradient_table(
+    masks: Dict[str, np.ndarray],
+    xyz: np.ndarray,
+    target: np.ndarray,
+    keep: np.ndarray,
+    *,
+    target_name: str,
+) -> tuple[str, list[dict]]:
+    """Compute LR/PA/DV slopes per ROI per hemisphere. Returns (text_table, rows)."""
+    AXES = [("x_LR(+R)", 0), ("y_PA(+A)", 1), ("z_DV(+D)", 2)]
+    HEMIS = [
+        ("ALL", np.ones(len(xyz), bool)),
+        ("LH", xyz[:, 0] < 0),
+        ("RH", xyz[:, 0] > 0),
+    ]
+    rows: list[dict] = []
+    lines = [f"== Spatial gradient of {target_name} (TR per metre, Pearson r) =="]
+    header = f"{'hemi':<4} {'ROI':<14} {'n':>6}  " + "  ".join(
+        f"{ax} slope/m  r" for ax, _ in AXES
+    )
+    lines.append(header)
+    lines.append("-" * len(header))
+    for hemi_name, hemi_mask in HEMIS:
+        for roi_name, roi_mask in masks.items():
+            mask = roi_mask & hemi_mask & keep & ~np.isnan(target)
+            n = int(mask.sum())
+            if n < 50:
+                lines.append(f"{hemi_name:<4} {roi_name:<14} {n:>6}  (n<50, skipped)")
+                continue
+            cells: list[str] = []
+            for ax_name, ax_idx in AXES:
+                slope, r = fit_axis(xyz[mask, ax_idx], target[mask])
+                rows.append({
+                    "metric": f"gradient_{target_name}",
+                    "roi": roi_name,
+                    "hemi": hemi_name,
+                    "axis": ax_name,
+                    "slope_per_mm": slope,
+                    "slope_per_m": slope * 1000.0,
+                    "pearson_r": r,
+                    "n_voxels": n,
+                })
+                cells.append(f"{slope*1000:>+10.2f}  {r:>+6.3f}")
+            lines.append(f"{hemi_name:<4} {roi_name:<14} {n:>6}  " + "  ".join(cells))
+    return "\n".join(lines), rows
 
 
 def load_sub_roi_masks(ba_dir: Path, uts_id: str, vox: np.ndarray) -> Dict[str, np.ndarray]:
@@ -215,6 +315,54 @@ def main() -> None:
         writer.writeheader()
         writer.writerows(rows)
     log.info("\nWrote %s", csv_path)
+
+    if args.no_spatial_gradient:
+        return
+
+    filestore = Path(args.pycortex_filestore).expanduser().resolve()
+    xyz = load_voxel_xyz(filestore, uts_id, args.xfm_name)
+    if xyz is None:
+        log.info("Skipping spatial gradient analysis (filestore lookup failed).")
+        return
+    if int(xyz.shape[0]) < int(np.max(voxels)) + 1:
+        log.warning(
+            "Mask voxel count (%d) is smaller than max voxel id (%d). Skipping spatial gradient.",
+            xyz.shape[0], int(np.max(voxels)),
+        )
+        return
+
+    voxel_xyz = xyz[voxels]
+    com_target = np.zeros(corrs.shape[1], dtype=np.float64)
+    weights = np.clip(corrs, 0.0, None)
+    denom = weights.sum(axis=0)
+    valid = denom > 0
+    com_target[valid] = (weights[:, valid] * lags[:, None].astype(np.float64)).sum(axis=0) / denom[valid]
+    com_target[~valid] = np.nan
+
+    keep = best_r >= float(args.gradient_r_threshold)
+    log.info(
+        "\nSpatial gradient analysis: %d/%d voxels with best-lag r >= %.3f",
+        int(keep.sum()), int(keep.size), args.gradient_r_threshold,
+    )
+
+    pref_text, pref_rows = spatial_gradient_table(
+        masks, voxel_xyz, preferred_lag.astype(np.float64), keep,
+        target_name="preferred_lag",
+    )
+    com_text, com_rows = spatial_gradient_table(
+        masks, voxel_xyz, com_target, keep,
+        target_name="com_lag",
+    )
+    log.info("\n%s", pref_text)
+    log.info("\n%s", com_text)
+
+    grad_csv = csv_path.with_name("lag_preference_spatial_gradient.csv")
+    fieldnames = ["metric", "roi", "hemi", "axis", "slope_per_mm", "slope_per_m", "pearson_r", "n_voxels"]
+    with open(grad_csv, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(pref_rows + com_rows)
+    log.info("Wrote %s", grad_csv)
 
 
 if __name__ == "__main__":
