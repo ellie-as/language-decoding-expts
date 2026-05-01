@@ -78,7 +78,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--local-cache-root", default=str(REPO_DIR / "local_compute_cache"))
     p.add_argument("--ridge-alphas", type=float, nargs="+", default=None)
     p.add_argument("--voxel-chunk-size", type=int, default=5_000)
-    p.add_argument("--reliable-threshold", type=float, default=0.05)
+    p.add_argument(
+        "--reliable-thresholds",
+        "--reliable-threshold",
+        dest="reliable_thresholds",
+        type=float,
+        nargs="+",
+        default=[0.05],
+        help="One or more best-lag-r thresholds for subset summaries.",
+    )
     p.add_argument("--out-csv", default=None)
     return p.parse_args()
 
@@ -150,7 +158,7 @@ def summarize_rows(
     block_norms: Dict[str, np.ndarray],
     block_names: Sequence[str],
     masks: Dict[str, np.ndarray],
-    reliable: np.ndarray,
+    subset_masks: Dict[str, np.ndarray],
 ) -> list[dict]:
     total = np.zeros_like(next(iter(block_norms.values())), dtype=np.float32)
     for block in block_names:
@@ -158,10 +166,7 @@ def summarize_rows(
     total[total == 0] = np.nan
 
     rows: list[dict] = []
-    for subset_name, subset_mask in {
-        "all": np.ones_like(reliable, dtype=bool),
-        "reliable": reliable,
-    }.items():
+    for subset_name, subset_mask in subset_masks.items():
         for roi, roi_mask in masks.items():
             mask = roi_mask & subset_mask
             if not np.any(mask):
@@ -263,7 +268,13 @@ def main() -> None:
         norms = fit_block_norms(x_train, y_train, block_slices, alphas, args.voxel_chunk_size)
         li = saved_lags.index(int(lag))
         best_r = saved["corrs"][np.argmax(saved["corrs"], axis=0), np.arange(saved["corrs"].shape[1])]
-        reliable = best_r >= float(args.reliable_threshold)
+        subset_masks = {"all": np.ones(saved["corrs"].shape[1], dtype=bool)}
+        for threshold in args.reliable_thresholds:
+            tag = f"r_ge_{str(float(threshold)).replace('.', 'p')}"
+            subset_masks[tag] = best_r >= float(threshold)
+        if len(args.reliable_thresholds) == 1:
+            # Backwards-compatible alias for the original single-threshold CSVs.
+            subset_masks["reliable"] = best_r >= float(args.reliable_thresholds[0])
         rows.extend(
             summarize_rows(
                 subject=subject,
@@ -271,7 +282,7 @@ def main() -> None:
                 block_norms=norms,
                 block_names=block_names,
                 masks=masks,
-                reliable=reliable,
+                subset_masks=subset_masks,
             )
         )
 
