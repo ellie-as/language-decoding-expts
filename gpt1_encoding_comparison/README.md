@@ -110,6 +110,54 @@ python gpt1_encoding_comparison/decode_and_score.py \
 `pretrained` use this experiment's trained encoders from
 `gpt1_encoding_comparison/outputs/S1/`.
 
+To compare the standalone MiniLM combo ridge models, train the two GPT-1
+comparison versions directly:
+
+```bash
+python gpt1_encoding_comparison/train_minilm_combo_encoding.py \
+  --data-root /ceph/behrens/ellie/language-decoding-expts \
+  --subjects S1 \
+  --conditions minilm_summary_combo minilm_window_combo \
+  --lag 2 \
+  --voxel-set full_frontal
+```
+
+This writes:
+
+- `gpt1_encoding_comparison/outputs/S1/encoding_model_minilm_summary_combo.npz`
+- `gpt1_encoding_comparison/outputs/S1/encoding_model_minilm_window_combo.npz`
+- `gpt1_encoding_comparison/outputs/S1/minilm_combo_encoding_summary.csv`
+
+Then include the MiniLM conditions in the decoding comparison:
+
+```bash
+python gpt1_encoding_comparison/decode_and_score.py \
+  --subject S1 \
+  --experiment perceived_speech \
+  --tasks wheretheressmoke \
+  --conditions paper finetuned pretrained minilm_summary_combo minilm_window_combo \
+  --n-null 10
+```
+
+`minilm_window_combo` is decoded with the same candidate text-window features it
+was trained on. `minilm_summary_combo` is trained with true training-story
+summaries, but decoding uses candidate text-window proxy features because oracle
+summaries of the held-out test story would leak the answer.
+
+On the cluster, the same train+decode comparison can be launched with:
+
+```bash
+cd /ceph/behrens/ellie/language-decoding-expts
+SUBJECTS="S1" RUN_DECODE=1 bash gpt1_encoding_comparison/run_minilm_combo_cluster.sh
+```
+
+For all three subjects:
+
+```bash
+cd /ceph/behrens/ellie/language-decoding-expts
+SUBJECTS="S1 S2 S3" RUN_DECODE=1 bash gpt1_encoding_comparison/run_minilm_combo_cluster.sh
+```
+
 The script writes decoded transcripts under
 `gpt1_encoding_comparison/decoding_outputs/` plus a
 `decoding_score_summary.csv` with WER, BLEU-1, METEOR, and BERTScore recall

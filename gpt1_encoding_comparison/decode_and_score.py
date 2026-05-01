@@ -50,7 +50,15 @@ from utils_ridge.textgrid import TextGrid  # noqa: E402
 
 CONDITION_PAPER = "paper"
 CONDITION_MINDEYE_ENCODING = "mindeye_encoding"
+CONDITION_MINILM_COMBO_RIDGE = "minilm_combo_ridge"
+CONDITION_MINILM_SUMMARY_COMBO = "minilm_summary_combo"
+CONDITION_MINILM_WINDOW_COMBO = "minilm_window_combo"
 CONDITION_LM_ONLY = "lm_only"
+MINILM_COMBO_CONDITIONS = {
+    CONDITION_MINILM_COMBO_RIDGE,
+    CONDITION_MINILM_SUMMARY_COMBO,
+    CONDITION_MINILM_WINDOW_COMBO,
+}
 DEFAULT_TASKS = ["wheretheressmoke"]
 BAD_WORDS_PERCEIVED_SPEECH = frozenset(["sentence_start", "sentence_end", "br", "lg", "ls", "ns", "sp"])
 BAD_WORDS_OTHER_TASKS = frozenset(["", "sp", "uh"])
@@ -70,6 +78,9 @@ def parse_args():
             CONDITION_FINETUNED,
             CONDITION_PRETRAINED,
             CONDITION_MINDEYE_ENCODING,
+            CONDITION_MINILM_COMBO_RIDGE,
+            CONDITION_MINILM_SUMMARY_COMBO,
+            CONDITION_MINILM_WINDOW_COMBO,
             CONDITION_LM_ONLY,
         ],
     )
@@ -85,6 +96,17 @@ def parse_args():
         default=None,
         help="Path to mindeye_text/train_mindeye_encoding.py model.pt.",
     )
+    parser.add_argument(
+        "--minilm-combo-encoding-model",
+        default=None,
+        help="Path to decoder-compatible MiniLM combo ridge npz.",
+    )
+    parser.add_argument(
+        "--minilm-combo-embedding-model",
+        default="sentence-transformers/all-MiniLM-L6-v2",
+        help="SentenceTransformer used for candidate 1TR/h20/h50/h200 proxy features.",
+    )
+    parser.add_argument("--minilm-combo-batch-size", type=int, default=256)
     parser.add_argument("--device", default=config.GPT_DEVICE)
     parser.add_argument("--beam-width", type=int, default=config.WIDTH)
     parser.add_argument("--pretrained-batch-size", type=int, default=64)
@@ -301,6 +323,15 @@ class NeuralEncodingModel:
         self.voxels = np.asarray(checkpoint["voxels"][subject], dtype=np.int64)
         self.resp = torch.from_numpy(resp[:, self.voxels]).float().to(device)
         self.sigma = np.asarray(checkpoint["noise_model"][subject], dtype=np.float32)
+        self.target_mode = str(checkpoint.get("target_mode", "response"))
+        base_weights = checkpoint.get("base_weights", {})
+        self.base_weights = None
+        if self.target_mode == "ridge_residual":
+            if subject not in base_weights:
+                raise KeyError(f"Residual checkpoint is missing base_weights for {subject}")
+            self.base_weights = torch.from_numpy(
+                np.asarray(base_weights[subject], dtype=np.float32)
+            ).float().to(device)
         self.model = MindEyeEncoding(
             output_dims={str(k): int(v) for k, v in checkpoint["output_dims"].items()},
             input_dim=int(checkpoint["input_dim"]),
@@ -323,9 +354,98 @@ class NeuralEncodingModel:
             n_variants, n_trs, n_feats = stim_t.shape
             flat = stim_t.reshape(n_variants * n_trs, n_feats)
             pred = self.model(flat, self.subject).reshape(n_variants, n_trs, -1)
+            if self.base_weights is not None:
+                base = torch.matmul(flat, self.base_weights).reshape(n_variants, n_trs, -1)
+                pred = pred + base
             diff = pred - self.resp[trs]
             multi = torch.matmul(torch.matmul(diff, self.precision), diff.permute(0, 2, 1))
             return -0.5 * multi.diagonal(dim1=-2, dim2=-1).sum(dim=1).detach().cpu().numpy()
+
+
+class SelectedVoxelEncodingModel:
+    """EncodingModel variant for weights already restricted to ``voxels``."""
+
+    def __init__(self, resp, weights, voxels, sigma, device="cpu"):
+        self.device = device
+        self.voxels = np.asarray(voxels, dtype=np.int64)
+        self.weights = torch.from_numpy(np.asarray(weights, dtype=np.float32)).float().to(self.device)
+        self.resp = torch.from_numpy(resp[:, self.voxels]).float().to(self.device)
+        self.sigma = np.asarray(sigma, dtype=np.float32)
+
+    def set_shrinkage(self, alpha):
+        precision = np.linalg.inv(self.sigma * (1 - alpha) + np.eye(len(self.sigma)) * alpha)
+        self.precision = torch.from_numpy(precision).float().to(self.device)
+
+    def prs(self, stim, trs):
+        with torch.no_grad():
+            stim = stim.float().to(self.device)
+            diff = torch.matmul(stim, self.weights) - self.resp[trs]
+            multi = torch.matmul(torch.matmul(diff, self.precision), diff.permute(0, 2, 1))
+            return -0.5 * multi.diagonal(dim1=-2, dim2=-1).sum(dim=1).detach().cpu().numpy()
+
+
+class MiniLMComboWindowFeatures:
+    """Decoder-safe proxy for the MiniLM combo training features.
+
+    Training used true-story GPT summaries for h20/h50/h200. During decoding we
+    cannot use oracle summaries, so this class embeds candidate text windows
+    of comparable lengths: current local window, last 20, last 50 and last 200
+    words.
+    """
+
+    def __init__(self, model_name, device, batch_size):
+        from sentence_transformers import SentenceTransformer
+
+        self.model_name = model_name
+        self.device = device
+        self.batch_size = int(batch_size)
+        self.model = SentenceTransformer(model_name, device=device)
+        self.hidden_size = int(self.model.get_sentence_embedding_dimension())
+        self.block_windows = [config.GPT_WORDS + 1, 20, 50, 200]
+
+    @staticmethod
+    def _clean_join(words):
+        return " ".join(str(word).strip() for word in words if str(word).strip())
+
+    def _texts_for_extension(self, words):
+        words = [str(word) for word in words]
+        return [self._clean_join(words[-window:]) for window in self.block_windows]
+
+    def _encode_texts(self, texts):
+        vecs = np.zeros((len(texts), self.hidden_size), dtype=np.float32)
+        nonempty = [i for i, text in enumerate(texts) if text.strip()]
+        if nonempty:
+            enc = self.model.encode(
+                [texts[i] for i in nonempty],
+                batch_size=self.batch_size,
+                show_progress_bar=False,
+                convert_to_numpy=True,
+            ).astype(np.float32, copy=False)
+            vecs[nonempty] = enc
+        return vecs
+
+    def make_stim(self, words):
+        texts = []
+        for word_index in range(len(words)):
+            texts.extend(self._texts_for_extension(words[:word_index + 1]))
+        if not texts:
+            return np.zeros((0, self.hidden_size * len(self.block_windows)), dtype=np.float32)
+        enc = self._encode_texts(texts).reshape(len(words), len(self.block_windows), self.hidden_size)
+        return enc.reshape(len(words), -1).astype(np.float32, copy=False)
+
+    def extend(self, extensions, verbose=False):
+        texts = []
+        for extension in extensions:
+            texts.extend(self._texts_for_extension(extension))
+        if verbose:
+            print(texts)
+        enc = self._encode_texts(texts).reshape(len(extensions), len(self.block_windows), self.hidden_size)
+        return enc.reshape(len(extensions), -1).astype(np.float32, copy=False)
+
+    def close(self):
+        del self.model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 def make_features(condition, args):
@@ -333,6 +453,12 @@ def make_features(condition, args):
         return HuthFinetunedGPT1Features(args.finetuned_checkpoint, args.device)
     if condition == CONDITION_PRETRAINED:
         return HFOpenAIGPTFeatures(args.pretrained_model, args.device, args.pretrained_batch_size)
+    if condition in MINILM_COMBO_CONDITIONS:
+        return MiniLMComboWindowFeatures(
+            args.minilm_combo_embedding_model,
+            args.device,
+            args.minilm_combo_batch_size,
+        )
     raise ValueError(f"Unknown condition: {condition}")
 
 
@@ -352,6 +478,25 @@ def load_mindeye_encoding_checkpoint(args):
     if not path.exists():
         raise FileNotFoundError(f"MindEye encoding checkpoint not found: {path}")
     return torch_load_checkpoint(path, map_location="cpu")
+
+
+def load_minilm_combo_encoding_model(args):
+    if not args.minilm_combo_encoding_model:
+        raise ValueError(
+            "--minilm-combo-encoding-model is required when using "
+            f"--conditions {CONDITION_MINILM_COMBO_RIDGE}"
+        )
+    path = Path(args.minilm_combo_encoding_model).expanduser().resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"MiniLM combo ridge model not found: {path}")
+    return np.load(path, allow_pickle=True)
+
+
+def load_standard_minilm_combo_model(condition, subject, args):
+    path = encoding_model_path(condition, subject, args)
+    if not path.exists():
+        raise FileNotFoundError(f"MiniLM combo encoding model not found: {path}")
+    return np.load(path, allow_pickle=True)
 
 
 def load_test_response(subject, experiment, task):
@@ -450,6 +595,15 @@ def decode_one(condition, subject, experiment, task, args, huth_lm):
         em_data = load_mindeye_encoding_checkpoint(args)
         if task in set(str(x) for x in em_data["stories"]):
             raise ValueError(f"{task!r} appears in training stories for {args.mindeye_encoding_checkpoint}")
+    elif condition in MINILM_COMBO_CONDITIONS:
+        if condition == CONDITION_MINILM_COMBO_RIDGE and args.minilm_combo_encoding_model:
+            em_data = load_minilm_combo_encoding_model(args)
+            model_desc = args.minilm_combo_encoding_model
+        else:
+            em_data = load_standard_minilm_combo_model(condition, subject, args)
+            model_desc = encoding_model_path(condition, subject, args)
+        if task in set(str(x) for x in em_data["stories"]):
+            raise ValueError(f"{task!r} appears in training stories for {model_desc}")
     else:
         em_path = encoding_model_path(condition, subject, args)
         if not em_path.exists():
@@ -468,6 +622,14 @@ def decode_one(condition, subject, experiment, task, args, huth_lm):
         tr_stats, word_mean = load_stimulus_stats(em_data)
         if condition == CONDITION_MINDEYE_ENCODING:
             em = NeuralEncodingModel(em_data, subject, resp, device=config.EM_DEVICE)
+        elif condition in MINILM_COMBO_CONDITIONS:
+            em = SelectedVoxelEncodingModel(
+                resp,
+                em_data["weights"],
+                em_data["voxels"],
+                em_data["noise_model"],
+                device=config.EM_DEVICE,
+            )
         else:
             em = EncodingModel(
                 resp,
