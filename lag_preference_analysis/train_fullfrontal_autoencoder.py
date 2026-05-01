@@ -85,6 +85,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--latent-dims", nargs="+", type=int, default=[128])
     p.add_argument("--hidden-dim", type=int, default=512)
     p.add_argument("--dropout", type=float, default=0.10)
+    p.add_argument(
+        "--input-noise-std",
+        type=float,
+        default=0.05,
+        help="Std of Gaussian noise added to z-scored AE inputs during training. Set 0 for plain AE.",
+    )
+    p.add_argument(
+        "--input-mask-prob",
+        type=float,
+        default=0.0,
+        help="Probability of masking each z-scored AE input feature during training.",
+    )
     p.add_argument("--epochs", type=int, default=40)
     p.add_argument("--patience", type=int, default=6)
     p.add_argument("--batch-size", type=int, default=128)
@@ -210,6 +222,16 @@ class NonlinearAutoencoder(nn.Module):
         return self.decoder(self.encoder(x))
 
 
+def corrupt_batch(x: torch.Tensor, noise_std: float, mask_prob: float) -> torch.Tensor:
+    out = x
+    if noise_std > 0:
+        out = out + torch.randn_like(out) * float(noise_std)
+    if mask_prob > 0:
+        keep = torch.rand_like(out) >= float(mask_prob)
+        out = out * keep.to(out.dtype)
+    return out
+
+
 def train_autoencoder(
     x_train: np.ndarray,
     x_val: np.ndarray,
@@ -250,8 +272,9 @@ def train_autoencoder(
         train_losses = []
         for (xb,) in loader:
             xb = xb.to(device)
+            xb_corrupt = corrupt_batch(xb, args.input_noise_std, args.input_mask_prob)
             optimizer.zero_grad(set_to_none=True)
-            loss = loss_fn(model(xb), xb)
+            loss = loss_fn(model(xb_corrupt), xb)
             loss.backward()
             optimizer.step()
             train_losses.append(float(loss.detach().cpu()))
@@ -261,7 +284,8 @@ def train_autoencoder(
         with torch.no_grad():
             for start in range(0, x_es.shape[0], max(1, int(args.batch_size) * 4)):
                 xb = x_es[start : start + int(args.batch_size) * 4].to(device)
-                es_losses.append(float(loss_fn(model(xb), xb).detach().cpu()))
+                xb_corrupt = corrupt_batch(xb, args.input_noise_std, args.input_mask_prob)
+                es_losses.append(float(loss_fn(model(xb_corrupt), xb).detach().cpu()))
         es_loss = float(np.mean(es_losses))
 
         if es_loss < best_loss - 1e-4:
@@ -297,6 +321,8 @@ def train_autoencoder(
                 "latent_dim": latent_dim,
                 "hidden_dim": int(args.hidden_dim),
                 "dropout": float(args.dropout),
+                "input_noise_std": float(args.input_noise_std),
+                "input_mask_prob": float(args.input_mask_prob),
                 "best_epoch": best_epoch,
                 "best_early_stop_mse": best_loss,
             },
@@ -432,6 +458,8 @@ def main() -> None:
                 "latent_dims": [int(x) for x in args.latent_dims],
                 "hidden_dim": int(args.hidden_dim),
                 "dropout": float(args.dropout),
+                "input_noise_std": float(args.input_noise_std),
+                "input_mask_prob": float(args.input_mask_prob),
                 "epochs": int(args.epochs),
                 "patience": int(args.patience),
                 "batch_size": int(args.batch_size),
