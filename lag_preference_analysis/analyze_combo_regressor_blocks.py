@@ -61,6 +61,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--results-dir", required=True, help="Combo run directory containing lag_corrs.npz/config.json.")
     p.add_argument("--subject", default=None, choices=sorted(SUBJECT_TO_UTS))
     p.add_argument("--lags", nargs="+", type=int, default=None, help="Lags to refit (default: all saved lags).")
+    p.add_argument("--chunk-trs", type=int, default=None, help="Text chunk size; defaults to saved run config.")
     p.add_argument("--sessions", nargs="+", type=int, default=[2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 18, 20])
     p.add_argument("--stories", nargs="+", default=None)
     p.add_argument("--summary-horizons", nargs="+", type=int, default=None)
@@ -197,7 +198,10 @@ def main() -> None:
     args.summary_horizons = args.summary_horizons or [int(x) for x in saved["summary_horizons"]]
     args.summary_model = args.summary_model or run_cfg.get("summary_model")
     args.embedding_model = run_cfg.get("embedding_model", args.embedding_model)
-    lags = args.lags or [int(x) for x in saved["lags"]]
+    saved_lags = [int(x) for x in saved["lags"]]
+    refit_lags = args.lags or saved_lags
+    args.lags = saved_lags
+    args.chunk_trs = int(args.chunk_trs or run_cfg.get("chunk_trs", saved.get("chunk_trs", 1)))
     alphas = args.ridge_alphas or [float(x) for x in saved["ridge_alphas"]]
 
     mounted_root = configure_data_root(args)
@@ -231,7 +235,7 @@ def main() -> None:
     responses_by_story = {s: arr.astype(np.float32) for s, arr in responses_by_story.items()}
     resp_lengths = {s: int(arr.shape[0]) for s, arr in responses_by_story.items()}
 
-    max_lag = max(lags)
+    max_lag = max(saved_lags)
     one_tr_args = argparse.Namespace(
         subject=subject,
         embedding_cache_dir=args.one_tr_cache_dir,
@@ -252,9 +256,8 @@ def main() -> None:
     block_names = ["1TR"] + [f"h{h}" for h in args.summary_horizons]
     block_slices = {name: slice(i * one_dim, (i + 1) * one_dim) for i, name in enumerate(block_names)}
 
-    saved_lags = [int(x) for x in saved["lags"]]
     rows: list[dict] = []
-    for lag in lags:
+    for lag in refit_lags:
         log.info("==== %s lag=%d ====", subject, lag)
         x_train, y_train = stack_lag(combo, responses_by_story, train_stories, int(lag))
         norms = fit_block_norms(x_train, y_train, block_slices, alphas, args.voxel_chunk_size)
