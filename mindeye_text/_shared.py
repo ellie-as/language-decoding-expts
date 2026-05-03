@@ -167,7 +167,14 @@ def load_responses_by_story(
 # ---------------------------------------------------------------------------
 
 
-def chunk_cache_key(subject: str, stories: List[str], feature_model: str, chunk_trs: int, lag_trs: int) -> str:
+def chunk_cache_key(
+    subject: str,
+    stories: List[str],
+    feature_model: str,
+    chunk_trs: int,
+    lag_trs: int,
+    embedding_model: str | None = None,
+) -> str:
     payload = {
         "subject": subject,
         "stories": stories,
@@ -176,6 +183,9 @@ def chunk_cache_key(subject: str, stories: List[str], feature_model: str, chunk_
         "lag_trs": int(lag_trs),
         "alignment": "text_at_i_brain_at_i_plus_lag_v2",
     }
+    if embedding_model is not None:
+        payload["embedding_model"] = embedding_model
+        payload["version"] = 2
     return hashlib.sha1(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:12]
 
 
@@ -285,7 +295,15 @@ def load_or_build_chunk_embeddings(
     """
     cache_dir = Path(args.embedding_cache_dir) / args.subject
     cache_dir.mkdir(parents=True, exist_ok=True)
-    key = chunk_cache_key(args.subject, stories, args.feature_model, args.chunk_trs, args.lag_trs)
+    explicit_embedding_model = getattr(args, "embedding_model", None)
+    key = chunk_cache_key(
+        args.subject,
+        stories,
+        args.feature_model,
+        args.chunk_trs,
+        args.lag_trs,
+        explicit_embedding_model,
+    )
     cache_path = cache_dir / (
         f"chunk{args.chunk_trs}tr_text_embeddings__{args.feature_model}"
         f"__lag{args.lag_trs}__{key}.pkl"
@@ -301,8 +319,13 @@ def load_or_build_chunk_embeddings(
         ensure_stimulus_data_root(response_root)
     log.info("Building 5-TR chunk texts and embeddings")
     texts_by_story = build_chunk_texts_by_story(stories, resp_lengths, args.chunk_trs, args.lag_trs)
-    emb_model_name, _ = EMBEDDING_MODELS[args.feature_model]
-    encoder, emb_dim = load_encoder(emb_model_name, device="cpu")
+    emb_model_name = explicit_embedding_model
+    if not emb_model_name:
+        emb_model_name, _ = EMBEDDING_MODELS[args.feature_model]
+    encoder, emb_dim = load_encoder(
+        emb_model_name,
+        device=getattr(args, "embedding_device", "cpu"),
+    )
     embeddings_by_story = embed_chunk_texts(
         encoder,
         emb_dim,
