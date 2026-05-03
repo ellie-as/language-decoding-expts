@@ -6,15 +6,15 @@
 #   bash lag_preference_analysis/run_combo_block_ablation_cluster.sh
 #
 # Useful overrides:
-#   SUBJECTS="S1 S2 S3" TOP_N=1000 bash lag_preference_analysis/run_combo_block_ablation_cluster.sh
-#   TOP_N=0 bash lag_preference_analysis/run_combo_block_ablation_cluster.sh  # all full-frontal voxels
+#   SUBJECTS="S1" bash lag_preference_analysis/run_combo_block_ablation_cluster.sh
+#   TOP_N=1000 bash lag_preference_analysis/run_combo_block_ablation_cluster.sh  # quick high-r subset
 
 set -euo pipefail
 
 DATA_ROOT="${DATA_ROOT:-/ceph/behrens/ellie/language-decoding-expts}"
 SUBJECTS="${SUBJECTS:-S1 S2 S3}"
 LAG="${LAG:-2}"
-TOP_N="${TOP_N:-1000}"
+TOP_N="${TOP_N:-0}"
 VOXEL_CHUNK_SIZE="${VOXEL_CHUNK_SIZE:-1000}"
 OUT_ROOT="${OUT_ROOT:-lag_preference_analysis/results/combo_block_ablation}"
 
@@ -33,7 +33,11 @@ echo "OUT_ROOT=${OUT_ROOT}"
 for SUB in ${SUBJECTS}; do
   TAG="${SUB}__embedding-summary-combo-h20-50-200__lags1-10__chunk1tr__seed0"
   RESULTS_DIR="${DATA_ROOT}/lag_preference_analysis/results/${TAG}"
-  OUT_PREFIX="${OUT_ROOT}/${SUB}_combo_block_ablation_lag${LAG}_top${TOP_N}"
+  if [[ "${TOP_N}" == "0" ]]; then
+    OUT_PREFIX="${OUT_ROOT}/${SUB}_combo_block_ablation_lag${LAG}_allfrontal"
+  else
+    OUT_PREFIX="${OUT_ROOT}/${SUB}_combo_block_ablation_lag${LAG}_top${TOP_N}"
+  fi
 
   echo
   echo "=== ${SUB}: ${RESULTS_DIR} ==="
