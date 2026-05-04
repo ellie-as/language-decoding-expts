@@ -38,7 +38,6 @@ from utils_resp import get_resp  # noqa: E402
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("combo_block_ablation")
 
-BLOCKS = ["1TR", "h20", "h50", "h200"]
 SUB_ROIS = ["BA_10", "BA_9_46", "BA_8", "BA_6", "BROCA"]
 
 
@@ -56,7 +55,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--summary-horizons", nargs="+", type=int, default=None)
     p.add_argument("--summary-model", default=None)
     p.add_argument("--summaries-dir", default=str(rse.LOCAL_DEFAULT_SUMMARIES_DIR))
-    p.add_argument("--embedding-model", default="sentence-transformers/all-MiniLM-L6-v2")
+    p.add_argument("--embedding-model", default="BAAI/bge-base-en-v1.5")
     p.add_argument("--embed-batch-size", type=int, default=256)
     p.add_argument("--embedding-cache-dir", default=str(THIS_DIR / "cache"))
     p.add_argument("--one-tr-cache-dir", default=str(REPO_DIR / "27-04-expts" / "cache"))
@@ -130,13 +129,13 @@ def select_voxels(saved_corrs: np.ndarray, saved_lags: Sequence[int], lag: int, 
     return np.sort(order)
 
 
-def summarize_rows(voxel_rows: list[dict], masks: Dict[str, np.ndarray]) -> list[dict]:
+def summarize_rows(voxel_rows: list[dict], masks: Dict[str, np.ndarray], blocks: Sequence[str]) -> list[dict]:
     rows: list[dict] = []
     for roi, mask in masks.items():
         selected_for_roi = np.nonzero(mask)[0].tolist()
         if not selected_for_roi:
             continue
-        for block in BLOCKS:
+        for block in blocks:
             vals = np.asarray([float(voxel_rows[i][f"delta_drop_{block}"]) for i in selected_for_roi], dtype=float)
             rows.append(
                 {
@@ -176,6 +175,7 @@ def main() -> None:
     args.summary_horizons = args.summary_horizons or [int(x) for x in saved["summary_horizons"]]
     args.summary_model = args.summary_model or run_cfg.get("summary_model")
     args.embedding_model = run_cfg.get("embedding_model", args.embedding_model)
+    block_names = ["1TR"] + [f"h{h}" for h in args.summary_horizons]
     saved_lags = [int(x) for x in saved["lags"]]
     args.lags = saved_lags
     args.chunk_trs = int(args.chunk_trs or run_cfg.get("chunk_trs", saved.get("chunk_trs", 1)))
@@ -218,6 +218,7 @@ def main() -> None:
         subject=subject,
         embedding_cache_dir=args.one_tr_cache_dir,
         feature_model="embedding",
+        embedding_model=args.embedding_model,
         chunk_trs=1,
         lag_trs=int(max(saved_lags)),
         embed_batch_size=int(args.embed_batch_size),
@@ -234,9 +235,9 @@ def main() -> None:
     log.info("%s: building combo feature matrices", subject)
     combo = build_combo_embeddings(one_tr, summary_embs, stories, args.summary_horizons)
 
-    block_slices = {name: slice(i * one_dim, (i + 1) * one_dim) for i, name in enumerate(BLOCKS)}
-    variants = {"full": np.arange(one_dim * len(BLOCKS))}
-    for block in BLOCKS:
+    block_slices = {name: slice(i * one_dim, (i + 1) * one_dim) for i, name in enumerate(block_names)}
+    variants = {"full": np.arange(one_dim * len(block_names))}
+    for block in block_names:
         keep = [np.arange(sl.start, sl.stop) for name, sl in block_slices.items() if name != block]
         variants[f"drop_{block}"] = np.concatenate(keep)
 
@@ -270,14 +271,14 @@ def main() -> None:
             "saved_full_r": float(saved_lag_r[i]),
             "refit_full_r": float(full[i]),
         }
-        for block in BLOCKS:
+        for block in block_names:
             drop_r = float(corrs_by_variant[f"drop_{block}"][i])
             row[f"drop_{block}_r"] = drop_r
             row[f"delta_drop_{block}"] = float(full[i] - drop_r)
         voxel_rows.append(row)
 
     masks = load_roi_masks(Path(args.ba_dir).expanduser().resolve(), subject, selected_voxels)
-    summary_rows = summarize_rows(voxel_rows, masks)
+    summary_rows = summarize_rows(voxel_rows, masks, block_names)
 
     out_prefix = Path(args.out_prefix).expanduser().resolve() if args.out_prefix else results_dir / f"combo_block_ablation_lag{args.lag}_top{len(selected_local)}"
     write_csv(out_prefix.with_name(out_prefix.name + "_voxels.csv"), voxel_rows)

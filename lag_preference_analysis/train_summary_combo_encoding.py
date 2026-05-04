@@ -80,11 +80,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--chunk-trs", type=int, default=1)
 
     p.add_argument("--summary-model", default=None, help="Summary generator model (default: infer).")
-    p.add_argument("--summary-horizons", nargs="+", type=int, default=[20, 50, 200])
+    p.add_argument("--summary-horizons", nargs="+", type=int, default=[20, 50, 200, 500])
     p.add_argument("--summaries-dir", default=str(LOCAL_DEFAULT_SUMMARIES_DIR))
     p.add_argument(
         "--embedding-model",
-        default="sentence-transformers/all-MiniLM-L6-v2",
+        default="BAAI/bge-base-en-v1.5",
         help="SentenceTransformer used for both 1TR text and summary text.",
     )
     p.add_argument("--embed-batch-size", type=int, default=256)
@@ -136,8 +136,8 @@ def cache_key(args: argparse.Namespace, stories: Sequence[str], resp_lengths: Di
         "embedding_model": args.embedding_model,
         "chunk_trs": int(args.chunk_trs),
         "max_lag": int(max(args.lags)),
-        "feature_blocks": ["1tr_text", "summary_h20", "summary_h50", "summary_h200"],
-        "version": 1,
+        "feature_blocks": ["1tr_text"] + [f"summary_h{int(h)}" for h in args.summary_horizons],
+        "version": 2,
     }
     return hashlib.sha1(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:12]
 
@@ -181,7 +181,7 @@ def load_or_build_summary_embeddings(
 
     encoder = rse.SummaryEmbeddingEncoder(
         model_name=args.embedding_model,
-        device="cpu",
+        device=getattr(args, "embedding_device", "cpu"),
         batch_size=int(args.embed_batch_size),
     )
 
@@ -281,6 +281,7 @@ def main() -> None:
         subject=args.subject,
         embedding_cache_dir=args.one_tr_cache_dir,
         feature_model="embedding",
+        embedding_model=args.embedding_model,
         chunk_trs=1,
         lag_trs=int(max_lag),
         embed_batch_size=int(args.embed_batch_size),

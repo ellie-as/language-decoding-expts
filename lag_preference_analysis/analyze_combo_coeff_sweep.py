@@ -71,6 +71,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--elasticnet-max-iter", type=int, default=2000)
     p.add_argument("--elasticnet-tol", type=float, default=1e-4)
     p.add_argument("--voxel-chunk-size", type=int, default=1000)
+    p.add_argument(
+        "--block-pca-dim",
+        type=int,
+        default=0,
+        help="If >0, fit PCA separately within each feature block on training rows and use this many PCs per block.",
+    )
     p.add_argument("--skip-single-blocks", action="store_true", help="Only write combined-model coefficient tables.")
 
     p.add_argument("--sessions", nargs="+", type=int, default=[2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 18, 20])
@@ -125,6 +131,43 @@ def zscore_train_apply(x_train: np.ndarray, x_val: np.ndarray) -> tuple[np.ndarr
     std = x_train.std(axis=0)
     std[std == 0] = 1.0
     return ((x_train - mean) / std).astype(np.float32), ((x_val - mean) / std).astype(np.float32)
+
+
+def apply_block_pca(
+    *,
+    x_train: np.ndarray,
+    x_val: np.ndarray,
+    block_slices: Dict[str, slice],
+    n_components: int,
+    seed: int,
+) -> tuple[np.ndarray, np.ndarray, Dict[str, slice], dict[str, float]]:
+    """Fit PCA separately per block on training rows, then transform validation rows."""
+    from sklearn.decomposition import PCA
+
+    if n_components <= 0:
+        return x_train, x_val, block_slices, {}
+
+    train_parts: list[np.ndarray] = []
+    val_parts: list[np.ndarray] = []
+    pca_slices: Dict[str, slice] = {}
+    explained: dict[str, float] = {}
+    start = 0
+
+    for block, sl in block_slices.items():
+        block_train, block_val = zscore_train_apply(x_train[:, sl], x_val[:, sl])
+        n_comp = min(int(n_components), block_train.shape[0] - 1, block_train.shape[1])
+        if n_comp <= 0:
+            raise ValueError(f"Cannot fit PCA for block {block!r}: requested {n_components}, train shape={block_train.shape}")
+        pca = PCA(n_components=n_comp, svd_solver="randomized", random_state=int(seed))
+        train_pcs = pca.fit_transform(block_train).astype(np.float32)
+        val_pcs = pca.transform(block_val).astype(np.float32)
+        train_parts.append(train_pcs)
+        val_parts.append(val_pcs)
+        pca_slices[block] = slice(start, start + n_comp)
+        explained[block] = float(np.sum(pca.explained_variance_ratio_))
+        start += n_comp
+
+    return np.hstack(train_parts).astype(np.float32), np.hstack(val_parts).astype(np.float32), pca_slices, explained
 
 
 def fit_coefficients(
@@ -385,6 +428,19 @@ def main() -> None:
         block_slices = {name: slice(i * one_dim, (i + 1) * one_dim) for i, name in enumerate(block_names)}
         x_train, y_train = stack_lag(combo, responses_by_story, train_stories, args.lag)
         x_val, y_val = stack_lag(combo, responses_by_story, val_stories, args.lag)
+        if int(args.block_pca_dim) > 0:
+            x_train, x_val, block_slices, pca_explained = apply_block_pca(
+                x_train=x_train,
+                x_val=x_val,
+                block_slices=block_slices,
+                n_components=int(args.block_pca_dim),
+                seed=int(args.seed),
+            )
+            log.info(
+                "Applied block PCA (%d PCs/block): %s",
+                int(args.block_pca_dim),
+                ", ".join(f"{block}={frac:.3f}" for block, frac in pca_explained.items()),
+            )
         log.info("X_train=%s X_val=%s Y_train=%s", x_train.shape, x_val.shape, y_train.shape)
 
         for regressor in args.regressors:
