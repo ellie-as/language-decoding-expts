@@ -276,18 +276,31 @@ def render_flatmap_images(
     return images, pixel_mask, extents
 
 
-def pad_to_multiple(images: np.ndarray, mask: np.ndarray, multiple: int) -> tuple[np.ndarray, np.ndarray, tuple[int, int]]:
+def pad_amount(image_hw: tuple[int, int], multiple: int) -> tuple[int, int]:
     if multiple <= 1:
-        return images, mask, (0, 0)
-    h, w = images.shape[-2:]
-    pad_h = (-h) % int(multiple)
-    pad_w = (-w) % int(multiple)
+        return 0, 0
+    h, w = image_hw
+    return int((-h) % int(multiple)), int((-w) % int(multiple))
+
+
+def pad_image_stack(images: np.ndarray, pad_hw: tuple[int, int]) -> np.ndarray:
+    pad_h, pad_w = pad_hw
     if pad_h == 0 and pad_w == 0:
-        return images, mask, (0, 0)
-    pad_spec_img = ((0, 0), (0, pad_h), (0, pad_w)) if images.ndim == 3 else ((0, pad_h), (0, pad_w))
-    images = np.pad(images, pad_spec_img, mode="constant", constant_values=np.nan)
-    mask = np.pad(mask, ((0, pad_h), (0, pad_w)), mode="constant", constant_values=False)
-    return images, mask, (pad_h, pad_w)
+        return images
+    if images.ndim == 3:
+        spec = ((0, 0), (0, pad_h), (0, pad_w))
+    elif images.ndim == 2:
+        spec = ((0, pad_h), (0, pad_w))
+    else:
+        raise ValueError(f"Cannot pad ndim={images.ndim}")
+    return np.pad(images, spec, mode="constant", constant_values=np.nan)
+
+
+def pad_mask(mask: np.ndarray, pad_hw: tuple[int, int]) -> np.ndarray:
+    pad_h, pad_w = pad_hw
+    if pad_h == 0 and pad_w == 0:
+        return mask
+    return np.pad(mask, ((0, pad_h), (0, pad_w)), mode="constant", constant_values=False)
 
 
 def fill_nan_inplace(images: np.ndarray, mask: np.ndarray) -> None:
@@ -677,13 +690,26 @@ def main() -> None:
             json.dump(cache_meta, f, indent=2)
         log.info("Cached flatmap images at %s", image_cache_dir)
 
-    images_train, pixel_mask, pad_train = pad_to_multiple(images_train, pixel_mask, int(args.pad_to_multiple))
-    images_val, pixel_mask, pad_val = pad_to_multiple(images_val, pixel_mask, int(args.pad_to_multiple))
-    if pad_train != pad_val:
-        raise RuntimeError("Inconsistent padding between train and val image stacks.")
+    if images_train.shape[1:] != images_val.shape[1:]:
+        raise RuntimeError(
+            f"Train/val rendered image shapes disagree: {images_train.shape[1:]} vs {images_val.shape[1:]}"
+        )
+    if pixel_mask.shape != images_train.shape[1:]:
+        log.warning(
+            "Cached pixel_mask shape %s does not match image shape %s; recomputing from images_train[0].",
+            pixel_mask.shape,
+            images_train.shape[1:],
+        )
+        pixel_mask = np.isfinite(images_train[0]).copy()
+
+    pad_hw = pad_amount(images_train.shape[1:], int(args.pad_to_multiple))
+    images_train = pad_image_stack(images_train, pad_hw)
+    images_val = pad_image_stack(images_val, pad_hw)
+    pixel_mask = pad_mask(pixel_mask, pad_hw)
     log.info(
-        "Image shape after pad-to-multiple=%d: train=%s val=%s pixel_mask=%s n_pixels=%d",
+        "Image shape after pad-to-multiple=%d (pad_hw=%s): train=%s val=%s pixel_mask=%s n_pixels=%d",
         int(args.pad_to_multiple),
+        pad_hw,
         images_train.shape,
         images_val.shape,
         pixel_mask.shape,
