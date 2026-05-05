@@ -24,6 +24,7 @@ SUBJECTS="${SUBJECTS:-S1}"
 LAG="${LAG:-2}"
 SUMMARY_HORIZONS="${SUMMARY_HORIZONS:-20 50 200 500}"
 EMBEDDING_MODEL="${EMBEDDING_MODEL:-BAAI/bge-base-en-v1.5}"
+CONTEXT_FEATURE_SOURCE="${CONTEXT_FEATURE_SOURCE:-summary}"
 RIDGE_ALPHAS="${RIDGE_ALPHAS:-1000 10000 100000 300000 1000000 3000000 10000000}"
 EMBEDDING_DEVICE="${EMBEDDING_DEVICE:-auto}"
 EMBED_BATCH_SIZE="${EMBED_BATCH_SIZE:-256}"
@@ -50,12 +51,17 @@ echo "DATA_ROOT=${DATA_ROOT}"
 echo "SUBJECTS=${SUBJECTS}"
 echo "LAG=${LAG}"
 echo "EMBEDDING_MODEL=${EMBEDDING_MODEL}"
+echo "CONTEXT_FEATURE_SOURCE=${CONTEXT_FEATURE_SOURCE}"
 echo "RIDGE_ALPHAS=${RIDGE_ALPHAS}"
 echo "DELTA_QUANTILE=${DELTA_QUANTILE}"
 echo "OUT_ROOT=${OUT_ROOT}"
 
 for SUB in ${SUBJECTS}; do
-  OUT_DIR="${OUT_ROOT}/${SUB}_bge"
+  if [[ "${CONTEXT_FEATURE_SOURCE}" == "summary" ]]; then
+    OUT_DIR="${OUT_ROOT}/${SUB}_bge"
+  else
+    OUT_DIR="${OUT_ROOT}/${SUB}_bge_${CONTEXT_FEATURE_SOURCE}"
+  fi
   echo
   echo "=== ${SUB} -> ${OUT_DIR} ==="
 
@@ -65,6 +71,7 @@ for SUB in ${SUBJECTS}; do
     --lag "${LAG}" \
     --summary-horizons ${SUMMARY_HORIZONS} \
     --embedding-model "${EMBEDDING_MODEL}" \
+    --context-feature-source "${CONTEXT_FEATURE_SOURCE}" \
     --ridge-alphas ${RIDGE_ALPHAS} \
     --embedding-device "${EMBEDDING_DEVICE}" \
     --embed-batch-size "${EMBED_BATCH_SIZE}" \

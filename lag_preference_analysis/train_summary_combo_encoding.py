@@ -52,6 +52,7 @@ from train_lag_encoding import (  # noqa: E402
     write_summary_csv,
 )
 from utils_resp import get_resp  # noqa: E402
+from utils_stim import get_story_wordseqs  # noqa: E402
 
 
 logging.basicConfig(
@@ -82,6 +83,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--summary-model", default=None, help="Summary generator model (default: infer).")
     p.add_argument("--summary-horizons", nargs="+", type=int, default=[20, 50, 200, 500])
     p.add_argument("--summaries-dir", default=str(LOCAL_DEFAULT_SUMMARIES_DIR))
+    p.add_argument(
+        "--context-feature-source",
+        choices=["summary", "raw_text_window"],
+        default="summary",
+        help=(
+            "Feature text used for hN blocks. 'summary' embeds generated rolling summaries; "
+            "'raw_text_window' embeds the actual transcript words in the previous N TRs."
+        ),
+    )
     p.add_argument(
         "--embedding-model",
         default="BAAI/bge-base-en-v1.5",
@@ -133,13 +143,35 @@ def cache_key(args: argparse.Namespace, stories: Sequence[str], resp_lengths: Di
         "resp_lengths": {s: int(resp_lengths[s]) for s in stories},
         "summary_model": args.summary_model,
         "summary_horizons": list(args.summary_horizons),
+        "context_feature_source": getattr(args, "context_feature_source", "summary"),
         "embedding_model": args.embedding_model,
         "chunk_trs": int(args.chunk_trs),
         "max_lag": int(max(args.lags)),
-        "feature_blocks": ["1tr_text"] + [f"summary_h{int(h)}" for h in args.summary_horizons],
-        "version": 2,
+        "feature_blocks": ["1tr_text"]
+        + [f"{getattr(args, 'context_feature_source', 'summary')}_h{int(h)}" for h in args.summary_horizons],
+        "version": 3,
     }
     return hashlib.sha1(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:12]
+
+
+def build_raw_text_windows_for_story(wordseq, response_len: int, window_trs: int) -> list[str]:
+    """Transcript text in the trailing window ending at each response-aligned TR."""
+    words = np.asarray(wordseq.data)
+    word_times = np.asarray(wordseq.data_times, dtype=np.float64)
+    tr_times = np.asarray(wordseq.tr_times, dtype=np.float64)
+    tr = float(np.median(np.diff(tr_times))) if len(tr_times) > 1 else 2.0
+    half_tr = tr / 2.0
+
+    texts: list[str] = []
+    for i in range(response_len):
+        stim_idx = rse.TRIM_START + i
+        if stim_idx >= len(tr_times):
+            raise ValueError(f"response index {i} maps past TR grid length {len(tr_times)}")
+        end_t = tr_times[stim_idx] + half_tr
+        start_t = end_t - float(window_trs) * tr
+        mask = (word_times >= start_t) & (word_times < end_t)
+        texts.append(" ".join(str(w).strip() for w in words[mask] if str(w).strip()))
+    return texts
 
 
 def make_tag(args: argparse.Namespace) -> str:
@@ -163,18 +195,29 @@ def load_or_build_summary_embeddings(
     cache_dir = Path(args.embedding_cache_dir).expanduser().resolve() / args.subject
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    summaries_dir = Path(args.summaries_dir).expanduser().resolve()
-    index = rse.build_summary_index(summaries_dir)
-    summary_model = rse.resolve_summary_model(index, list(stories), args.summary_model)
-    horizons = rse.resolve_summary_horizons(index, list(stories), summary_model, args.summary_horizons)
-    if sorted(horizons) != sorted(args.summary_horizons):
-        raise ValueError(f"Resolved summary horizons {horizons} != requested {args.summary_horizons}")
-    args.summary_model = summary_model
+    context_source = getattr(args, "context_feature_source", "summary")
+    if context_source not in {"summary", "raw_text_window"}:
+        raise ValueError(f"Unknown --context-feature-source: {context_source!r}")
+
+    horizons = sorted({int(h) for h in args.summary_horizons})
+    if context_source == "summary":
+        summaries_dir = Path(args.summaries_dir).expanduser().resolve()
+        index = rse.build_summary_index(summaries_dir)
+        summary_model = rse.resolve_summary_model(index, list(stories), args.summary_model)
+        horizons = rse.resolve_summary_horizons(index, list(stories), summary_model, args.summary_horizons)
+        if sorted(horizons) != sorted(args.summary_horizons):
+            raise ValueError(f"Resolved summary horizons {horizons} != requested {args.summary_horizons}")
+        args.summary_model = summary_model
+        cache_stem = f"summary_combo_minilm__{summary_model}__h{'-'.join(map(str, horizons))}"
+    else:
+        summary_model = "raw_text_window"
+        args.summary_model = summary_model
+        cache_stem = f"raw_text_window_combo__h{'-'.join(map(str, horizons))}"
 
     key = cache_key(args, stories, resp_lengths)
-    cache_path = cache_dir / f"summary_combo_minilm__{summary_model}__h{'-'.join(map(str, horizons))}__{key}.pkl"
+    cache_path = cache_dir / f"{cache_stem}__{key}.pkl"
     if cache_path.is_file():
-        log.info("Loading cached summary embeddings: %s", cache_path)
+        log.info("Loading cached %s embeddings: %s", context_source, cache_path)
         with open(cache_path, "rb") as f:
             payload = pickle.load(f)
         return payload["summary_embeddings"], summary_model, str(cache_path)
@@ -187,17 +230,29 @@ def load_or_build_summary_embeddings(
 
     out: Dict[int, Dict[str, np.ndarray]] = {int(h): {} for h in horizons}
     try:
+        if context_source == "raw_text_window":
+            log.info("Loading word sequences for raw text-window context features")
+            wordseqs = get_story_wordseqs(list(stories))
+        else:
+            wordseqs = None
+
         for horizon in horizons:
-            log.info("Embedding summaries: model=%s horizon=%s", summary_model, horizon)
+            log.info("Embedding %s features: model=%s horizon=%s", context_source, summary_model, horizon)
             for story in stories:
-                summary_path = index[(story, summary_model, int(horizon))]
-                payload = rse.load_summary_texts(summary_path, story, summary_model, int(horizon))
-                vecs = encoder.encode(payload["texts"]).astype(np.float32)
-                trimmed = vecs[rse.TRIM_START : -rse.TRIM_END]
+                if context_source == "summary":
+                    summary_path = index[(story, summary_model, int(horizon))]
+                    payload = rse.load_summary_texts(summary_path, story, summary_model, int(horizon))
+                    vecs = encoder.encode(payload["texts"]).astype(np.float32)
+                    trimmed = vecs[rse.TRIM_START : -rse.TRIM_END]
+                else:
+                    if wordseqs is None:
+                        raise RuntimeError("wordseqs unexpectedly missing for raw_text_window source")
+                    texts = build_raw_text_windows_for_story(wordseqs[story], int(resp_lengths[story]), int(horizon))
+                    trimmed = encoder.encode(texts).astype(np.float32)
                 expected = int(resp_lengths[story])
                 if trimmed.shape[0] != expected:
                     raise ValueError(
-                        f"{story} h{horizon}: summary embeddings trim to {trimmed.shape[0]}, "
+                        f"{story} h{horizon}: {context_source} embeddings align to {trimmed.shape[0]}, "
                         f"but response has {expected} TRs."
                     )
                 out[int(horizon)][story] = trimmed
@@ -210,6 +265,7 @@ def load_or_build_summary_embeddings(
                 "summary_embeddings": out,
                 "summary_model": summary_model,
                 "horizons": list(map(int, horizons)),
+                "context_feature_source": context_source,
                 "embedding_model": args.embedding_model,
                 "stories": list(stories),
             },

@@ -86,6 +86,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--summary-model", default=None)
     p.add_argument("--summaries-dir", default=str(rse.LOCAL_DEFAULT_SUMMARIES_DIR))
+    p.add_argument(
+        "--context-feature-source",
+        choices=["summary", "raw_text_window"],
+        default="summary",
+        help=(
+            "Feature text used for hN blocks. 'summary' embeds generated rolling summaries; "
+            "'raw_text_window' embeds actual transcript words in the previous N TRs."
+        ),
+    )
     p.add_argument("--embed-batch-size", type=int, default=256)
     p.add_argument("--embedding-device", default="auto")
     p.add_argument("--embedding-cache-dir", default=str(THIS_DIR / "cache"))
