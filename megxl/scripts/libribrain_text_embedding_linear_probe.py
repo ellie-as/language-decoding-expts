@@ -374,8 +374,9 @@ class IndexedEmbeddingDataset(Dataset):
 
 
 def collate_batch(samples: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    min_time = min(s["meg"].shape[-1] for s in samples)
     return {
-        "meg": torch.stack([s["meg"] for s in samples]),
+        "meg": torch.stack([s["meg"][..., :min_time] for s in samples]),
         "sensor_xyzdir": torch.stack([s["sensor_xyzdir"] for s in samples]),
         "sensor_types": torch.stack([s["sensor_types"] for s in samples]),
         "sensor_mask": torch.stack([s["sensor_mask"] for s in samples]),
