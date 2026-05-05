@@ -114,8 +114,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--mask-type", default="thick")
     p.add_argument("--image-height", type=int, default=192,
                    help="Flatmap pixel height; width is auto-inferred from pycortex extents.")
-    p.add_argument("--pad-to-multiple", type=int, default=8,
-                   help="Pad H and W up to this multiple (must be a power of 2 covering all stride-2 convs).")
+    p.add_argument("--pad-to-multiple", type=int, default=32,
+                   help="Pad H and W up to this multiple. Must be >= 2**num_strides so the encoder/decoder shapes line up exactly.")
     p.add_argument("--with-curvature", action="store_true",
                    help="Use pycortex curvature underlay when rendering reference images. The training tensor itself is always the projected response value, never blended with curvature.")
 
@@ -138,6 +138,18 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--latent-dims", nargs="+", type=int, default=[128])
     p.add_argument("--base-channels", type=int, default=8)
+    p.add_argument(
+        "--num-strides",
+        type=int,
+        default=5,
+        help="Number of stride-2 conv blocks in the encoder. The decoder mirrors. Image dims must be a multiple of 2**num_strides (use --pad-to-multiple).",
+    )
+    p.add_argument(
+        "--bottleneck-channels",
+        type=int,
+        default=16,
+        help="Channel count after the 1x1 conv compression that precedes the Linear bottleneck. Smaller values shrink the bottleneck Linear quadratically.",
+    )
     p.add_argument("--dropout", type=float, default=0.10)
     p.add_argument("--input-noise-std", type=float, default=0.05)
     p.add_argument("--input-mask-prob", type=float, default=0.0)
@@ -335,22 +347,58 @@ class FlatmapDataset(Dataset):
 
 
 class Conv2DAutoencoder(nn.Module):
-    def __init__(self, image_shape: Sequence[int], latent_dim: int, base_channels: int, dropout: float) -> None:
+    """Deeper conv AE with channel-compressed spatial bottleneck.
+
+    Encoder: 1 stride-1 stem (1 -> c channels) followed by ``num_strides``
+    stride-2 conv blocks that double channels each step (c -> 2c -> ... ->
+    c * 2**num_strides), then a 1x1 conv compresses to ``bottleneck_channels``
+    so the spatial bottleneck stays small and the Linear layer is cheap.
+
+    Decoder mirrors the encoder: 1x1 conv expands back, followed by
+    ``num_strides`` stride-2 ConvTranspose blocks that halve channels each
+    step, and a 3x3 conv returns to one greyscale channel.
+
+    Compared to the previous (3-stride-2, no channel compression) variant,
+    most parameters now live in the conv stack rather than in two huge linear
+    layers, and the total parameter count drops by roughly 10-15x at
+    latent_dim=128.
+    """
+
+    def __init__(
+        self,
+        image_shape: Sequence[int],
+        latent_dim: int,
+        base_channels: int,
+        dropout: float,
+        num_strides: int = 5,
+        bottleneck_channels: int = 16,
+    ) -> None:
         super().__init__()
         c = int(base_channels)
-        self.encoder_conv = nn.Sequential(
+        n_strides = int(num_strides)
+        bn_c = int(bottleneck_channels)
+
+        encoder_layers: list[nn.Module] = [
             nn.Conv2d(1, c, kernel_size=3, padding=1),
             nn.GELU(),
             nn.Dropout2d(dropout),
-            nn.Conv2d(c, c * 2, kernel_size=3, stride=2, padding=1),
+        ]
+        cur = c
+        for _ in range(n_strides):
+            nxt = cur * 2
+            encoder_layers += [
+                nn.Conv2d(cur, nxt, kernel_size=3, stride=2, padding=1),
+                nn.GELU(),
+                nn.Dropout2d(dropout),
+            ]
+            cur = nxt
+        self.expanded_channels = cur
+        encoder_layers += [
+            nn.Conv2d(cur, bn_c, kernel_size=1),
             nn.GELU(),
-            nn.Dropout2d(dropout),
-            nn.Conv2d(c * 2, c * 4, kernel_size=3, stride=2, padding=1),
-            nn.GELU(),
-            nn.Dropout2d(dropout),
-            nn.Conv2d(c * 4, c * 8, kernel_size=3, stride=2, padding=1),
-            nn.GELU(),
-        )
+        ]
+        self.encoder_conv = nn.Sequential(*encoder_layers)
+
         with torch.no_grad():
             dummy = torch.zeros(1, 1, int(image_shape[0]), int(image_shape[1]))
             encoded = self.encoder_conv(dummy)
@@ -358,17 +406,23 @@ class Conv2DAutoencoder(nn.Module):
         encoded_dim = int(np.prod(self.encoded_shape))
         self.to_latent = nn.Linear(encoded_dim, latent_dim)
         self.from_latent = nn.Linear(latent_dim, encoded_dim)
-        self.decoder_conv = nn.Sequential(
-            nn.ConvTranspose2d(c * 8, c * 4, kernel_size=4, stride=2, padding=1),
+
+        decoder_layers: list[nn.Module] = [
+            nn.Conv2d(bn_c, cur, kernel_size=1),
             nn.GELU(),
-            nn.Dropout2d(dropout),
-            nn.ConvTranspose2d(c * 4, c * 2, kernel_size=4, stride=2, padding=1),
-            nn.GELU(),
-            nn.Dropout2d(dropout),
-            nn.ConvTranspose2d(c * 2, c, kernel_size=4, stride=2, padding=1),
-            nn.GELU(),
-            nn.Conv2d(c, 1, kernel_size=3, padding=1),
-        )
+        ]
+        for _ in range(n_strides):
+            nxt = cur // 2
+            decoder_layers += [
+                nn.ConvTranspose2d(cur, nxt, kernel_size=4, stride=2, padding=1),
+                nn.GELU(),
+                nn.Dropout2d(dropout),
+            ]
+            cur = nxt
+        decoder_layers += [
+            nn.Conv2d(cur, 1, kernel_size=3, padding=1),
+        ]
+        self.decoder_conv = nn.Sequential(*decoder_layers)
         self.image_shape = (int(image_shape[0]), int(image_shape[1]))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -421,7 +475,24 @@ def train_conv_ae(
     val_loader = DataLoader(val_ds, batch_size=int(args.batch_size), shuffle=False, num_workers=0)
 
     pixel_mask_t = torch.from_numpy(mask.astype(np.float32))[None, None].to(device)
-    model = Conv2DAutoencoder(image_shape, latent_dim, int(args.base_channels), float(args.dropout)).to(device)
+    model = Conv2DAutoencoder(
+        image_shape,
+        latent_dim,
+        int(args.base_channels),
+        float(args.dropout),
+        num_strides=int(args.num_strides),
+        bottleneck_channels=int(args.bottleneck_channels),
+    ).to(device)
+    n_params = sum(p.numel() for p in model.parameters())
+    log.info(
+        "Conv2DAutoencoder latent=%d num_strides=%d base_c=%d bn_c=%d encoded_shape=%s n_params=%d",
+        latent_dim,
+        int(args.num_strides),
+        int(args.base_channels),
+        int(args.bottleneck_channels),
+        model.encoded_shape,
+        n_params,
+    )
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(args.lr), weight_decay=float(args.weight_decay))
 
     epoch_sample_count = int(getattr(args, "epoch_png_count", 0))
@@ -500,6 +571,13 @@ def train_conv_ae(
                 pred_batch.shape[0],
                 label=f"ep{epoch:03d}",
             )
+            del pred_batch, target_batch
+
+        import gc as _gc
+
+        _gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         if bad_epochs >= int(args.patience) and epoch >= 10:
             break
@@ -531,7 +609,17 @@ def train_conv_ae(
             pred_images.append(model(xb.to(device)).cpu().numpy()[:, 0])
     pred_imgs = np.concatenate(pred_images, axis=0).astype(np.float32)
     pred_vec = masked_pixel_vector(pred_imgs, mask)
-    return pred_vec, {"best_epoch": best_epoch, "best_early_stop_mse": best_loss}, time.time() - t0
+    elapsed = time.time() - t0
+
+    del model, optimizer, train_ds, es_ds, val_ds, train_loader, es_loader, val_loader
+    if epoch_sample_targets is not None:
+        del epoch_sample_targets
+    del best_state
+    import gc as _gc
+    _gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return pred_vec, {"best_epoch": best_epoch, "best_early_stop_mse": best_loss}, elapsed
 
 
 def save_sample_pngs(
@@ -542,12 +630,17 @@ def save_sample_pngs(
     n_samples: int,
     label: str,
 ) -> None:
+    """Use the matplotlib OOP API (Figure + FigureCanvasAgg) rather than pyplot.
+
+    pyplot keeps a global registry of figures whose underlying Agg canvases are
+    not always released on plt.close, which leaks memory over many calls (e.g.
+    when called per-epoch). Explicitly creating Figure/FigureCanvasAgg avoids
+    that registry entirely.
+    """
     if n_samples <= 0:
         return
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
 
     out_dir.mkdir(parents=True, exist_ok=True)
     n = min(int(n_samples), pred_imgs.shape[0], target_imgs.shape[0])
@@ -558,16 +651,21 @@ def save_sample_pngs(
         target[~mask] = np.nan
         pred[~mask] = np.nan
         vmax = float(np.nanmax(np.abs(np.stack([target, pred])))) or 1.0
-        fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+        fig = Figure(figsize=(10, 4))
+        canvas = FigureCanvasAgg(fig)
+        axes = [fig.add_subplot(1, 2, 1), fig.add_subplot(1, 2, 2)]
+        last_im = None
         for ax, img, title in zip(axes, (target, pred), ("target", "reconstruction")):
-            im = ax.imshow(img, cmap="RdBu_r", vmin=-vmax, vmax=vmax, origin="lower")
+            last_im = ax.imshow(img, cmap="RdBu_r", vmin=-vmax, vmax=vmax, origin="lower")
             ax.set_title(f"{label} TR={int(idx)} {title}")
             ax.set_axis_off()
-        cbar = fig.colorbar(im, ax=axes.ravel().tolist(), shrink=0.6)
-        cbar.set_label("z-scored BOLD")
+        if last_im is not None:
+            cbar = fig.colorbar(last_im, ax=axes, shrink=0.6)
+            cbar.set_label("z-scored BOLD")
         out_path = out_dir / f"{label}_sample_{k:02d}_TR{int(idx)}.png"
-        fig.savefig(out_path, dpi=120, bbox_inches="tight")
-        plt.close(fig)
+        canvas.print_png(str(out_path))
+        fig.clf()
+        del fig, canvas, axes
 
 
 def main() -> None:
@@ -702,6 +800,12 @@ def main() -> None:
         )
         pixel_mask = np.isfinite(images_train[0]).copy()
 
+    required_multiple = 2 ** int(args.num_strides)
+    if int(args.pad_to_multiple) < required_multiple:
+        raise ValueError(
+            f"--pad-to-multiple={int(args.pad_to_multiple)} is smaller than 2**num_strides={required_multiple}; "
+            "the encoder downsamples by 2**num_strides and needs image dims divisible by that."
+        )
     pad_hw = pad_amount(images_train.shape[1:], int(args.pad_to_multiple))
     images_train = pad_image_stack(images_train, pad_hw)
     images_val = pad_image_stack(images_val, pad_hw)
@@ -809,6 +913,12 @@ def main() -> None:
                 int(args.sample_png_count),
                 label="pca",
             )
+            del ae_pred_imgs, pca_pred_imgs, target_imgs
+
+        del pca, pca_pred_vec, ae_pred_vec
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     fieldnames = [
         "model",

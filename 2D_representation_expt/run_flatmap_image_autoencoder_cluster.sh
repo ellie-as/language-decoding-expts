@@ -26,10 +26,12 @@ DATA_ROOT="${DATA_ROOT:-/ceph/behrens/ellie/language-decoding-expts}"
 SUBJECTS="${SUBJECTS:-S1}"
 LATENT_DIMS="${LATENT_DIMS:-64 128 256}"
 IMAGE_HEIGHT="${IMAGE_HEIGHT:-192}"
-PAD_TO_MULTIPLE="${PAD_TO_MULTIPLE:-8}"
+PAD_TO_MULTIPLE="${PAD_TO_MULTIPLE:-32}"
 EPOCHS="${EPOCHS:-40}"
 BATCH_SIZE="${BATCH_SIZE:-16}"
 BASE_CHANNELS="${BASE_CHANNELS:-8}"
+NUM_STRIDES="${NUM_STRIDES:-5}"
+BOTTLENECK_CHANNELS="${BOTTLENECK_CHANNELS:-16}"
 DROPOUT="${DROPOUT:-0.10}"
 INPUT_NOISE_STD="${INPUT_NOISE_STD:-0.05}"
 INPUT_MASK_PROB="${INPUT_MASK_PROB:-0.0}"
@@ -83,6 +85,8 @@ for SUB in ${SUBJECTS}; do
     --pad-to-multiple "${PAD_TO_MULTIPLE}" \
     --latent-dims ${LATENT_DIMS} \
     --base-channels "${BASE_CHANNELS}" \
+    --num-strides "${NUM_STRIDES}" \
+    --bottleneck-channels "${BOTTLENECK_CHANNELS}" \
     --dropout "${DROPOUT}" \
     --input-noise-std "${INPUT_NOISE_STD}" \
     --input-mask-prob "${INPUT_MASK_PROB}" \
