@@ -199,15 +199,19 @@ def stack_stories(responses: Dict[str, np.ndarray], stories: Sequence[str]) -> n
 
 
 def zscore_train_val(x_train: np.ndarray, x_val: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """In-place z-score (mutates x_train and x_val) to keep memory low for huge BOLD arrays."""
+    if x_train.dtype != np.float32:
+        x_train = x_train.astype(np.float32, copy=False)
+    if x_val.dtype != np.float32:
+        x_val = x_val.astype(np.float32, copy=False)
     mean = x_train.mean(axis=0, dtype=np.float64).astype(np.float32)
     std = x_train.std(axis=0, dtype=np.float64).astype(np.float32)
     std[std == 0] = 1.0
-    return (
-        ((x_train - mean) / std).astype(np.float32),
-        ((x_val - mean) / std).astype(np.float32),
-        mean,
-        std,
-    )
+    np.subtract(x_train, mean, out=x_train)
+    np.divide(x_train, std, out=x_train)
+    np.subtract(x_val, mean, out=x_val)
+    np.divide(x_val, std, out=x_val)
+    return x_train, x_val, mean, std
 
 
 def cache_paths(cache_dir: Path, subject: str, xfm_name: str, mask_type: str, image_height: int) -> dict[str, Path]:
@@ -578,11 +582,14 @@ def main() -> None:
 
     responses, total_voxels = load_responses(args, stories, response_root)
     log.info("Loaded responses for %s: %d voxels (mask_thick)", args.subject, total_voxels)
-    x_train_raw = stack_stories(responses, train_stories)
-    x_val_raw = stack_stories(responses, val_stories)
-    log.info("Raw response shapes: train=%s val=%s", x_train_raw.shape, x_val_raw.shape)
-    x_train, x_val, train_mean, train_std = zscore_train_val(x_train_raw, x_val_raw)
-    del x_train_raw, x_val_raw
+    x_train = stack_stories(responses, train_stories)
+    x_val = stack_stories(responses, val_stories)
+    del responses
+    import gc
+    gc.collect()
+    log.info("Raw response shapes: train=%s val=%s", x_train.shape, x_val.shape)
+    x_train, x_val, train_mean, train_std = zscore_train_val(x_train, x_val)
+    log.info("Z-scored in place; current dtype=%s", x_train.dtype)
 
     configure_pycortex_filestore(args.pycortex_filestore)
     import cortex  # noqa: WPS433
@@ -615,7 +622,9 @@ def main() -> None:
     )
 
     if cache_ok:
-        log.info("Loading cached flatmap images from %s", image_cache_dir)
+        log.info("Loading cached flatmap images from %s (no longer need BOLD arrays)", image_cache_dir)
+        del x_train, x_val
+        gc.collect()
         images_train = np.load(paths["train_images"]).astype(np.float32, copy=False)
         images_val = np.load(paths["val_images"]).astype(np.float32, copy=False)
         pixel_mask = np.load(paths["pixel_mask"]).astype(bool, copy=False)
@@ -637,6 +646,8 @@ def main() -> None:
             log_every=int(args.render_batch_log_every),
             label="train",
         )
+        del x_train
+        gc.collect()
         log.info("Rendering flatmap images (val) ...")
         images_val, _val_mask, _ = render_flatmap_images(
             x_val,
@@ -646,6 +657,8 @@ def main() -> None:
             log_every=int(args.render_batch_log_every),
             label="val",
         )
+        del x_val
+        gc.collect()
         np.save(paths["train_images"], images_train)
         np.save(paths["val_images"], images_val)
         np.save(paths["pixel_mask"], pixel_mask)
