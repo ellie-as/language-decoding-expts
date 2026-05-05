@@ -11,6 +11,7 @@ MEG-XL features.
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import json
 import logging
@@ -138,6 +139,89 @@ def require_hf_hub() -> Any:
     except ImportError as exc:
         raise RuntimeError("Install huggingface_hub first: pip install huggingface_hub") from exc
     return hf_hub_download
+
+
+def ensure_libribrain_metadata(data_root: Path) -> None:
+    metadata_dir = data_root / "metadata"
+    channels_path = metadata_dir / "channels.tsv"
+    sensor_xyz_path = metadata_dir / "sensor_xyz.json"
+    if channels_path.exists() and sensor_xyz_path.exists():
+        return
+
+    hf_hub_download = require_hf_hub()
+    LOG.info("LibriBrain metadata missing under %s; downloading small metadata files", metadata_dir)
+    metadata_dir.mkdir(parents=True, exist_ok=True)
+    for filename in ["metadata/channels.tsv", "metadata/sensor_xyz.json"]:
+        hf_hub_download(
+            repo_id="pnpl/LibriBrain",
+            filename=filename,
+            repo_type="dataset",
+            local_dir=data_root,
+        )
+
+
+def write_megxl_sensor_json(data_root: Path, output_path: Path) -> None:
+    ensure_libribrain_metadata(data_root)
+    channels_path = data_root / "metadata" / "channels.tsv"
+    sensor_xyz_path = data_root / "metadata" / "sensor_xyz.json"
+
+    with sensor_xyz_path.open("r") as f:
+        xyz_values = json.load(f)
+
+    sensors = []
+    with channels_path.open("r", newline="") as f:
+        reader = csv.DictReader(f, delimiter="\t")
+        for i, row in enumerate(reader):
+            ch_name = row.get("name") or row.get("ch_name")
+            if not ch_name or not ch_name.startswith("MEG"):
+                continue
+            if i >= len(xyz_values):
+                break
+
+            ch_type = (row.get("type") or row.get("kind") or "").lower()
+            is_mag = "mag" in ch_type and "grad" not in ch_type
+            coil_type = 3024 if is_mag else 3012
+
+            pos = [float(v) for v in xyz_values[i][:3]]
+            # MEG-XL expects MNE-style 12-value loc arrays. The public metadata
+            # provides positions only, so use a fixed orientation as a lightweight
+            # compatibility value for the frozen model's spatial embedding.
+            loc = pos + [0.0, 0.0, 1.0] + [0.0, 1.0, 0.0] + [0.0, 0.0, 1.0]
+            sensors.append({"ch_name": ch_name, "loc": loc, "coil_type": coil_type})
+
+    if not sensors:
+        raise RuntimeError(f"Could not build sensor metadata from {channels_path} and {sensor_xyz_path}")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w") as f:
+        json.dump(sensors, f)
+    LOG.info("Wrote MEG-XL-compatible sensor metadata: %s", output_path)
+
+
+def prepare_libribrain_root(data_root: Path, cache_dir: Path) -> Path:
+    """Return a root compatible with MEG-XL's LibriBrainWordAlignedDataset."""
+    sensor_json = data_root / "meg_sensors_information.json"
+    has_serialized = (data_root / "serialized").exists()
+    if sensor_json.exists() and has_serialized:
+        return data_root
+
+    compat_root = cache_dir / "libribrain_megxl_compat"
+    compat_root.mkdir(parents=True, exist_ok=True)
+
+    compat_sensor_json = compat_root / "meg_sensors_information.json"
+    if sensor_json.exists():
+        if not compat_sensor_json.exists():
+            compat_sensor_json.symlink_to(sensor_json)
+    else:
+        write_megxl_sensor_json(data_root, compat_sensor_json)
+
+    compat_serialized = compat_root / "serialized"
+    if not compat_serialized.exists():
+        serialized_source = data_root / "serialized" if has_serialized else data_root
+        compat_serialized.symlink_to(serialized_source, target_is_directory=True)
+
+    LOG.info("Using MEG-XL-compatible LibriBrain root: %s", compat_root)
+    return compat_root
 
 
 def download_megxl_checkpoint(checkpoint_dir: Path, repo_id: str, filename: str) -> Path:
@@ -467,8 +551,9 @@ def main() -> None:
     megxl = load_megxl_model(checkpoint_path, tokenizer, device)
 
     LOG.info("Building LibriBrain dataset")
+    libribrain_root = prepare_libribrain_root(Path(cfg.libribrain_root), cache_dir)
     dataset = LibriBrainWordAlignedDataset(
-        data_root=cfg.libribrain_root,
+        data_root=str(libribrain_root),
         segment_length=cfg.words_per_segment * cfg.subsegment_duration,
         subsegment_duration=cfg.subsegment_duration,
         words_per_segment=cfg.words_per_segment,
