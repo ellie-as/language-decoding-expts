@@ -80,6 +80,7 @@ class RunConfig:
     grad_clip: float
     loss: str
     temperature: float
+    eval_max_batches: int | None
     device: str
     text_device: str
     amp: bool
@@ -445,12 +446,15 @@ def evaluate(
     loss_name: str,
     temperature: float,
     use_amp: bool,
+    max_batches: int | None = None,
 ) -> Dict[str, float]:
     probe.eval()
     losses: List[float] = []
     preds: List[torch.Tensor] = []
     targets: List[torch.Tensor] = []
-    for batch in tqdm(loader, desc="Evaluate", leave=False):
+    for batch_idx, batch in enumerate(tqdm(loader, desc="Evaluate", leave=False)):
+        if max_batches is not None and batch_idx >= max_batches:
+            break
         pred, target = forward_probe(megxl, probe, batch, device, use_amp)
         loss = batch_loss(pred, target, loss_name, temperature)
         losses.append(float(loss.detach().cpu()))
@@ -466,13 +470,18 @@ def evaluate(
     top5 = (ranks[:, : min(5, sims.shape[1])] == labels).any(dim=1).float().mean().item()
     top10 = (ranks[:, : min(10, sims.shape[1])] == labels).any(dim=1).float().mean().item()
     paired_cosine = F.cosine_similarity(pred_all, target_all, dim=-1).mean().item()
+    n_candidates = sims.shape[1]
 
     return {
         "loss": float(np.mean(losses)) if losses else math.nan,
+        "n_eval_examples": float(n_candidates),
         "paired_cosine": paired_cosine,
         "retrieval_top1": top1,
         "retrieval_top5": top5,
         "retrieval_top10": top10,
+        "random_top1": min(1.0, 1.0 / n_candidates),
+        "random_top5": min(1.0, 5.0 / n_candidates),
+        "random_top10": min(1.0, 10.0 / n_candidates),
     }
 
 
@@ -507,6 +516,12 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--loss", choices=["contrastive", "mse", "cosine"], default="contrastive")
     parser.add_argument("--temperature", type=float, default=0.07)
+    parser.add_argument(
+        "--eval-max-batches",
+        type=int,
+        default=None,
+        help="Limit validation batches evaluated after each epoch; final test still uses the full test split",
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--text-device", default="cuda")
     parser.add_argument("--no-amp", action="store_true")
@@ -553,6 +568,7 @@ def main() -> None:
         grad_clip=args.grad_clip,
         loss=args.loss,
         temperature=args.temperature,
+        eval_max_batches=args.eval_max_batches,
         device=str(device),
         text_device=str(text_device),
         amp=not args.no_amp,
@@ -638,16 +654,29 @@ def main() -> None:
             optimizer.step()
             train_losses.append(float(loss.detach().cpu()))
 
-        val_metrics = evaluate(megxl, probe, val_loader, device, cfg.loss, cfg.temperature, cfg.amp)
+        val_metrics = evaluate(
+            megxl,
+            probe,
+            val_loader,
+            device,
+            cfg.loss,
+            cfg.temperature,
+            cfg.amp,
+            max_batches=cfg.eval_max_batches,
+        )
         row = {"epoch": epoch, "train_loss": float(np.mean(train_losses)), **{f"val_{k}": v for k, v in val_metrics.items()}}
         history.append(row)
         LOG.info(
-            "Epoch %d: train_loss=%.4f val_loss=%.4f val_cos=%.4f val_top1=%.4f",
+            "Epoch %d: train_loss=%.4f val_loss=%.4f val_cos=%.4f "
+            "val_top1=%.4f val_top10=%.4f random_top10=%.4f n_eval=%.0f",
             epoch,
             row["train_loss"],
             val_metrics["loss"],
             val_metrics["paired_cosine"],
             val_metrics["retrieval_top1"],
+            val_metrics["retrieval_top10"],
+            val_metrics["random_top10"],
+            val_metrics["n_eval_examples"],
         )
 
         if val_metrics["paired_cosine"] > best_val:
