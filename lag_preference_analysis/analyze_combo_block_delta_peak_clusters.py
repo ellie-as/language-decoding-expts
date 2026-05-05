@@ -120,6 +120,14 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--min-cluster-size", type=int, default=3)
     p.add_argument(
+        "--from-voxel-deltas-csv",
+        default=None,
+        help=(
+            "If set, skip ridge fitting and load r_full / drop_<block>_r from this voxel_block_deltas.csv. "
+            "Use to redo clustering / maps after a successful fit."
+        ),
+    )
+    p.add_argument(
         "--out-dir",
         default=str(THIS_DIR / "results" / "combo_block_delta_peak_clusters" / "S1_bge"),
     )
@@ -187,10 +195,39 @@ def write_csv(path: Path, rows: Sequence[dict]) -> None:
     if not rows:
         path.write_text("", encoding="utf-8")
         return
+    fieldnames: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        for key in row.keys():
+            if key not in seen:
+                fieldnames.append(key)
+                seen.add(key)
     with open(path, "w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
-        writer.writerows(rows)
+        for row in rows:
+            writer.writerow({k: row.get(k, "") for k in fieldnames})
+
+
+def load_voxel_deltas_csv(
+    path: Path, block_names: Sequence[str]
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, np.ndarray]]:
+    """Reload voxels / r_full / selected_alpha / r_drops from a previously written CSV."""
+    with open(path, encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
+    if not rows:
+        raise ValueError(f"voxel deltas CSV is empty: {path}")
+    voxels = np.asarray([int(r["global_voxel_index"]) for r in rows], dtype=np.int64)
+    r_full = np.asarray([float(r["full_model_r"]) for r in rows], dtype=np.float32)
+    full_alphas = np.asarray([float(r["selected_alpha"]) for r in rows], dtype=np.float32)
+    r_drops: dict[str, np.ndarray] = {}
+    for block in block_names:
+        col = f"drop_{block}_r"
+        if col not in rows[0]:
+            raise ValueError(f"CSV {path} is missing column {col!r}")
+        r_drops[block] = np.asarray([float(r[col]) for r in rows], dtype=np.float32)
+    return voxels, r_full, full_alphas, r_drops
 
 
 def fit_full_and_drops(
@@ -320,19 +357,16 @@ def summarize_clusters(
             "primary_roi": primary_roi(cluster_voxels, roi_lookup),
             "mean_full_model_r": float(np.mean(full_corrs[idx])),
             "peak_full_model_r": float(np.max(full_corrs[idx])),
-            f"mean_delta_drop_{block}": float(np.mean(block_delta[idx])),
-            f"peak_delta_drop_{block}": float(block_delta[peak_local]),
+            "peak_delta_focal": float(block_delta[peak_local]),
             "peak_global_voxel": int(voxels[peak_local]),
             "centroid_i": float(centroid_ijk[0]),
             "centroid_j": float(centroid_ijk[1]),
             "centroid_k": float(centroid_ijk[2]),
         }
         for other in deltas:
-            if other == block:
-                continue
             item[f"mean_delta_drop_{other}"] = float(np.mean(deltas[other][idx]))
         out.append(item)
-    return sorted(out, key=lambda row: (-row[f"peak_delta_drop_{block}"], -row["n_voxels"]))
+    return sorted(out, key=lambda row: (-row["peak_delta_focal"], -row["n_voxels"]))
 
 
 def roi_block_contingency(
@@ -483,65 +517,72 @@ def main() -> None:
     out_dir = Path(args.out_dir).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    mounted_root = configure_data_root(args)
-    stories = load_stories(args)
-    train_stories, val_stories = split_stories(stories, args)
-    log.info(
-        "%s: %d stories | %d train | %d val", args.subject, len(stories), len(train_stories), len(val_stories)
-    )
+    block_names = ["1TR"] + [f"h{h}" for h in args.summary_horizons]
 
-    response_root = config.DATA_TRAIN_DIR
-    if args.local_compute_mode and mounted_root is not None:
-        response_root = str(
-            rse.stage_local_response_cache(
-                args.subject,
-                stories,
-                Path(config.DATA_TRAIN_DIR),
-                Path(args.local_cache_root).expanduser().resolve(),
-            )
+    if args.from_voxel_deltas_csv:
+        csv_path = Path(args.from_voxel_deltas_csv).expanduser().resolve()
+        log.info("Resuming from %s (skipping ridge fits)", csv_path)
+        voxels, r_full, full_alphas, r_drops = load_voxel_deltas_csv(csv_path, block_names)
+        configure_data_root(args)
+    else:
+        mounted_root = configure_data_root(args)
+        stories = load_stories(args)
+        train_stories, val_stories = split_stories(stories, args)
+        log.info(
+            "%s: %d stories | %d train | %d val", args.subject, len(stories), len(train_stories), len(val_stories)
         )
 
-    sample_resp = get_resp(args.subject, [stories[0]], stack=True, vox=None, response_root=response_root)
-    voxels = load_full_frontal_voxels(args.subject, int(sample_resp.shape[1]), args.ba_dir)
-    responses_by_story = get_resp(args.subject, stories, stack=False, vox=voxels, response_root=response_root)
-    responses_by_story = {s: arr.astype(np.float32) for s, arr in responses_by_story.items()}
-    resp_lengths = {s: int(arr.shape[0]) for s, arr in responses_by_story.items()}
+        response_root = config.DATA_TRAIN_DIR
+        if args.local_compute_mode and mounted_root is not None:
+            response_root = str(
+                rse.stage_local_response_cache(
+                    args.subject,
+                    stories,
+                    Path(config.DATA_TRAIN_DIR),
+                    Path(args.local_cache_root).expanduser().resolve(),
+                )
+            )
 
-    one_tr_args = argparse.Namespace(
-        subject=args.subject,
-        embedding_cache_dir=args.one_tr_cache_dir,
-        feature_model="embedding",
-        embedding_model=args.embedding_model,
-        chunk_trs=1,
-        lag_trs=int(args.lag),
-        embed_batch_size=int(args.embed_batch_size),
-        embedding_device=args.embedding_device,
-    )
-    one_tr, one_dim, _one_cache = load_or_build_chunk_embeddings(
-        one_tr_args,
-        stories,
-        resp_lengths,
-        response_root=config.DATA_TRAIN_DIR,
-    )
-    summary_embs, _summary_model, _summary_cache = load_or_build_summary_embeddings(args, stories, resp_lengths)
-    combo = build_combo_embeddings(one_tr, summary_embs, stories, args.summary_horizons)
+        sample_resp = get_resp(args.subject, [stories[0]], stack=True, vox=None, response_root=response_root)
+        voxels = load_full_frontal_voxels(args.subject, int(sample_resp.shape[1]), args.ba_dir)
+        responses_by_story = get_resp(args.subject, stories, stack=False, vox=voxels, response_root=response_root)
+        responses_by_story = {s: arr.astype(np.float32) for s, arr in responses_by_story.items()}
+        resp_lengths = {s: int(arr.shape[0]) for s, arr in responses_by_story.items()}
 
-    block_names = ["1TR"] + [f"h{h}" for h in args.summary_horizons]
-    block_slices = {name: slice(i * one_dim, (i + 1) * one_dim) for i, name in enumerate(block_names)}
+        one_tr_args = argparse.Namespace(
+            subject=args.subject,
+            embedding_cache_dir=args.one_tr_cache_dir,
+            feature_model="embedding",
+            embedding_model=args.embedding_model,
+            chunk_trs=1,
+            lag_trs=int(args.lag),
+            embed_batch_size=int(args.embed_batch_size),
+            embedding_device=args.embedding_device,
+        )
+        one_tr, one_dim, _one_cache = load_or_build_chunk_embeddings(
+            one_tr_args,
+            stories,
+            resp_lengths,
+            response_root=config.DATA_TRAIN_DIR,
+        )
+        summary_embs, _summary_model, _summary_cache = load_or_build_summary_embeddings(args, stories, resp_lengths)
+        combo = build_combo_embeddings(one_tr, summary_embs, stories, args.summary_horizons)
 
-    x_train, y_train = stack_lag(combo, responses_by_story, train_stories, args.lag)
-    x_val, y_val = stack_lag(combo, responses_by_story, val_stories, args.lag)
-    log.info("X_train=%s X_val=%s Y_train=%s", x_train.shape, x_val.shape, y_train.shape)
+        block_slices = {name: slice(i * one_dim, (i + 1) * one_dim) for i, name in enumerate(block_names)}
 
-    r_full, full_alphas, r_drops = fit_full_and_drops(
-        x_train=x_train,
-        y_train=y_train,
-        x_val=x_val,
-        y_val=y_val,
-        block_slices=block_slices,
-        alphas=args.ridge_alphas,
-        voxel_chunk_size=args.voxel_chunk_size,
-    )
+        x_train, y_train = stack_lag(combo, responses_by_story, train_stories, args.lag)
+        x_val, y_val = stack_lag(combo, responses_by_story, val_stories, args.lag)
+        log.info("X_train=%s X_val=%s Y_train=%s", x_train.shape, x_val.shape, y_train.shape)
+
+        r_full, full_alphas, r_drops = fit_full_and_drops(
+            x_train=x_train,
+            y_train=y_train,
+            x_val=x_val,
+            y_val=y_val,
+            block_slices=block_slices,
+            alphas=args.ridge_alphas,
+            voxel_chunk_size=args.voxel_chunk_size,
+        )
 
     pycortex_filestore = Path(args.pycortex_filestore).expanduser().resolve()
     pycortex_subject = args.pycortex_subject or SUBJECT_TO_UTS[args.subject]
