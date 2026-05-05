@@ -130,6 +130,25 @@ def split_indices(
         else:
             test.append(idx)
 
+    if (not train or not val or not test) and len(all_indices) >= 3:
+        LOG.warning(
+            "Hash split produced an empty split for %d examples; "
+            "falling back to deterministic shuffled split for this run",
+            len(all_indices),
+        )
+        rng = np.random.default_rng(seed)
+        shuffled = list(all_indices)
+        rng.shuffle(shuffled)
+        n_total = len(shuffled)
+        n_train = max(1, int(round(train_ratio * n_total)))
+        n_val = max(1, int(round(val_ratio * n_total)))
+        if n_train + n_val >= n_total:
+            n_train = max(1, n_total - 2)
+            n_val = 1
+        train = sorted(shuffled[:n_train])
+        val = sorted(shuffled[n_train : n_train + n_val])
+        test = sorted(shuffled[n_train + n_val :])
+
     return train, val, test, idx_to_text
 
 
@@ -169,20 +188,22 @@ def write_megxl_sensor_json(data_root: Path, output_path: Path) -> None:
         xyz_values = json.load(f)
 
     sensors = []
+    meg_xyz_idx = 0
     with channels_path.open("r", newline="") as f:
         reader = csv.DictReader(f, delimiter="\t")
-        for i, row in enumerate(reader):
+        for row in reader:
             ch_name = row.get("name") or row.get("ch_name")
             if not ch_name or not ch_name.startswith("MEG"):
                 continue
-            if i >= len(xyz_values):
+            if meg_xyz_idx >= len(xyz_values):
                 break
 
             ch_type = (row.get("type") or row.get("kind") or "").lower()
             is_mag = "mag" in ch_type and "grad" not in ch_type
             coil_type = 3024 if is_mag else 3012
 
-            pos = [float(v) for v in xyz_values[i][:3]]
+            pos = [float(v) for v in xyz_values[meg_xyz_idx][:3]]
+            meg_xyz_idx += 1
             # MEG-XL expects MNE-style 12-value loc arrays. The public metadata
             # provides positions only, so use a fixed orientation as a lightweight
             # compatibility value for the frozen model's spatial embedding.
