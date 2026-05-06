@@ -77,6 +77,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--force-features", action="store_true")
     parser.add_argument("--force-targets", action="store_true")
     parser.add_argument("--force-reference", action="store_true")
+    parser.add_argument(
+        "--no-append-existing",
+        action="store_true",
+        help="Start fresh summary/correlation outputs instead of merging with files already in --output-dir.",
+    )
+    parser.add_argument(
+        "--force-eval",
+        action="store_true",
+        help="Re-evaluate combinations that already exist in the summary outputs.",
+    )
     return parser.parse_args()
 
 
@@ -206,6 +216,65 @@ def evaluate_feature_for_subject(
     }
 
 
+def load_existing_outputs(args: argparse.Namespace) -> tuple[list[dict[str, object]], list[dict[str, object]], dict[str, np.ndarray]]:
+    if args.no_append_existing:
+        return [], [], {}
+
+    summary_path = args.output_dir / "gpt2_context_layer_summary.csv"
+    channel_path = args.output_dir / "gpt2_context_layer_channel_scores.csv"
+    corr_path = args.output_dir / "gpt2_context_layer_corrs.npz"
+
+    rows: list[dict[str, object]] = []
+    channel_rows: list[dict[str, object]] = []
+    corr_payloads: dict[str, np.ndarray] = {}
+    if summary_path.is_file():
+        rows = pd.read_csv(summary_path).to_dict("records")
+        print(f"Loaded existing summary rows: {len(rows)} from {summary_path}", flush=True)
+    if channel_path.is_file():
+        channel_rows = pd.read_csv(channel_path).to_dict("records")
+        print(f"Loaded existing channel rows: {len(channel_rows)} from {channel_path}", flush=True)
+    if corr_path.is_file():
+        with np.load(corr_path, allow_pickle=True) as data:
+            corr_payloads = {key: data[key] for key in data.files}
+        print(f"Loaded existing correlation arrays: {len(corr_payloads)} from {corr_path}", flush=True)
+    return rows, channel_rows, corr_payloads
+
+
+def summary_key(row: dict[str, object]) -> tuple[str, int, int]:
+    return (str(row["subject"]), int(row["context_tokens"]), int(row["layer"]))
+
+
+def drop_existing_combination(
+    *,
+    rows: list[dict[str, object]],
+    channel_rows: list[dict[str, object]],
+    corr_payloads: dict[str, np.ndarray],
+    key: tuple[str, int, int],
+    corr_key: str,
+) -> tuple[list[dict[str, object]], list[dict[str, object]], dict[str, np.ndarray]]:
+    subject, context_tokens, layer = key
+    rows = [
+        row
+        for row in rows
+        if not (
+            str(row.get("subject")) == subject
+            and int(row.get("context_tokens")) == context_tokens
+            and int(row.get("layer")) == layer
+        )
+    ]
+    channel_rows = [
+        row
+        for row in channel_rows
+        if not (
+            str(row.get("subject")) == subject
+            and int(row.get("context_tokens")) == context_tokens
+            and int(row.get("layer")) == layer
+        )
+    ]
+    corr_payloads.pop(corr_key, None)
+    return rows, channel_rows, corr_payloads
+
+
 def write_outputs(
     *,
     args: argparse.Namespace,
@@ -250,7 +319,10 @@ def main() -> int:
     dtype = resolve_dtype(args.dtype, device)
     config = vars(args).copy()
     config.update({"mounted_root": str(args.mounted_root), "bids_root": str(root), "device_resolved": device, "dtype_resolved": str(dtype)})
-    (args.output_dir / "config.json").write_text(json.dumps(config, indent=2, default=str), encoding="utf-8")
+    config_path = args.output_dir / "config.json"
+    if config_path.exists() and not args.no_append_existing:
+        config_path = args.output_dir / f"append_config_{time.strftime('%Y%m%d_%H%M%S')}.json"
+    config_path.write_text(json.dumps(config, indent=2, default=str), encoding="utf-8")
 
     print("Loading GPT-2 XL reference features for lag selection", flush=True)
     words, reference_features = load_words_and_gpt2_features(root, args.reference_gpt2_layer)
@@ -278,9 +350,7 @@ def main() -> int:
     layers = parse_layers(args.layers, int(model.config.num_hidden_layers))
     print(f"Evaluating layers: {layers}", flush=True)
 
-    rows: list[dict[str, object]] = []
-    channel_rows: list[dict[str, object]] = []
-    corr_payloads: dict[str, np.ndarray] = {}
+    rows, channel_rows, corr_payloads = load_existing_outputs(args)
     model_tag = safe_name(args.model)
 
     for context_len in args.context_token_lengths:
@@ -303,6 +373,19 @@ def main() -> int:
             feature_path = feature_paths[layer]
             dim = feature_dim(feature_path)
             for subject in args.subjects:
+                row_key = (f"sub-{subject}", int(context_len), int(layer))
+                corr_key = f"{model_tag}__ctx{int(context_len)}__layer{int(layer)}__sub{subject}"
+                if not args.force_eval and row_key in {summary_key(row) for row in rows}:
+                    print(f"Skipping existing sub-{subject} context={context_len} layer={layer}", flush=True)
+                    continue
+                if args.force_eval:
+                    rows, channel_rows, corr_payloads = drop_existing_combination(
+                        rows=rows,
+                        channel_rows=channel_rows,
+                        corr_payloads=corr_payloads,
+                        key=row_key,
+                        corr_key=corr_key,
+                    )
                 print(f"Evaluating sub-{subject} context={context_len} layer={layer}", flush=True)
                 result = evaluate_feature_for_subject(
                     args=args,
@@ -342,8 +425,7 @@ def main() -> int:
                             "z": float(coords[i, 2]),
                         }
                     )
-                key = f"{model_tag}__ctx{int(context_len)}__layer{int(layer)}__sub{subject}"
-                corr_payloads[key] = result["corrs"]
+                corr_payloads[corr_key] = result["corrs"]
         write_outputs(args=args, rows=rows, channel_rows=channel_rows, corr_payloads=corr_payloads)
         print(f"=== Context {context_len} done in {(time.time() - t0) / 60:.1f} min ===", flush=True)
 
