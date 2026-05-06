@@ -202,6 +202,36 @@ the current defaults that is expected at
 `podcast_ecog/outputs_all_channels/sub-XX_gpt2-xl_layer-24_encoding_results.npz`
 under `--mounted-root`.
 
+To visualize which channels prefer which LLM context length after the sweep:
+
+```bash
+python podcast_ecog/plot_llm_context_preferences.py \
+  --sweep-dir podcast_ecog/outputs/llm_context_sweep \
+  --mounted-root /ceph/behrens/ellie/language-decoding-expts \
+  --subject 03 \
+  --output-dir podcast_ecog/outputs/llm_context_preferences
+```
+
+To run the full all-subject GPT-2 context-size and layer sweep on the cluster:
+
+```bash
+python podcast_ecog/run_gpt2_all_subject_context_layer_sweep.py \
+  --bids-root /ceph/behrens/ellie/language-decoding-expts/podcast_ecog/data/ds005574 \
+  --mounted-root /ceph/behrens/ellie/language-decoding-expts \
+  --output-dir podcast_ecog/outputs/gpt2_all_subject_context_layer_sweep \
+  --subjects 01 02 03 04 05 06 07 08 09 \
+  --model gpt2 \
+  --context-token-lengths 0 1 2 4 8 16 32 64 \
+  --layers all \
+  --device cuda \
+  --batch-size 16
+```
+
+This computes/reuses preferred-lag targets for each subject, then evaluates all
+GPT-2 layers across all requested context lengths. It writes feature caches,
+target caches, per-fold correlations, per-channel scores, and summary tables
+under `--output-dir`.
+
 To run the ridge text-window preference analysis across all nine podcast subjects:
 
 ```bash
