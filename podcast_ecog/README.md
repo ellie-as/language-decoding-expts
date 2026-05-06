@@ -1,4 +1,4 @@
-s# Podcast ECoG Encoding Tutorial on a Cluster
+# Podcast ECoG Encoding Tutorial on a Cluster
 
 This directory contains a Python-script version of the Hasson Lab Podcast ECoG encoding tutorial:
 
@@ -154,4 +154,56 @@ To inspect long-window channels and their temporal GPT-2 lag profiles:
 
 ```bash
 python podcast_ecog/plot_long_window_lag_profiles.py
+```
+
+To compare a few encoding model classes on the same sub-03 text-window task:
+
+```bash
+python podcast_ecog/compare_encoding_models.py
+```
+
+To compare GPT-2 features against MiniLM sentence/text-window embeddings:
+
+```bash
+python podcast_ecog/compare_feature_spaces.py
+```
+
+To test whether concatenating GPT-2 embeddings from the last N words helps:
+
+```bash
+python podcast_ecog/compare_gpt2_context_windows.py
+```
+
+To recompute one-word GPT-2 features while varying the internal model context length:
+
+```bash
+python podcast_ecog/compare_gpt2_internal_context.py
+```
+
+To sweep several Hugging Face causal LMs over several internal context lengths
+on an allocated server node:
+
+```bash
+python podcast_ecog/run_llm_context_sweep.py \
+  --bids-root /ceph/behrens/ellie/language-decoding-expts/podcast_ecog/data/ds005574 \
+  --mounted-root /ceph/behrens/ellie/language-decoding-expts \
+  --output-dir podcast_ecog/outputs/llm_context_sweep \
+  --subjects 03 \
+  --models gpt2 gpt2-medium gpt2-large openai-community/gpt2-xl \
+  --context-token-lengths 0 1 2 4 8 16 32 64 \
+  --layers final \
+  --device cuda \
+  --batch-size 8
+```
+
+Use `--extract-only` if you only want to cache features first. The ridge
+evaluation step needs a preferred-lag reference result for each subject; with
+the current defaults that is expected at
+`podcast_ecog/outputs_all_channels/sub-XX_gpt2-xl_layer-24_encoding_results.npz`
+under `--mounted-root`.
+
+To run the ridge text-window preference analysis across all nine podcast subjects:
+
+```bash
+python podcast_ecog/run_all_subject_window_preferences.py
 ```
