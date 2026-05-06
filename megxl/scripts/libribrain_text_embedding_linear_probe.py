@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Linear probe from frozen MEG-XL features to LibriBrain text-window embeddings.
+"""Probe MEG-XL features against LibriBrain text-window embeddings.
 
 This script expects the MEG-XL repository to be checked out at ../MEG-XL relative
 to this file. It downloads the public MEG-XL checkpoint from Hugging Face when
 needed, builds word-aligned LibriBrain windows, embeds each text window with a
-Hugging Face text encoder, and trains only a linear projection on top of frozen
-MEG-XL features.
+Hugging Face text encoder, and trains a projection on top of MEG-XL features.
+By default MEG-XL is frozen; pass --finetune-backbone to update the MEG-XL
+transformer while keeping the BioCodec tokenizer frozen.
 """
 
 from __future__ import annotations
@@ -76,8 +77,11 @@ class RunConfig:
     num_workers: int
     epochs: int
     lr: float
+    backbone_lr: float
     weight_decay: float
     grad_clip: float
+    finetune_backbone: bool
+    pooling: str
     loss: str
     temperature: float
     eval_max_batches: int | None
@@ -275,7 +279,12 @@ def load_biocodec_tokenizer(checkpoint_path: Path, device: torch.device) -> BioC
     return tokenizer
 
 
-def load_megxl_model(checkpoint_path: Path, tokenizer: BioCodecModel, device: torch.device) -> CrissCrossTransformerModule:
+def load_megxl_model(
+    checkpoint_path: Path,
+    tokenizer: BioCodecModel,
+    device: torch.device,
+    freeze_backbone: bool,
+) -> CrissCrossTransformerModule:
     LOG.info("Loading MEG-XL checkpoint: %s", checkpoint_path)
     checkpoint = torch.load(checkpoint_path, map_location=device)
     model = CrissCrossTransformerModule(tokenizer=tokenizer, **checkpoint["hyper_parameters"])
@@ -289,9 +298,17 @@ def load_megxl_model(checkpoint_path: Path, tokenizer: BioCodecModel, device: to
         LOG.warning("Unexpected checkpoint keys: %s", unexpected)
     LOG.info("Loaded MEG-XL with %d missing deterministic RoPE buffers", len(missing))
     model.to(device)
-    model.eval()
-    for param in model.parameters():
-        param.requires_grad_(False)
+    for name, param in model.named_parameters():
+        if name.startswith("tokenizer."):
+            param.requires_grad_(False)
+        else:
+            param.requires_grad_(not freeze_backbone)
+    if freeze_backbone:
+        model.eval()
+    else:
+        model.train()
+    n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    LOG.info("MEG-XL trainable parameters: %d", n_trainable)
     return model
 
 
@@ -387,13 +404,23 @@ def collate_batch(samples: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 class WindowLinearProbe(nn.Module):
-    def __init__(self, num_channels: int, latent_dim: int, output_dim: int):
+    def __init__(self, num_channels: int, latent_dim: int, output_dim: int, pooling: str):
         super().__init__()
-        self.proj = nn.Linear(num_channels * latent_dim, output_dim)
+        if pooling not in {"channel_mean", "flatten_channels"}:
+            raise ValueError(f"Unknown pooling mode: {pooling}")
+        self.pooling = pooling
+        input_dim = latent_dim if pooling == "channel_mean" else num_channels * latent_dim
+        self.proj = nn.Linear(input_dim, output_dim)
 
-    def forward(self, features: torch.Tensor) -> torch.Tensor:
-        pooled = features.mean(dim=2)
-        return self.proj(pooled.flatten(start_dim=1))
+    def forward(self, features: torch.Tensor, sensor_mask: torch.Tensor) -> torch.Tensor:
+        time_pooled = features.mean(dim=2)
+        if self.pooling == "channel_mean":
+            weights = sensor_mask.to(time_pooled.dtype)
+            weights = weights / weights.sum(dim=1, keepdim=True).clamp_min(1.0)
+            pooled = (time_pooled * weights.unsqueeze(-1)).sum(dim=1)
+        else:
+            pooled = time_pooled.flatten(start_dim=1)
+        return self.proj(pooled)
 
 
 def contrastive_loss(pred: torch.Tensor, target: torch.Tensor, temperature: float) -> torch.Tensor:
@@ -420,6 +447,7 @@ def forward_probe(
     batch: Dict[str, Any],
     device: torch.device,
     use_amp: bool,
+    finetune_backbone: bool,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     meg = batch["meg"].to(device, non_blocking=True)
     sensor_xyzdir = batch["sensor_xyzdir"].to(device, non_blocking=True)
@@ -430,11 +458,16 @@ def forward_probe(
     sensor_xyz = sensor_xyzdir[..., :3]
     sensor_abc = sensor_xyzdir[..., 3:]
 
-    with torch.no_grad(), torch.autocast(device_type=device.type, enabled=use_amp and device.type == "cuda"):
-        output = megxl(meg, sensor_xyz, sensor_abc, sensor_types, sensor_mask, apply_mask=False)
-        features = output["features"].float()
+    if finetune_backbone:
+        with torch.autocast(device_type=device.type, enabled=use_amp and device.type == "cuda"):
+            output = megxl(meg, sensor_xyz, sensor_abc, sensor_types, sensor_mask, apply_mask=False)
+            features = output["features"].float()
+    else:
+        with torch.no_grad(), torch.autocast(device_type=device.type, enabled=use_amp and device.type == "cuda"):
+            output = megxl(meg, sensor_xyz, sensor_abc, sensor_types, sensor_mask, apply_mask=False)
+            features = output["features"].float()
 
-    pred = probe(features)
+    pred = probe(features, sensor_mask)
     return pred, target
 
 
@@ -447,8 +480,10 @@ def evaluate(
     loss_name: str,
     temperature: float,
     use_amp: bool,
+    finetune_backbone: bool,
     max_batches: int | None = None,
 ) -> Dict[str, float]:
+    megxl.eval()
     probe.eval()
     losses: List[float] = []
     preds: List[torch.Tensor] = []
@@ -456,7 +491,7 @@ def evaluate(
     for batch_idx, batch in enumerate(tqdm(loader, desc="Evaluate", leave=False)):
         if max_batches is not None and batch_idx >= max_batches:
             break
-        pred, target = forward_probe(megxl, probe, batch, device, use_amp)
+        pred, target = forward_probe(megxl, probe, batch, device, use_amp, finetune_backbone)
         loss = batch_loss(pred, target, loss_name, temperature)
         losses.append(float(loss.detach().cpu()))
         preds.append(F.normalize(pred.detach().cpu(), dim=-1))
@@ -513,8 +548,25 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument(
+        "--backbone-lr",
+        type=float,
+        default=1e-5,
+        help="Learning rate for MEG-XL parameters when --finetune-backbone is set",
+    )
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--grad-clip", type=float, default=1.0)
+    parser.add_argument(
+        "--finetune-backbone",
+        action="store_true",
+        help="Unfreeze MEG-XL transformer/backbone parameters; BioCodec tokenizer stays frozen",
+    )
+    parser.add_argument(
+        "--pooling",
+        choices=["channel_mean", "flatten_channels"],
+        default="channel_mean",
+        help="How to pool MEG-XL features before the projection head",
+    )
     parser.add_argument("--loss", choices=["contrastive", "mse", "cosine"], default="contrastive")
     parser.add_argument("--temperature", type=float, default=0.07)
     parser.add_argument(
@@ -565,8 +617,11 @@ def main() -> None:
         num_workers=args.num_workers,
         epochs=args.epochs,
         lr=args.lr,
+        backbone_lr=args.backbone_lr,
         weight_decay=args.weight_decay,
         grad_clip=args.grad_clip,
+        finetune_backbone=args.finetune_backbone,
+        pooling=args.pooling,
         loss=args.loss,
         temperature=args.temperature,
         eval_max_batches=args.eval_max_batches,
@@ -586,7 +641,7 @@ def main() -> None:
     )
     tokenizer_path = MEGXL_REPO / "brainstorm" / "neuro_tokenizers" / "biocodec_ckpt.pt"
     tokenizer = load_biocodec_tokenizer(tokenizer_path, device)
-    megxl = load_megxl_model(checkpoint_path, tokenizer, device)
+    megxl = load_megxl_model(checkpoint_path, tokenizer, device, freeze_backbone=not cfg.finetune_backbone)
 
     LOG.info("Building LibriBrain dataset")
     libribrain_root = prepare_libribrain_root(Path(cfg.libribrain_root), cache_dir)
@@ -635,23 +690,39 @@ def main() -> None:
     val_loader = DataLoader(val_ds, shuffle=False, **loader_kwargs)
     test_loader = DataLoader(test_ds, shuffle=False, **loader_kwargs)
 
-    probe = WindowLinearProbe(cfg.max_channel_dim, megxl.latent_dim, embed_dim).to(device)
-    optimizer = AdamW(probe.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    probe = WindowLinearProbe(cfg.max_channel_dim, megxl.latent_dim, embed_dim, cfg.pooling).to(device)
+    if cfg.finetune_backbone:
+        backbone_params = [p for p in megxl.parameters() if p.requires_grad]
+        optimizer = AdamW(
+            [
+                {"params": probe.parameters(), "lr": cfg.lr},
+                {"params": backbone_params, "lr": cfg.backbone_lr},
+            ],
+            weight_decay=cfg.weight_decay,
+        )
+        clip_params = list(probe.parameters()) + backbone_params
+    else:
+        optimizer = AdamW(probe.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+        clip_params = list(probe.parameters())
 
     best_val = -float("inf")
     best_path = output_dir / "best_probe.pt"
     history: List[Dict[str, float]] = []
 
     for epoch in range(1, cfg.epochs + 1):
+        if cfg.finetune_backbone:
+            megxl.train()
+        else:
+            megxl.eval()
         probe.train()
         train_losses: List[float] = []
         for batch in tqdm(train_loader, desc=f"Epoch {epoch}/{cfg.epochs}"):
             optimizer.zero_grad(set_to_none=True)
-            pred, target = forward_probe(megxl, probe, batch, device, cfg.amp)
+            pred, target = forward_probe(megxl, probe, batch, device, cfg.amp, cfg.finetune_backbone)
             loss = batch_loss(pred, target, cfg.loss, cfg.temperature)
             loss.backward()
             if cfg.grad_clip > 0:
-                nn.utils.clip_grad_norm_(probe.parameters(), cfg.grad_clip)
+                nn.utils.clip_grad_norm_(clip_params, cfg.grad_clip)
             optimizer.step()
             train_losses.append(float(loss.detach().cpu()))
 
@@ -663,6 +734,7 @@ def main() -> None:
             cfg.loss,
             cfg.temperature,
             cfg.amp,
+            cfg.finetune_backbone,
             max_batches=cfg.eval_max_batches,
         )
         row = {"epoch": epoch, "train_loss": float(np.mean(train_losses)), **{f"val_{k}": v for k, v in val_metrics.items()}}
@@ -685,6 +757,7 @@ def main() -> None:
             torch.save(
                 {
                     "probe_state_dict": probe.state_dict(),
+                    "megxl_state_dict": megxl.state_dict() if cfg.finetune_backbone else None,
                     "config": asdict(cfg),
                     "epoch": epoch,
                     "val_metrics": val_metrics,
@@ -696,7 +769,13 @@ def main() -> None:
 
     checkpoint = torch.load(best_path, map_location=device)
     probe.load_state_dict(checkpoint["probe_state_dict"])
-    test_metrics = evaluate(megxl, probe, test_loader, device, cfg.loss, cfg.temperature, cfg.amp)
+    if checkpoint.get("megxl_state_dict") is not None:
+        missing, unexpected = megxl.load_state_dict(checkpoint["megxl_state_dict"], strict=False)
+        if unexpected:
+            LOG.warning("Unexpected keys while loading fine-tuned MEG-XL: %s", unexpected)
+        if missing:
+            LOG.warning("Missing keys while loading fine-tuned MEG-XL: %s", missing)
+    test_metrics = evaluate(megxl, probe, test_loader, device, cfg.loss, cfg.temperature, cfg.amp, cfg.finetune_backbone)
     LOG.info("Final test metrics: %s", test_metrics)
 
     result = {"best_checkpoint": str(best_path), "history": history, "test_metrics": test_metrics}
