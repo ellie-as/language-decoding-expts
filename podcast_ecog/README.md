@@ -1,4 +1,4 @@
-# Podcast ECoG Encoding Tutorial on a Cluster
+s# Podcast ECoG Encoding Tutorial on a Cluster
 
 This directory contains a Python-script version of the Hasson Lab Podcast ECoG encoding tutorial:
 
@@ -65,7 +65,17 @@ For the minimal tutorial data:
 python podcast_ecog/download_minimal.py --bids-root "$SCRATCH/podcast_ecog/data/ds005574"
 ```
 
-For the full dataset, download OpenNeuro `ds005574` using your cluster's preferred OpenNeuro/DataLad workflow, then pass that directory as `--bids-root`.
+For the full OpenNeuro `ds005574` dataset:
+
+```bash
+python podcast_ecog/download_minimal.py --all --bids-root "$SCRATCH/podcast_ecog/data/ds005574"
+```
+
+To inspect the file list first:
+
+```bash
+python podcast_ecog/download_minimal.py --all --dry-run
+```
 
 ## 4. Run a Smoke Test
 
@@ -80,12 +90,14 @@ python podcast_ecog/run_encoding.py \
   --backend auto
 ```
 
-Expected shapes for the full tutorial are roughly:
+Expected shapes depend on the channel filter:
 
 - token embeddings: `(5491, 1600)`
 - word embeddings: `(5136, 1600)`
-- epochs after resampling: `(5130, 235, 128)`
-- correlation result: `(2, 235, 128)`
+- all channels with `--picks-regex '.*'`: epochs `(5130, 235, 128)`, correlations `(2, 235, 128)`
+- left-grid channels with `--picks-regex 'LG.*'`: epochs `(5130, 127, 128)`, correlations `(2, 127, 128)`
+
+The rendered tutorial shows `(5130, 235, 128)`, which corresponds to all 235 ECoG channels in the current `task-podcast` high-gamma file. If you run with `LG.*`, you are intentionally plotting only the 127 channels whose names start with `LG`.
 
 ## 5. Run on an Allocated Node
 
@@ -99,7 +111,7 @@ python podcast_ecog/run_encoding.py \
   --output-dir podcast_ecog/outputs \
   --backend auto \
   --subject 03 \
-  --picks-regex 'LG[AB]*'
+  --picks-regex '.*'
 ```
 
 The script writes:
@@ -111,3 +123,35 @@ The script writes:
 ## Notes
 
 The full tutorial fit is memory-heavy because it predicts every selected electrode at every lag. If CUDA runs out of memory, retry with `--backend torch` or `--backend numpy`, reduce channels with `--picks-regex` or `--max-channels`, or reduce lags by lowering the epoch window or resampling more aggressively.
+
+## Derived Analyses
+
+If the cluster clone is mounted locally at `/Volumes/ellie/language-decoding-expts`, derived analyses can read the saved encoding results from Ceph and write local outputs here.
+
+Preferred lag per channel:
+
+```bash
+python podcast_ecog/plot_preferred_lag.py
+```
+
+This writes a colorbar brain plot and a CSV table to `podcast_ecog/outputs/preferred_lag/`. Pass `--results-npz` if you want to use a specific encoding result file.
+
+Text-window horizon encoding:
+
+```bash
+python podcast_ecog/run_text_window_encoding.py
+```
+
+By default this reads the podcast transcript and high-gamma FIF from `/Volumes/ellie/language-decoding-expts`, embeds trailing text windows of 1, 5, 10, 20, 50, 100, 200, and 500 words with MiniLM, and predicts each channel's response at its GPT-2-preferred lag. Outputs are local under `podcast_ecog/outputs/text_window_encoding/`.
+
+After the run, write compact interpretation tables and plots:
+
+```bash
+python podcast_ecog/summarize_text_window_encoding.py
+```
+
+To inspect long-window channels and their temporal GPT-2 lag profiles:
+
+```bash
+python podcast_ecog/plot_long_window_lag_profiles.py
+```
