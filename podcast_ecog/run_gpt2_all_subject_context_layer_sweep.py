@@ -65,6 +65,8 @@ def parse_args() -> argparse.Namespace:
         help="GPT-2 hidden layers to evaluate: all, final, or integer layer indices. Layer 0 is embeddings.",
     )
     parser.add_argument("--resample-sfreq", type=float, default=32.0)
+    parser.add_argument("--lag-tmin", type=float, default=-2.0, help="Start of epoch window, in seconds, for lag selection.")
+    parser.add_argument("--lag-tmax", type=float, default=2.0, help="End of epoch window, in seconds, for lag selection.")
     parser.add_argument("--outer-splits", type=int, default=2)
     parser.add_argument("--ridge-alpha", type=float, default=100000.0)
     parser.add_argument("--batch-size", type=int, default=16)
@@ -98,7 +100,12 @@ def cache_tag(args: argparse.Namespace) -> str:
     word_tag = f"maxwords{args.max_words}" if args.max_words is not None else "allwords"
     chan_tag = f"maxch{args.max_channels}" if args.max_channels is not None else "allch"
     picks = re.sub(r"[^A-Za-z0-9_.-]+", "-", args.picks_regex).strip("-") or "all"
-    return f"{word_tag}_{chan_tag}_{picks}"
+    lag_tag = ""
+    if float(args.lag_tmin) != -2.0 or float(args.lag_tmax) != 2.0:
+        lag_tmin = str(float(args.lag_tmin)).replace("-", "m").replace(".", "p")
+        lag_tmax = str(float(args.lag_tmax)).replace("-", "m").replace(".", "p")
+        lag_tag = f"_lag{lag_tmin}to{lag_tmax}"
+    return f"{word_tag}_{chan_tag}_{picks}{lag_tag}"
 
 
 def reference_cache_path(args: argparse.Namespace, subject: str) -> Path:
@@ -134,8 +141,8 @@ def load_or_build_subject_targets(
         words=subject_words,
         picks_regex=args.picks_regex,
         max_channels=args.max_channels,
-        tmin=-2.0,
-        tmax=2.0,
+        tmin=args.lag_tmin,
+        tmax=args.lag_tmax,
         resample_sfreq=args.resample_sfreq,
     )
     selection = epochs.selection.astype(np.int64)
